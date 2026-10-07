@@ -4,6 +4,8 @@
 import assert from 'node:assert';
 import { PassThrough, type Readable, type Writable } from 'node:stream';
 import { describe, it } from 'node:test';
+import { MxcError } from '../../src/errors.js';
+import type { AbiErrorDetail } from '../../src/bindings/native-error.js';
 import {
   createStateAwareStreamingDriver,
   createStreamingDriver,
@@ -22,6 +24,7 @@ class FakeNative implements StreamingNativeFacade {
   readonly freedStrings: unknown[] = [];
   closeFailureHandle: number | bigint | undefined;
   spawnStatus = 0;
+  spawnMessage: Buffer | undefined;
   takeStatus = 0;
   killCount = 0;
   timeoutKillCount = 0;
@@ -44,8 +47,9 @@ class FakeNative implements StreamingNativeFacade {
   stateAwareRequest: string | undefined;
   stateAwareExperimental: number | undefined;
 
-  spawn(_request: string, outHandle: unknown[], _error: unknown): number {
-    outHandle[0] = this.handle;
+  spawn(_request: string, outHandle: unknown[], error: AbiErrorDetail): number {
+    outHandle[0] = this.spawnStatus === 0 ? this.handle : null;
+    if (this.spawnMessage) error.message = this.spawnMessage;
     return this.spawnStatus;
   }
 
@@ -53,7 +57,7 @@ class FakeNative implements StreamingNativeFacade {
     request: string,
     experimental: number,
     outHandle: unknown[],
-    error: unknown,
+    error: AbiErrorDetail,
   ): number {
     this.stateAwareRequest = request;
     this.stateAwareExperimental = experimental;
@@ -148,6 +152,7 @@ class FakeNative implements StreamingNativeFacade {
 
   freeError(): void {
     this.freeErrorCount += 1;
+    this.spawnMessage?.fill(0);
   }
 
   freeString(value: unknown): void {
@@ -186,6 +191,32 @@ class FakeStreams implements NativeStreamFactory {
 }
 
 describe('native streaming binding ownership', () => {
+  for (const stateAware of [false, true]) {
+    it(`owns populated native failure text from ${stateAware ? 'state-aware exec' : 'spawn'}`, () => {
+      const native = new FakeNative();
+      const message = 'CreateProcessSecurityEnvironment failed (HRESULT = 0x800704EC)\n'
+        + 'Resource 1: "C:\\\\\u65e5\u672c"\n'
+        + 'required=18446744073709551615.';
+      native.spawnStatus = 12;
+      native.spawnMessage = Buffer.from(`${message}\0`, 'utf8');
+      let captured: MxcError | undefined;
+      assert.throws(
+        () => stateAware
+          ? createStateAwareStreamingDriver('{"phase":"exec"}', false, native, new FakeStreams())
+          : createStreamingDriver({} as never, native, new FakeStreams()),
+        (error: unknown) => {
+          if (!(error instanceof MxcError)) return false;
+          captured = error;
+          return error.code === 'backend_error' && error.message === message;
+        },
+      );
+      assert.strictEqual(native.freeErrorCount, 1);
+      assert.strictEqual(native.freeCount, 0);
+      assert.strictEqual(native.spawnMessage.every(byte => byte === 0), true);
+      assert.strictEqual(captured?.message, message);
+    });
+  }
+
   it('dispatches state-aware exec through the native entry point', async () => {
     const native = new FakeNative();
     const streams = new FakeStreams();

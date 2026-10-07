@@ -55,6 +55,15 @@ whenever its runtime probe succeeds and the contract can represent the complete
 requested policy, independent of schema version. Otherwise selection continues
 through the AppContainer fallback tiers.
 
+On the selected BaseContainer path, CPSE is the creation entrypoint on every
+host. After its policy-denied HRESULT, MXC retrieves the calling thread's cached
+refusal through the optional `GetLastProcessSecurityEnvironmentPolicyResult`
+export. `PSE_SUPPORT_POLICY_RESULT` advertises that getter, not whether policy
+governs the caller. This adds no release-floor requirement or tier-selection
+change; unavailable diagnostics never replace the original creation result.
+See [detailed policy errors](guide.md#detailed-policy-errors) for the diagnostic
+contract and retrieval-failure handling.
+
 When `processContainer.captureDenials` is present, MXC treats PSEC plus the
 `api-win-appmodel-processmodel~learningmodetrace` API set as one native capture
 capability set.

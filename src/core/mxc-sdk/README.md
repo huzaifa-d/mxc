@@ -10,6 +10,24 @@ Either way it selects the right containment backend for the host and runs the
 sandboxed process over ordinary pipes, with no pty. The state-aware
 [`exec_attached`] path is the one exception — see *Pty allocation*.
 
+## ProcessContainer policy errors
+
+On capable Windows BaseContainer hosts, policy-denied creation (`0x800704EC`)
+automatically retrieves the calling thread's cached refusal and adds available
+outcome/action details to the ordinary `Error::message`.
+This applies to `run()` and `spawn_sandbox()` without a new request setting or
+additional experimental authorization. The native operation and HRESULT are
+included in the message; optional `operation` and `native_code` fields need not
+be populated for this backend path. Existing error codes and successful result
+types are unchanged. Missing or failed retrieval cannot replace the creation
+error; successful creation and non-policy failures are not queried.
+
+MXC neither mutates the request nor retries a policy refusal. A caller may pass
+the text to an appropriate LLM/user and deliberately build another request.
+Returned constraints are non-exhaustive; unknown or incomplete details are not
+instructions to guess a repair. Diagnostic prose is not a stable parsing API.
+See the [backend guide](../../../docs/process-container/guide.md#detailed-policy-errors).
+
 ## Usage
 
 ```rust,no_run
@@ -174,9 +192,9 @@ Filesystem-policy discovery helpers are also available to feed a policy:
 Every fallible **entry point** — [`build_request`],
 [`build_request_with_containment`], [`run`], [`spawn_sandbox`],
 the typed state-aware lifecycle calls, and the raw JSON compatibility calls —
-returns an [`Error`] carrying a closed [`ErrorCode`] and a message, plus, when
-the failure came from an underlying platform API, the call that failed and its
-status.
+returns an [`Error`] carrying a closed [`ErrorCode`] and a message. When the
+backend supplies native API metadata, the error also identifies the call and
+its status.
 
 The live [`Sandbox`] handle is the deliberate exception: `wait`, `try_wait`,
 `wait_with_output` and `kill` return [`std::io::Result`], mirroring
@@ -185,6 +203,7 @@ failure — a timeout is [`WaitOutcome::TimedOut`], not an error.
 
 ```rust,no_run
 # fn report(error: mxc_sdk::Error) {
+eprintln!("{}", error.message);
 if let Some(operation) = &error.operation {
     eprintln!("{operation} failed with {:?}", error.native_code);
 }
@@ -194,12 +213,11 @@ if let Some(hint) = &error.remediation {
 # }
 ```
 
-[`Error::operation`] and [`Error::native_code`] are **absent** for a failure
-raised before any API call was reached — a malformed policy, say — so their
-presence tells you which side of the boundary the failure came from. An API that
-names the call it failed in without supplying a status is a normal, tested
-shape. [`Error::remediation`] is present whenever the failure has an actionable
-hint.
+[`Error::operation`] and [`Error::native_code`] are **absent** when that metadata
+is not supplied, including message-only backend errors and failures before any
+API call. Their absence does not identify the failure stage. An API that names
+the call without supplying a status is also supported.
+[`Error::remediation`] carries a separate actionable hint when supplied.
 
 [`Error`] is `#[non_exhaustive]` — read its fields freely, but build one with
 [`Error::new`] rather than by literal, so a field added later costs you nothing.

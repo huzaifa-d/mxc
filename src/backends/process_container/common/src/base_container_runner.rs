@@ -41,13 +41,13 @@ use crate::capture_output::{
 use crate::job_object::UiJobObject;
 use crate::launch_diagnostics::{
     diagnose_create_process_failure, diagnose_missing_required_env, diagnose_process_exit,
-    security_environment_failure_message, validate_required_child_env,
+    validate_required_child_env,
 };
 use crate::native_capture::CaptureSession;
 use crate::proxy_coordinator::ProxyCoordinator;
 use crate::secenv::{
-    self, ProcessSecurityEnvironment, SecurityEnvironmentStartupInfo, SecurityEnvironmentSupport,
-    SecurityEnvironmentVersion, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
+    self, CreationError, ProcessSecurityEnvironment, SecurityEnvironmentStartupInfo,
+    SecurityEnvironmentSupport, SecurityEnvironmentVersion, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
     SECURITY_ENVIRONMENT_API_SET,
 };
 use wxc_common::api_set::is_api_set_implemented;
@@ -177,7 +177,7 @@ trait CaptureSessionFactory: Send + Sync {
         &self,
         sandbox_specification: &[u8],
         flags: u32,
-    ) -> Result<Box<dyn CaptureSessionOps>, learning_mode_windows::LearningModeError>;
+    ) -> Result<Box<dyn CaptureSessionOps>, CreationError>;
 }
 
 struct RealCaptureSessionFactory;
@@ -187,9 +187,11 @@ impl CaptureSessionFactory for RealCaptureSessionFactory {
         &self,
         sandbox_specification: &[u8],
         flags: u32,
-    ) -> Result<Box<dyn CaptureSessionOps>, learning_mode_windows::LearningModeError> {
-        CaptureSession::begin(sandbox_specification, flags)
+    ) -> Result<Box<dyn CaptureSessionOps>, CreationError> {
+        let environment = secenv::create_with_diagnostics(sandbox_specification, flags)?;
+        CaptureSession::begin_with_environment(environment)
             .map(|session| Box::new(session) as Box<dyn CaptureSessionOps>)
+            .map_err(Into::into)
     }
 }
 
@@ -719,7 +721,7 @@ impl BaseContainerRunner {
                         capture_session = Some(session);
                     }
                     Err(e) => {
-                        let msg = security_environment_failure_message(&e, true);
+                        let msg = e.message(true);
                         let _ = writeln!(logger, "Error: {msg}");
                         let failure_phase = if e.is_api_unavailable() {
                             FailurePhase::BackendUnavailable
@@ -737,7 +739,10 @@ impl BaseContainerRunner {
                     }
                 }
             } else {
-                let result = secenv::create(psec_spec, PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE);
+                let result = secenv::create_with_diagnostics(
+                    psec_spec,
+                    PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
+                );
                 match result {
                     Ok(environment) => {
                         let _ = writeln!(
@@ -747,7 +752,7 @@ impl BaseContainerRunner {
                         security_environment = Some(environment);
                     }
                     Err(error) => {
-                        let msg = security_environment_failure_message(&error, false);
+                        let msg = error.message(false);
                         let _ = writeln!(logger, "Error: {msg}");
                         let failure_phase = if error.is_api_unavailable() {
                             FailurePhase::BackendUnavailable
@@ -2100,13 +2105,14 @@ mod tests {
             &self,
             _sandbox_specification: &[u8],
             _flags: u32,
-        ) -> Result<Box<dyn CaptureSessionOps>, learning_mode_windows::LearningModeError> {
+        ) -> Result<Box<dyn CaptureSessionOps>, CreationError> {
             self.begin_calls.fetch_add(1, Ordering::SeqCst);
             if let Some((function, code)) = self.begin_error {
                 return Err(learning_mode_windows::LearningModeError::HResultCall {
                     function,
                     code,
-                });
+                }
+                .into());
             }
             Ok(Box::new(FakeCaptureSession {
                 finish_error: self.finish_error,
