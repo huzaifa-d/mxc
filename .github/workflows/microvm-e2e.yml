@@ -113,6 +113,7 @@ jobs:
         run: |
           cargo test -p mxc-sdk --features microvm --test wxc_e2e_tests_e2e_windows --target x86_64-pc-windows-msvc test_microvm_ -- --nocapture
           cargo test -p mxc-sdk --features microvm --test nvx_e2e --target x86_64-pc-windows-msvc -- --ignored --nocapture
+          ../tests/scripts/run_microvm_state_aware_tests.ps1 -WxcExePath ./target/x86_64-pc-windows-msvc/debug/wxc-exec.exe
 
       - name: Upload logs on failure
         if: failure() || cancelled()

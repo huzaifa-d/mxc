@@ -494,6 +494,10 @@ fn deserialize_development_request(
                     deserialize_development_root(json, "IsolationSession provision", "1.1", true)
                         .map(ProvisionRequest::IsolationSession)
                 }
+                Containment::MicroVm => {
+                    deserialize_development_root(json, "MicroVM provision", "1.1", true)
+                        .map(ProvisionRequest::MicroVm)
+                }
                 Containment::Wslc => {
                     deserialize_development_root(json, "WSLC provision", "1.1", true)
                         .map(ProvisionRequest::Wslc)
@@ -1193,6 +1197,7 @@ fn state_aware_containment_from_id(sandbox_id: &str) -> Option<wire::Containment
         "wslc" => Some(wire::Containment::Wslc),
         "wsb" => Some(wire::Containment::WindowsSandbox),
         "iso" => Some(wire::Containment::IsolationSession),
+        "microvm" => Some(wire::Containment::Microvm),
         _ => None,
     }
 }
@@ -1636,6 +1641,7 @@ fn normalize_state_aware(
                 StateAwareOperation::Provision(provision) => Some(match provision {
                     StateAwareProvision::IsolationSession(_) => wire::Containment::IsolationSession,
                     StateAwareProvision::WindowsSandbox => wire::Containment::WindowsSandbox,
+                    StateAwareProvision::MicroVm(_) => wire::Containment::Microvm,
                     StateAwareProvision::Wslc(_) => wire::Containment::Wslc,
                 }),
                 StateAwareOperation::Start { .. }
@@ -1804,6 +1810,7 @@ mod tests {
     enum ProvisionSnapshot {
         IsolationSession(Option<Option<String>>),
         WindowsSandbox,
+        MicroVm(Option<Option<u32>>),
         Wslc(Option<(Option<String>, Option<String>)>),
     }
 
@@ -1826,6 +1833,9 @@ mod tests {
                             StateAwareProvision::WindowsSandbox => {
                                 ProvisionSnapshot::WindowsSandbox
                             }
+                            StateAwareProvision::MicroVm(config) => ProvisionSnapshot::MicroVm(
+                                config.as_ref().map(|config| config.memory_mib),
+                            ),
                             StateAwareProvision::Wslc(config) => {
                                 ProvisionSnapshot::Wslc(config.as_ref().map(|config| {
                                     (config.image.clone(), config.image_tar_path.clone())

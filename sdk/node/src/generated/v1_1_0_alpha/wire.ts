@@ -258,6 +258,34 @@ export interface Lxc {
   release: string;
 }
 
+export type MicroVmContainment = "microvm";
+
+/**
+ * MicroVM settings accepted during provisioning.
+ */
+export interface MicroVmProvision {
+  /**
+   * Guest memory in MiB. Zero is rejected by backend semantic validation.
+   */
+  memoryMib?: number;
+}
+
+/**
+ * A complete development provision request for the MicroVM backend.
+ */
+export interface MicroVmProvisionRequest {
+  $schema?: string;
+  _comment?: unknown;
+  containment: MicroVmContainment;
+  filesystem?: Filesystem;
+  microvm?: StateAwareMicroVm;
+  network?: Network;
+  phase: ProvisionPhase;
+  runtimeConfig?: RuntimeConfig;
+  telemetry?: Telemetry;
+  version: Version;
+}
+
 /**
  * Network access policy shared by the stable containment backends.
  */
@@ -717,6 +745,16 @@ export interface StateAwareIsolationSession {
 }
 
 /**
+ * State-aware MicroVM settings.
+ */
+export interface StateAwareMicroVm {
+  /**
+   * Optional provision-phase settings.
+   */
+  provision?: MicroVmProvision;
+}
+
+/**
  * State-aware WSLC settings.
  */
 export interface StateAwareWslc {
@@ -903,4 +941,4 @@ export interface WslcProvisionRequest {
 /**
  * Exact mutable MXC development configuration contract.
  */
-export type MXCConfiguration = OneShotRequest | DeprovisionRequest | StopRequest | ExecRequest | StartRequest | WslcProvisionRequest | IsolationSessionProvisionRequest | WindowsSandboxProvisionRequest;
+export type MXCConfiguration = OneShotRequest | DeprovisionRequest | StopRequest | ExecRequest | StartRequest | WslcProvisionRequest | MicroVmProvisionRequest | IsolationSessionProvisionRequest | WindowsSandboxProvisionRequest;

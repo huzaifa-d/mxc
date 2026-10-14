@@ -33,6 +33,8 @@ enum ProvisionContainment {
         image: Option<String>,
         image_tar_path: Option<String>,
     },
+    /// Experimental NVX MicroVM.
+    MicroVm { memory_mib: Option<u32> },
 }
 
 impl ProvisionContainment {
@@ -59,6 +61,13 @@ impl ProvisionContainment {
                     })
                 };
                 RuntimeProvision::Wslc(config)
+            }
+            Self::MicroVm { memory_mib } => {
+                RuntimeProvision::MicroVm(memory_mib.map(|memory_mib| {
+                    crate::mxc_common::models::MicroVmProvisionConfig {
+                        memory_mib: Some(memory_mib),
+                    }
+                }))
             }
         })
     }
@@ -159,6 +168,16 @@ impl ProvisionRequest {
         }
     }
 
+    /// Create an experimental NVX MicroVM provision request.
+    pub fn microvm(memory_mib: Option<u32>) -> Self {
+        Self {
+            provision: ProvisionContainment::MicroVm { memory_mib },
+            filesystem: None,
+            network: None,
+            telemetry: None,
+        }
+    }
+
     /// Set provision-time filesystem policy.
     pub fn set_filesystem(&mut self, filesystem: FilesystemPolicy) -> &mut Self {
         self.filesystem = Some(filesystem);
@@ -181,7 +200,11 @@ impl ProvisionRequest {
         self,
         telemetry: Option<crate::options::TelemetryConfig>,
     ) -> Result<SdkStateAwareInput, MxcError> {
-        let version = ContractVersion::V1_0_0;
+        let version = if matches!(&self.provision, ProvisionContainment::MicroVm { .. }) {
+            ContractVersion::V1_1_0Alpha
+        } else {
+            ContractVersion::V1_0_0
+        };
         match &self.provision {
             ProvisionContainment::IsolationSession { .. } if self.filesystem.is_some() => {
                 return Err(MxcError::malformed_request(
@@ -312,6 +335,7 @@ pub struct IsolationSessionProvisionMetadata {
 #[non_exhaustive]
 pub enum ProvisionMetadata {
     IsolationSessionProvision(IsolationSessionProvisionMetadata),
+    MicroVmProvision(serde_json::Value),
 }
 
 /// Result of successfully provisioning a container.
@@ -357,6 +381,9 @@ impl StateAwareResult {
                 agent_user_sid,
                 ephemeral_workspace_path,
             }),
+            crate::mxc_engine::EngineProvisionMetadata::MicroVm(metadata) => {
+                ProvisionMetadata::MicroVmProvision(metadata)
+            }
         });
         Self {
             sandbox_id: result.sandbox_id,

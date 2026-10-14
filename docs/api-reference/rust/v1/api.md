@@ -26,6 +26,31 @@ IsolationSession-only. Seatbelt PTY rejects `guiAccess` and legacy
 caller explicit input, output, resize, and process ownership instead of
 attaching the workload to the host process's global console streams.
 
+## Experimental MicroVM operations
+
+NVX MicroVM uses the ordinary V1 request, process, result, and options types
+through explicit experimental entry points:
+
+```rust
+pub fn mxc_sdk::v1::experimental::spawn(
+    request: ContainerRequest,
+    options: SpawnOptions,
+) -> Result<MxcProcess, Error>;
+
+pub fn mxc_sdk::v1::experimental::run(
+    request: ContainerRequest,
+    options: RunOptions,
+) -> Result<ExecutionResult, Error>;
+```
+
+`mxc_sdk::v1::experimental::container` exposes `provision_container`,
+`validate_provision`, `start_container`, `validate_start`,
+`spawn_in_container`, `run_in_container`, `validate_process`,
+`stop_container`, `validate_stop`, `deprovision_container`, and
+`validate_deprovision` with the same signatures as `v1::container`.
+`spawn_in_container_with_pty` is present for API consistency but NVX rejects it
+before workload launch.
+
 ## Discovery and validation
 
 | Operation | Use it to |

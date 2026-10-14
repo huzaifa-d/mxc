@@ -107,8 +107,11 @@ Both ingress controls also default to `deny` when omitted. `hostLoopback`
 resolves independently of `ingress.default`, so host-loopback access must
 be requested explicitly.
 
-The initial development Windows x64 NVX signed-agent MicroVM backend rejects
-every network policy and `runtimeConfig.networkProxy` before creating a VM.
+The development Windows x64 NVX signed-agent MicroVM backend maps supported
+egress defaults and CIDR/protocol/port rules. Ingress deny and host-loopback
+deny are supported; allow postures fail closed when the runtime does not
+advertise them. `runtimeConfig.networkProxy` is accepted only during provision
+or create-and-run because networking is immutable after the VM starts.
 A ProcessContainer proxy requires `ingress.default: "allow"`. Identity-scoped
 proxies set a non-blank `allowedProxyPeer` and keep `hostLoopback: "deny"`;
 identity-less host proxies omit `allowedProxyPeer` and require
@@ -378,10 +381,10 @@ The `filesystem` section defines path access policy shared across backends:
 | `readonlyPaths` | string[] | `[]` | Paths the process can read but not write. |
 | `deniedPaths` | string[] | `[]` | Paths the process cannot access at all. |
 
-The initial development Windows x64 NVX signed-agent MicroVM backend rejects
-`readwritePaths`, `readonlyPaths`, and `deniedPaths`. The
+The development Windows x64 NVX signed-agent MicroVM backend maps
+`readwritePaths`, `readonlyPaths`, and `deniedPaths` at provision time. The
 `processContainer.filesystem.enumeratePaths` field is ProcessContainer-only
-and also cannot be combined with `containment: "microvm"`.
+and cannot be combined with `containment: "microvm"`.
 
 The ProcessContainer-only `processContainer.filesystem` section contains:
 

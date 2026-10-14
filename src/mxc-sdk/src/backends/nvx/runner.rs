@@ -3,13 +3,14 @@
 
 //! Minimal one-shot adapter for the signed NVX agent runtime.
 
-use std::time::Duration;
+use std::io::{Read, Write};
 
-use aci_edge_sandboxes::{ExecOutcome, ExecRequest, ProvisionRequest};
+use aci_edge_sandboxes::{AciEdgeSandbox, ExecOutcome, SandboxId};
 
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, FailurePhase, ScriptResponse};
 use crate::mxc_common::mxc_error::{MxcError, MxcErrorCode};
+use crate::mxc_common::sandbox_process::{NativeStdio, SandboxProcess, StreamCloser};
 use crate::mxc_common::script_runner::ScriptRunner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +40,16 @@ impl NvxRunner {
         request: &ExecutionRequest,
         logger: &mut Logger,
     ) -> Result<CapturedRun, MxcError> {
-        super::policy::validate_phase_one(request)?;
+        validate_one_shot_lifecycle(request)?;
+        super::policy::validate_common(request)?;
         let client = super::runtime::create_client()?;
         client.probe().map_err(super::runtime::map_nvx_error)?;
+        let (provision, spec) =
+            super::policy::provision_request(request, None, &client.capabilities())?;
+        let exec = super::policy::exec_request(request, false, &client.capabilities())?;
 
         let provisioned = client
-            .provision(&ProvisionRequest::new())
+            .provision_with(&provision, &spec)
             .map_err(super::runtime::map_nvx_error)?;
         let sandbox_id = provisioned.sandbox_id;
         let primary = (|| {
@@ -52,7 +57,7 @@ impl NvxRunner {
                 .start(&sandbox_id)
                 .map_err(super::runtime::map_nvx_error)?;
             client
-                .exec(&sandbox_id, &exec_request(request))
+                .exec(&sandbox_id, &exec)
                 .map_err(super::runtime::map_nvx_error)?
                 .wait_with_output()
                 .map_err(super::runtime::map_nvx_error)
@@ -107,11 +112,153 @@ impl NvxRunner {
             stderr: output.stderr,
         })
     }
+
+    pub fn spawn_streaming(
+        request: &ExecutionRequest,
+    ) -> Result<Box<dyn SandboxProcess>, MxcError> {
+        validate_one_shot_lifecycle(request)?;
+        super::policy::validate_common(request)?;
+        let client = super::runtime::create_client()?;
+        let (provision, spec) =
+            super::policy::provision_request(request, None, &client.capabilities())?;
+        let provisioned = client
+            .provision_with(&provision, &spec)
+            .map_err(super::runtime::map_nvx_error)?;
+        let sandbox_id = provisioned.sandbox_id;
+        if let Err(error) = client.start(&sandbox_id) {
+            let primary = super::runtime::map_nvx_error(error);
+            let _ = client.deprovision(&sandbox_id);
+            return Err(primary);
+        }
+        let exec = super::policy::exec_request(request, true, &client.capabilities())?;
+        let execution = match client.exec(&sandbox_id, &exec) {
+            Ok(execution) => execution,
+            Err(error) => {
+                let primary = super::runtime::map_nvx_error(error);
+                let _ = client.stop(&sandbox_id);
+                let _ = client.deprovision(&sandbox_id);
+                return Err(primary);
+            }
+        };
+        let handle = super::process::into_exec_handle(execution)?;
+        let inner =
+            match crate::mxc_common::exec_stream::ExecSandboxProcess::from_exec_handle(handle) {
+                Ok(inner) => inner,
+                Err(error) => {
+                    let _ = client.stop(&sandbox_id);
+                    let _ = client.deprovision(&sandbox_id);
+                    return Err(error);
+                }
+            };
+        Ok(Box::new(NvxOneShotProcess {
+            inner: Box::new(inner),
+            client,
+            sandbox_id: Some(sandbox_id),
+        }))
+    }
+}
+
+struct NvxOneShotProcess {
+    inner: Box<dyn SandboxProcess>,
+    client: AciEdgeSandbox,
+    sandbox_id: Option<SandboxId>,
+}
+
+impl NvxOneShotProcess {
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        let Some(sandbox_id) = self.sandbox_id.take() else {
+            return Ok(());
+        };
+        let stop = self.client.stop(&sandbox_id);
+        let deprovision = self.client.deprovision(&sandbox_id);
+        match (stop, deprovision) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (stop, deprovision) => Err(std::io::Error::other(format!(
+                "NVX cleanup failed: stop={:?}; deprovision={:?}",
+                stop.err(),
+                deprovision.err()
+            ))),
+        }
+    }
+}
+
+impl SandboxProcess for NvxOneShotProcess {
+    fn warnings(&self) -> Vec<String> {
+        self.inner.warnings()
+    }
+
+    fn take_native_stdio(&mut self) -> std::io::Result<Option<NativeStdio>> {
+        self.inner.take_native_stdio()
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        self.inner.take_stdin()
+    }
+
+    fn stdin_closer(&self) -> Option<Box<dyn StreamCloser>> {
+        self.inner.stdin_closer()
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        self.inner.take_stdout()
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+        self.inner.take_stderr()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+        let result = self.inner.try_wait()?;
+        if result.is_some() {
+            self.cleanup()?;
+        }
+        Ok(result)
+    }
+
+    fn id(&self) -> u32 {
+        self.inner.id()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.inner.kill()
+    }
+
+    fn kill_for_timeout(&mut self) -> std::io::Result<()> {
+        self.inner.kill_for_timeout()
+    }
+
+    fn wait(&mut self) -> std::io::Result<i32> {
+        let result = self.inner.wait();
+        let cleanup = self.cleanup();
+        match (result, cleanup) {
+            (Ok(code), Ok(())) => Ok(code),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+}
+
+impl Drop for NvxOneShotProcess {
+    fn drop(&mut self) {
+        if self.sandbox_id.is_some() {
+            let _ = self.inner.kill();
+            let _ = self.inner.wait();
+            let _ = self.cleanup();
+        }
+    }
 }
 
 impl ScriptRunner for NvxRunner {
     fn validate_runner(&self, request: &ExecutionRequest) -> Result<(), ScriptResponse> {
-        super::policy::validate_phase_one(request)
+        validate_one_shot_lifecycle(request)
+            .map_err(|error| ScriptResponse::rejected(&error.message))?;
+        super::policy::validate_common(request)
+            .map_err(|error| ScriptResponse::rejected(&error.message))?;
+        let client = super::runtime::create_client()
+            .map_err(|error| ScriptResponse::rejected(&error.message))?;
+        super::policy::provision_request(request, None, &client.capabilities())
+            .and_then(|_| super::policy::exec_request(request, false, &client.capabilities()))
+            .map(|_| ())
             .map_err(|error| ScriptResponse::rejected(&error.message))
     }
 
@@ -133,6 +280,20 @@ impl ScriptRunner for NvxRunner {
             },
         }
     }
+}
+
+fn validate_one_shot_lifecycle(request: &ExecutionRequest) -> Result<(), MxcError> {
+    if !request.lifecycle.destroy_on_exit {
+        return Err(MxcError::policy_validation(
+            "NVX create-and-run requires lifecycle.destroyOnExit=true",
+        ));
+    }
+    if request.lifecycle.preserve_policy {
+        return Err(MxcError::policy_validation(
+            "NVX create-and-run requires lifecycle.preservePolicy=false",
+        ));
+    }
+    Ok(())
 }
 
 fn map_outcome(outcome: ExecOutcome) -> Result<CapturedOutcome, MxcError> {
@@ -167,20 +328,6 @@ fn captured_to_script_response(result: CapturedRun) -> ScriptResponse {
             ..Default::default()
         },
     }
-}
-
-fn exec_request(request: &ExecutionRequest) -> ExecRequest {
-    let mut exec = ExecRequest::command_line(request.script_code.clone());
-    if request.script_timeout != 0 {
-        exec = exec.with_timeout(Duration::from_millis(u64::from(request.script_timeout)));
-    }
-    if !request.working_directory.is_empty() {
-        exec = exec.with_cwd(request.working_directory.clone());
-    }
-    if let Some(environment) = &request.env {
-        exec = exec.with_envs(environment.clone());
-    }
-    exec.with_inherit_default_env(request.inherit_default_env)
 }
 
 #[cfg(test)]
@@ -232,5 +379,21 @@ mod tests {
         });
         assert_eq!(response.exit_code, -1);
         assert_eq!(response.failure_phase, FailurePhase::Timeout);
+    }
+
+    #[test]
+    fn create_and_run_rejects_non_default_lifecycle() {
+        let mut request = ExecutionRequest::default();
+        request.lifecycle.destroy_on_exit = false;
+        assert!(validate_one_shot_lifecycle(&request)
+            .unwrap_err()
+            .message
+            .contains("destroyOnExit=true"));
+        request.lifecycle.destroy_on_exit = true;
+        request.lifecycle.preserve_policy = true;
+        assert!(validate_one_shot_lifecycle(&request)
+            .unwrap_err()
+            .message
+            .contains("preservePolicy=false"));
     }
 }

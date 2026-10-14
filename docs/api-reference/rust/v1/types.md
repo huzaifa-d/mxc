@@ -260,6 +260,23 @@ pub struct FilesystemPolicy {
 }
 ```
 
+## `mxc_sdk::v1::Containment::MicroVm`
+
+Experimental NVX MicroVM selection. Enable the Cargo `microvm` feature and use
+an operation under `mxc_sdk::v1::experimental`.
+
+## `mxc_sdk::v1::ProvisionRequest::microvm`
+
+Creates a typed experimental MicroVM provision request.
+
+```rust
+pub fn microvm(memory_mib: Option<u32>) -> ProvisionRequest;
+```
+
+Filesystem and network policy are applied with `set_filesystem` and
+`set_network`. A runtime proxy in the network policy is fixed during
+provisioning.
+
 
 ## `mxc_sdk::v1::policy::filesystem::FilesystemPolicyResult`
 
@@ -622,6 +639,7 @@ Backend-specific metadata returned by a typed lifecycle call.
 ```rust
 pub enum ProvisionMetadata {
   IsolationSessionProvision(IsolationSessionProvisionMetadata),
+  MicroVmProvision(serde_json::Value),
 }
 ```
 

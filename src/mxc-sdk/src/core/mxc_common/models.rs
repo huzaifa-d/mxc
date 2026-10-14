@@ -279,6 +279,13 @@ pub struct IsolationSessionProvisionConfig {
     pub app_id: Option<String>,
 }
 
+/// Runtime-owned state-aware provision config for the MicroVM backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MicroVmProvisionConfig {
+    /// Guest memory in MiB. The backend chooses its default when absent.
+    pub memory_mib: Option<u32>,
+}
+
 /// Runtime-owned state-aware provision config for the WSLc backend.
 ///
 /// Image selection and defaulting remain backend responsibilities. Conversion

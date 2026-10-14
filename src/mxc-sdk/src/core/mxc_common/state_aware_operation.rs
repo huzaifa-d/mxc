@@ -8,7 +8,8 @@
 //! an ID, whose contents are validated at the existing dispatch boundary.
 
 use crate::mxc_common::models::{
-    ContainmentBackend, IsolationSessionProvisionConfig, WslcProvisionConfig,
+    ContainmentBackend, IsolationSessionProvisionConfig, MicroVmProvisionConfig,
+    WslcProvisionConfig,
 };
 use crate::mxc_common::state_aware_request::Phase;
 
@@ -19,6 +20,8 @@ pub enum StateAwareProvision {
     IsolationSession(Option<IsolationSessionProvisionConfig>),
     /// Windows Sandbox has no backend-specific provision configuration.
     WindowsSandbox,
+    /// MicroVM provision configuration.
+    MicroVm(Option<MicroVmProvisionConfig>),
     /// An omitted image remains absent until the WSLC backend chooses a default.
     Wslc(Option<WslcProvisionConfig>),
 }
@@ -29,6 +32,7 @@ impl StateAwareProvision {
         match self {
             Self::IsolationSession(_) => ContainmentBackend::IsolationSession,
             Self::WindowsSandbox => ContainmentBackend::WindowsSandbox,
+            Self::MicroVm(_) => ContainmentBackend::MicroVm,
             Self::Wslc(_) => ContainmentBackend::Wslc,
         }
     }
@@ -97,6 +101,13 @@ impl StateAwareOperation {
                     None => Ok(()),
                 }
             }
+            Self::Provision(StateAwareProvision::MicroVm(Some(config)))
+                if config.memory_mib == Some(0) =>
+            {
+                Err(crate::mxc_common::error::WxcError::Validation(
+                    "microvm.provision.memoryMib must be greater than zero".to_owned(),
+                ))
+            }
             Self::Provision(_)
             | Self::Start { .. }
             | Self::Exec { .. }
@@ -120,6 +131,10 @@ mod tests {
             (
                 StateAwareProvision::WindowsSandbox,
                 ContainmentBackend::WindowsSandbox,
+            ),
+            (
+                StateAwareProvision::MicroVm(None),
+                ContainmentBackend::MicroVm,
             ),
             (StateAwareProvision::Wslc(None), ContainmentBackend::Wslc),
         ] {
@@ -180,6 +195,10 @@ mod tests {
         assert_ne!(
             StateAwareProvision::Wslc(None),
             StateAwareProvision::Wslc(Some(WslcProvisionConfig::default()))
+        );
+        assert_ne!(
+            StateAwareProvision::MicroVm(None),
+            StateAwareProvision::MicroVm(Some(MicroVmProvisionConfig::default()))
         );
     }
 }

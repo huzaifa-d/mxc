@@ -9,12 +9,13 @@ via KVM on Linux.
 > [!IMPORTANT]
 > Active `microvm` execution is the development NVX signed-agent integration
 > on Windows x64. Build with `--with-microvm`, set `MXC_NVX_BUNDLE_DIR` to the
-> verified extracted edge bundle, and pass `--experimental`. This slice
-> preserves the initial create-and-run command, timeout, guest working
-> directory, and additive environment surface. Filesystem, network, proxies,
-> UI, capture-denials, non-default lifecycle settings, streaming, PTY, and
-> lifecycle operations are rejected before VM creation. Compatibility and
-> runtime validation remain false. Nanvix build and runtime paths are inactive,
+> verified extracted edge bundle, and pass `--experimental` or use the Rust
+> `mxc_sdk::v1::experimental` operations. Create-and-run and container
+> lifecycle operations support captured or piped execution, cancellation,
+> filesystem mappings, supported directional networking, and a provision-time
+> proxy. PTY, UI, capture-denials, environment replacement, and exec-time proxy
+> changes are rejected before workload launch. Compatibility and runtime
+> validation remain false. Nanvix build and runtime paths are inactive,
 > including on Linux. The Rust crate is pinned to NVX `843835760e06` while the
 > available signed edge bundle was published with `4a30cb560277`; digest and
 > capability checks establish development ABI compatibility, not a matched

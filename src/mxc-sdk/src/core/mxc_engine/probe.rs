@@ -254,6 +254,13 @@ fn windows_backends(
         ));
     }
 
+    #[cfg(all(feature = "microvm", target_arch = "x86_64"))]
+    if crate::nvx::is_available() {
+        backends.push(AvailableBackend::tierless(
+            ContainmentBackend::MicroVm.wire_name(),
+        ));
+    }
+
     backends
 }
 

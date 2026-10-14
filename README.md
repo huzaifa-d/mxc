@@ -62,10 +62,13 @@ The Windows x64 `microvm` backend is a development NVX signed-agent
 integration. Set `MXC_NVX_BUNDLE_DIR` to the manually verified and extracted
 signed edge bundle before running it. NVX state defaults to
 `%LOCALAPPDATA%\Microsoft\MXC\NVX`; `MXC_NVX_STATE_ROOT` overrides that private
-directory. This slice requires `--experimental` and preserves the initial
-create-and-run surface: command, timeout, guest working directory, and additive
-environment settings. Filesystem, network, proxy, UI, capture-denials,
-non-default lifecycle, streaming, PTY, and container lifecycle operations
+directory. Build with the `microvm` feature and use `--experimental` or the
+Rust `mxc_sdk::v1::experimental` operations. The backend supports captured and
+live create-and-run execution plus provision, start, repeated exec, stop, and
+deprovision. Live exec exposes piped stdin, separate stdout/stderr, timeout,
+and cancellation. Read-only/read-write/denied host paths, supported directional
+network rules, and a provision-time proxy are mapped into NVX. UI,
+capture-denials, environment replacement, exec-time proxy changes, and PTY
 remain fail-closed. The release manifest continues to report
 `mxcCompatible=false` and `runtimeValidated=false`.
 The Rust adapter is pinned to NVX commit `843835760e06`; the currently
