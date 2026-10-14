@@ -12,7 +12,8 @@ behind a unified containment model and typed SDKs.
 - **JSON-based configuration**: Versioned container-creation requests and
   security policies
 - **Multiple containment backends**: ProcessContainer, Windows Sandbox, LXC,
-  Bubblewrap, Seatbelt, MicroVM (Nanvix), Hyperlight, IsolationSession, and WSLC
+  Bubblewrap, Seatbelt, MicroVM (NVX on Windows x64), Hyperlight,
+  IsolationSession, and WSLC
 - **Policy-driven sandboxing**:
   - **Filesystem policy**: Read-only, read-write, and denied path lists
   - **Network policy**: Proxy support, outbound controls, and backend-dependent
@@ -52,10 +53,26 @@ Linux, and macOS.
 | Runtime platform | Default backend | Other backends | Minimum host OS |
 |---|---|---|---|
 | Windows 11 x64 / ARM64 | `processcontainer` | `windows_sandbox`\*, `wslc`, `microvm`\*, `hyperlight`\*, `isolation_session` | [Windows OS-version support](docs/backends/process-container/os-version-support.md)|
-| Linux x64 / ARM64 | `bubblewrap` | `lxc`, `microvm`, `hyperlight` | - |
+| Linux x64 / ARM64 | `bubblewrap` | `lxc`, `hyperlight` | - |
 | macOS ARM64 / x64 | `seatbelt` | - | - |
 
 \* These backends are **experimental**.
+
+The Windows x64 `microvm` backend is a development NVX signed-agent
+integration. Set `MXC_NVX_BUNDLE_DIR` to the manually verified and extracted
+signed edge bundle before running it. NVX state defaults to
+`%LOCALAPPDATA%\Microsoft\MXC\NVX`; `MXC_NVX_STATE_ROOT` overrides that private
+directory. This slice requires `--experimental` and preserves the initial
+create-and-run surface: command, timeout, guest working directory, and additive
+environment settings. Filesystem, network, proxy, UI, capture-denials,
+non-default lifecycle, streaming, PTY, and container lifecycle operations
+remain fail-closed. The release manifest continues to report
+`mxcCompatible=false` and `runtimeValidated=false`.
+The Rust adapter is pinned to NVX commit `843835760e06`; the currently
+available signed edge bundle is the development artifact published with
+`4a30cb560277`. The adapter verifies its manifest and library digests and
+requires the runtime capability handshake, but this ABI-compatible combination
+is test evidence rather than a matched production release.
 
 ## How do I use MXC?
 

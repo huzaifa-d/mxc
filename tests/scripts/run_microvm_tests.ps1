@@ -3,11 +3,11 @@
 
 <#
 .SYNOPSIS
-    Runs MicroVM E2E tests. Requires WHP and Nanvix binaries next to wxc-exec.exe.
+    Runs Windows signed-agent NVX MicroVM E2E tests. Requires WHP and MXC_NVX_BUNDLE_DIR.
 
 .DESCRIPTION
     - Locates wxc-exec.exe (built with --features microvm)
-    - Verifies Nanvix binaries are present
+    - Verifies the manually extracted signed NVX bundle is present
     - Runs each test config via wxc-exec, validates exit codes and stdout content
     - Reports pass/fail summary with per-test performance timing
     - Writes microvm-perf-results.json for CI artifact consumption
@@ -86,38 +86,29 @@ if (-not (Test-Path $WxcExePath)) {
 
 $wxcExe = Resolve-Path $WxcExePath
 
-# -- Verify MicroVM binaries --------------------------------------------------
-
-$requiredBinaries = @(
-    "nanvixd.exe",
-    "nanvix_rootfs.img",
-    "python3.initrd",
-    "bin\kernel.elf",
-    "snapshots\kernel.vmem",
-    "snapshots\kernel.whp.cbor"
-)
-$binDir = Split-Path $wxcExe
-$missing = $requiredBinaries | Where-Object { -not (Test-Path (Join-Path $binDir $_)) }
-
-if ($missing) {
-    Write-Host "ERROR: Missing MicroVM binaries in ${binDir}:" -ForegroundColor Red
-    $missing | ForEach-Object { Write-Host "       - $_" }
-    Write-Host "       Build with: cd src && cargo build --features microvm"
+Write-Host "wxc-exec: $wxcExe"
+if (-not $env:MXC_NVX_BUNDLE_DIR) {
+    Write-Host "ERROR: MXC_NVX_BUNDLE_DIR is not set." -ForegroundColor Red
     exit 1
 }
-
-Write-Host "wxc-exec: $wxcExe"
-Write-Host "binaries: $binDir"
+$bundleDir = [System.IO.Path]::GetFullPath($env:MXC_NVX_BUNDLE_DIR)
+$requiredBundleFiles = @("SOURCE-MANIFEST.json", "bin\aci_edge_agent.dll")
+$missing = $requiredBundleFiles | Where-Object { -not (Test-Path (Join-Path $bundleDir $_) -PathType Leaf) }
+if ($missing) {
+    Write-Host "ERROR: MXC_NVX_BUNDLE_DIR is missing required files: $($missing -join ', ')" -ForegroundColor Red
+    exit 1
+}
+Write-Host "NVX bundle: $bundleDir"
 
 # -- Test definitions ---------------------------------------------------------
 
 $tests = @(
     @{ Config = "microvm_hello.json";        ExpectedExit = 0;  Description = "Hello world";                    OutputContains = "sum=100" },
     @{ Config = "microvm_exit_code.json";    ExpectedExit = 42; Description = "Exit code propagation" },
-    @{ Config = "microvm_multiline.json";    ExpectedExit = 0;  Description = "Multi-line script (fibonacci)";  OutputContains = "fib(" },
-    @{ Config = "microvm_stdlib.json";       ExpectedExit = 0;  Description = "Stdlib (json, math, hashlib)";   OutputContains = "pi" },
+    @{ Config = "microvm_multiline.json";    ExpectedExit = 0;  Description = "Shell Fibonacci program";       OutputContains = "fib(" },
+    @{ Config = "microvm_stdlib.json";       ExpectedExit = 0;  Description = "Guest shell and OS";            OutputContains = "shell=busybox" },
     @{ Config = "microvm_large_output.json"; ExpectedExit = 0;  Description = "Large stdout (1000 lines)";      OutputContains = "line 999" },
-    @{ Config = "microvm_error.json";        ExpectedExit = 1;  Description = "Python exception";               OutputContains = "ValueError" },
+    @{ Config = "microvm_error.json";        ExpectedExit = 1;  Description = "Shell error";                    OutputContains = "intentional test error" },
     @{ Config = "microvm_timeout.json";      ExpectedExit = -1; Description = "Timeout kills VM" }
 )
 

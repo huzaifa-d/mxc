@@ -4,7 +4,23 @@
 
 Nanvix MicroVM is an experimental containment backend for MxC. It is powered by the
 [Nanvix OS/VM](https://aka.ms/nanvix) and runs untrusted code with hardware-enforced isolation
-via the Windows Hypervisor Platform (WHP) on Windows or KVM on Linux.
+via KVM on Linux.
+
+> [!IMPORTANT]
+> Active `microvm` execution is the development NVX signed-agent integration
+> on Windows x64. Build with `--with-microvm`, set `MXC_NVX_BUNDLE_DIR` to the
+> verified extracted edge bundle, and pass `--experimental`. This slice
+> preserves the initial create-and-run command, timeout, guest working
+> directory, and additive environment surface. Filesystem, network, proxies,
+> UI, capture-denials, non-default lifecycle settings, streaming, PTY, and
+> lifecycle operations are rejected before VM creation. Compatibility and
+> runtime validation remain false. Nanvix build and runtime paths are inactive,
+> including on Linux. The Rust crate is pinned to NVX `843835760e06` while the
+> available signed edge bundle was published with `4a30cb560277`; digest and
+> capability checks establish development ABI compatibility, not a matched
+> production release. The Windows Nanvix
+> descriptions retained later in this document are historical implementation
+> context, not current runtime instructions.
 
 ## Key Features
 
@@ -14,13 +30,6 @@ via the Windows Hypervisor Platform (WHP) on Windows or KVM on Linux.
 
 ## Requirements
 
-### Windows
-
-- Windows with WHP enabled (`bcdedit /set hypervisorlaunchtype auto`)
-- Nanvix runtime binaries (`nanvixd.exe`, `kernel.elf`, `python3.initrd`, `nanvix_rootfs.img`) placed next to `wxc-exec.exe`
-- Build with `--with-microvm` (`build.bat --with-microvm` or `cargo build -p wxc --features microvm`)
-- `--experimental` flag (Nanvix MicroVM is an experimental feature)
-
 ### Linux
 
 - Linux with KVM available at `/dev/kvm` (and the invoking user has read/write access to it)
@@ -28,8 +37,7 @@ via the Windows Hypervisor Platform (WHP) on Windows or KVM on Linux.
 - Build with `--with-microvm` (`./build.sh --with-microvm` or `cargo build -p lxc --features microvm`)
 - `--experimental` flag (Nanvix MicroVM is an experimental feature)
 
-> **Note:** On Linux, WHP snapshots are not used. Each invocation cold-boots
-> the VM via KVM. Snapshot-based warm-start is Windows-only.
+> **Note:** Each Linux invocation cold-boots the VM via KVM.
 
 ### Offline builds
 
@@ -39,10 +47,7 @@ binaries and point the `NANVIX_BIN` environment variable at the directory
 containing them:
 
 ```
-# Windows (PowerShell)
-$env:NANVIX_BIN = "C:\path\to\nanvix-binaries"
-
-# Linux / macOS
+# Linux
 export NANVIX_BIN=/path/to/nanvix-binaries
 ```
 
