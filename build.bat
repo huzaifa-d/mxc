@@ -131,11 +131,6 @@ for %%T in (x86_64-pc-windows-msvc aarch64-pc-windows-msvc) do (
             copy /Y "!BIN_DIR!\mxc_ffi.dll" "sdk\node\bin\!SDK_ARCH!\" >nul
             echo   Copied !SDK_ARCH!\mxc_ffi.dll
         )
-        if "%WITH_MICROVM%"=="1" if /i "!SDK_ARCH!"=="x64" if exist "!BIN_DIR!\nvx\SOURCE-MANIFEST.json" (
-            if exist "sdk\node\bin\!SDK_ARCH!\nvx" rmdir /S /Q "sdk\node\bin\!SDK_ARCH!\nvx"
-            xcopy /E /I /Y "!BIN_DIR!\nvx" "sdk\node\bin\!SDK_ARCH!\nvx" >nul
-            echo   Copied !SDK_ARCH!\nvx direct runtime
-        )
         if "!COPY_WSLC_RUNTIME!"=="1" (
             if "%WITH_WSLC%"=="1" (
                 for %%B in (wxc-wslc-daemon.exe wslcsdk.dll) do (
@@ -294,7 +289,7 @@ echo   --release   Build release configuration
 echo   --x64       Build for x64 only
 echo   --arm64     Build for ARM64 only
 echo   --all             Build both Windows architectures and create the .NET NuGet package
-echo   --with-microvm    Enable bundled direct NVX MicroVM support (x64)
+echo   --with-microvm    Enable signed-agent NVX MicroVM support (x64; bundle supplied at runtime)
 echo   --with-wslc       Build with WSL Container (WSLC SDK) support
 echo   --with-isolation-session   Build with IsolationSession backend (IsoEnvBroker)
 echo   --with-hyperlight         Build with Hyperlight (micro-VM) backend (x86_64 only)

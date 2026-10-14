@@ -104,7 +104,7 @@ windows-future = { version = "0.3", optional = true }
 winreg.workspace = true
 
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
-aci_edge_sandboxes = { git = "https://github.com/microsoft/nvx", rev = "57b4a428218951778794931b18d10f99b8ee7583", default-features = false, features = ["openvmm", "bundled"], optional = true }
+aci_edge_sandboxes = { git = "https://github.com/microsoft/nvx", rev = "843835760e0613a7153c9b4a1f1da8fe450dffe0", default-features = false, features = ["agent"], optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 cc = "1"

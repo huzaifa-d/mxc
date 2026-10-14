@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Minimal one-shot adapter for the direct bundled NVX runtime.
+//! Minimal one-shot adapter for the signed NVX agent runtime.
 
 use std::time::Duration;
 

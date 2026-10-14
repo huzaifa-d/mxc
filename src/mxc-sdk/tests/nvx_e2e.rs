@@ -26,7 +26,7 @@ fn run_nonce(label: &str) {
     );
     let command = format!("printf '{}\\n'; uname -s", nonce.replace('\'', "'\"'\"'"));
     let result = mxc_sdk::__ffi::run_json(&process_only_request(&command).to_string(), true)
-        .expect("exact alpha MicroVM request should run through direct NVX");
+        .expect("exact alpha MicroVM request should run through the signed NVX agent");
     assert_eq!(
         result.outcome,
         WaitResult::Exited(0),
@@ -68,36 +68,34 @@ fn unsupported_policy_is_rejected_before_runtime_discovery() {
 }
 
 #[test]
-fn explicit_missing_artifact_directory_is_backend_unavailable() {
-    if std::env::var_os("MXC_NVX_MISSING_ARTIFACTS_CHILD").is_some() {
+fn missing_bundle_is_backend_unavailable() {
+    if std::env::var_os("MXC_NVX_MISSING_BUNDLE_CHILD").is_some() {
         let request = process_only_request("printf ok");
         let error = mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err();
         assert_eq!(error.code, ErrorCode::BackendUnavailable);
-        assert!(error.message.contains("NVX"));
+        assert!(error.message.contains("MXC_NVX_BUNDLE_DIR"));
         return;
     }
 
-    let missing =
-        std::env::temp_dir().join(format!("missing-nvx-artifacts-{}", std::process::id()));
     let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
-        .arg("explicit_missing_artifact_directory_is_backend_unavailable")
+        .arg("missing_bundle_is_backend_unavailable")
         .arg("--nocapture")
-        .env("MXC_NVX_MISSING_ARTIFACTS_CHILD", "1")
-        .env("NVX_ARTIFACTS_DIR", missing)
+        .env("MXC_NVX_MISSING_BUNDLE_CHILD", "1")
+        .env_remove("MXC_NVX_BUNDLE_DIR")
         .output()
-        .expect("launch isolated missing-artifacts test");
+        .expect("launch isolated missing-bundle test");
     assert!(
         output.status.success(),
-        "isolated missing-artifacts test failed\nstdout: {}\nstderr: {}",
+        "isolated missing-bundle test failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-#[ignore = "requires Windows x64 and WHP"]
-fn exact_alpha_json_runs_twice_through_direct_nvx() {
+#[ignore = "requires Windows x64, WHP, MXC_NVX_BUNDLE_DIR, and MCR access"]
+fn exact_alpha_json_runs_twice_through_signed_nvx_agent() {
     run_nonce("mxc-nvx-first");
     run_nonce("mxc-nvx-second");
 }

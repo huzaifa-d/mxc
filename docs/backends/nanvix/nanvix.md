@@ -7,14 +7,18 @@ Nanvix MicroVM is an experimental containment backend for MxC. It is powered by 
 via KVM on Linux.
 
 > [!IMPORTANT]
-> Active `microvm` execution is the development direct NVX integration on
-> Windows x64. Build with `--with-microvm` and pass `--experimental`; the
-> pinned NVX release is staged by Cargo. This initial slice supports only
-> create-and-run command, timeout, guest working directory, and additive
-> environment settings. Filesystem, network, proxies, UI, capture-denials,
-> non-default lifecycle settings, streaming, PTY, and lifecycle operations are
-> rejected before VM creation. Nanvix build and runtime paths are inactive,
-> including on Linux. The Windows Nanvix
+> Active `microvm` execution is the development NVX signed-agent integration
+> on Windows x64. Build with `--with-microvm`, set `MXC_NVX_BUNDLE_DIR` to the
+> verified extracted edge bundle, and pass `--experimental`. This slice
+> preserves the initial create-and-run command, timeout, guest working
+> directory, and additive environment surface. Filesystem, network, proxies,
+> UI, capture-denials, non-default lifecycle settings, streaming, PTY, and
+> lifecycle operations are rejected before VM creation. Compatibility and
+> runtime validation remain false. Nanvix build and runtime paths are inactive,
+> including on Linux. The Rust crate is pinned to NVX `843835760e06` while the
+> available signed edge bundle was published with `4a30cb560277`; digest and
+> capability checks establish development ABI compatibility, not a matched
+> production release. The Windows Nanvix
 > descriptions retained later in this document are historical implementation
 > context, not current runtime instructions.
 

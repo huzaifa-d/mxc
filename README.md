@@ -58,13 +58,21 @@ Linux, and macOS.
 
 \* These backends are **experimental**.
 
-The Windows x64 `microvm` backend is a development NVX integration. A build
-with `--with-microvm` stages the pinned direct NVX release and requires the
-runtime `--experimental` opt-in. This initial slice supports create-and-run
-execution with the command, timeout, guest working directory, and additive
+The Windows x64 `microvm` backend is a development NVX signed-agent
+integration. Set `MXC_NVX_BUNDLE_DIR` to the manually verified and extracted
+signed edge bundle before running it. NVX state defaults to
+`%LOCALAPPDATA%\Microsoft\MXC\NVX`; `MXC_NVX_STATE_ROOT` overrides that private
+directory. This slice requires `--experimental` and preserves the initial
+create-and-run surface: command, timeout, guest working directory, and additive
 environment settings. Filesystem, network, proxy, UI, capture-denials,
 non-default lifecycle, streaming, PTY, and container lifecycle operations
-remain fail-closed. Linux MicroVM execution is inactive in this phase.
+remain fail-closed. The release manifest continues to report
+`mxcCompatible=false` and `runtimeValidated=false`.
+The Rust adapter is pinned to NVX commit `843835760e06`; the currently
+available signed edge bundle is the development artifact published with
+`4a30cb560277`. The adapter verifies its manifest and library digests and
+requires the runtime capability handshake, but this ABI-compatible combination
+is test evidence rather than a matched production release.
 
 ## How do I use MXC?
 

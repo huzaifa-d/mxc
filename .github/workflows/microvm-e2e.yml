@@ -35,6 +35,38 @@ jobs:
         with:
           workspaces: src
 
+      - name: Download and verify signed NVX agent bundle
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $release = Join-Path $env:RUNNER_TEMP "nvx-agent-release"
+          New-Item -ItemType Directory -Force $release | Out-Null
+          gh release download v0.1.0-dev.4a30cb560277 `
+            --repo microsoft/nvx `
+            --pattern aci-edge-sandboxes.zip `
+            --dir $release
+          $archive = Join-Path $release "aci-edge-sandboxes.zip"
+          $expectedArchive = "b22c39abafe889dd20f62a7e49bc3aa7dbf09b0f0f779b98c82df0ac52d5dc80"
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expectedArchive) {
+            throw "NVX release ZIP digest mismatch"
+          }
+          $bundle = Join-Path $release "bundle"
+          Expand-Archive -LiteralPath $archive -DestinationPath $bundle
+          $entries = @(Get-Content (Join-Path $bundle "SHA256SUMS"))
+          if ($entries.Count -ne 17) {
+            throw "Expected 17 signed-bundle entries, got $($entries.Count)"
+          }
+          foreach ($entry in $entries) {
+            $parts = $entry -split '\s+\*?', 2
+            $file = Join-Path $bundle $parts[1]
+            if ($parts.Count -ne 2 -or (Get-FileHash $file -Algorithm SHA256).Hash -ne $parts[0]) {
+              throw "NVX bundle file digest mismatch: $file"
+            }
+          }
+          "MXC_NVX_BUNDLE_DIR=$bundle" | Out-File $env:GITHUB_ENV -Append
+          "MXC_NVX_STATE_ROOT=$(Join-Path $release 'state')" | Out-File $env:GITHUB_ENV -Append
+
       - name: Build with MicroVM support
         working-directory: src
         env:
@@ -49,11 +81,15 @@ jobs:
           Add-MpPreference -ExclusionPath $binDir
           Write-Host "Added Defender exclusion for $binDir"
 
-      - name: Verify MicroVM executable
+      - name: Verify MicroVM inputs
         shell: pwsh
         run: |
           $binDir = Join-Path $env:GITHUB_WORKSPACE "src\target\x86_64-pc-windows-msvc\debug"
-          $required = @((Join-Path $binDir "wxc-exec.exe"))
+          $required = @(
+            (Join-Path $binDir "wxc-exec.exe"),
+            (Join-Path $env:MXC_NVX_BUNDLE_DIR "SOURCE-MANIFEST.json"),
+            (Join-Path $env:MXC_NVX_BUNDLE_DIR "bin\aci_edge_agent.dll")
+          )
           $missing = $required | Where-Object { -not (Test-Path $_ -PathType Leaf) }
           if ($missing) {
             Write-Host "::error::Missing binaries: $($missing -join ', ')"
