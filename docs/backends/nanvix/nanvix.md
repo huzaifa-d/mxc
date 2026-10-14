@@ -4,7 +4,19 @@
 
 Nanvix MicroVM is an experimental containment backend for MxC. It is powered by the
 [Nanvix OS/VM](https://aka.ms/nanvix) and runs untrusted code with hardware-enforced isolation
-via the Windows Hypervisor Platform (WHP) on Windows or KVM on Linux.
+via KVM on Linux.
+
+> [!IMPORTANT]
+> Active `microvm` execution is the development direct NVX integration on
+> Windows x64. Build with `--with-microvm` and pass `--experimental`; the
+> pinned NVX release is staged by Cargo. This initial slice supports only
+> create-and-run command, timeout, guest working directory, and additive
+> environment settings. Filesystem, network, proxies, UI, capture-denials,
+> non-default lifecycle settings, streaming, PTY, and lifecycle operations are
+> rejected before VM creation. Nanvix build and runtime paths are inactive,
+> including on Linux. The Windows Nanvix
+> descriptions retained later in this document are historical implementation
+> context, not current runtime instructions.
 
 ## Key Features
 
@@ -14,13 +26,6 @@ via the Windows Hypervisor Platform (WHP) on Windows or KVM on Linux.
 
 ## Requirements
 
-### Windows
-
-- Windows with WHP enabled (`bcdedit /set hypervisorlaunchtype auto`)
-- Nanvix runtime binaries (`nanvixd.exe`, `kernel.elf`, `python3.initrd`, `nanvix_rootfs.img`) placed next to `wxc-exec.exe`
-- Build with `--with-microvm` (`build.bat --with-microvm` or `cargo build -p wxc --features microvm`)
-- `--experimental` flag (Nanvix MicroVM is an experimental feature)
-
 ### Linux
 
 - Linux with KVM available at `/dev/kvm` (and the invoking user has read/write access to it)
@@ -28,8 +33,7 @@ via the Windows Hypervisor Platform (WHP) on Windows or KVM on Linux.
 - Build with `--with-microvm` (`./build.sh --with-microvm` or `cargo build -p lxc --features microvm`)
 - `--experimental` flag (Nanvix MicroVM is an experimental feature)
 
-> **Note:** On Linux, WHP snapshots are not used. Each invocation cold-boots
-> the VM via KVM. Snapshot-based warm-start is Windows-only.
+> **Note:** Each Linux invocation cold-boots the VM via KVM.
 
 ### Offline builds
 
@@ -39,10 +43,7 @@ binaries and point the `NANVIX_BIN` environment variable at the directory
 containing them:
 
 ```
-# Windows (PowerShell)
-$env:NANVIX_BIN = "C:\path\to\nanvix-binaries"
-
-# Linux / macOS
+# Linux
 export NANVIX_BIN=/path/to/nanvix-binaries
 ```
 
