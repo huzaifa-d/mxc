@@ -177,6 +177,27 @@ temporary storage without creating directories.
 
 ## Internal modules and executor binaries
 
+### Experimental NVX create-and-run
+
+The `microvm` feature enables only Windows x64 and requires runtime experimental
+authorization. P1 uses the official signed `aci_edge_sandboxes` bundled agent at
+immutable Git revision `0430ce79d125203c20f0aa69243480513a774296`; it does not
+enable the standalone OpenVMM feature. This development crate has
+`publish = false`.
+
+The existing hidden JSON facade `mxc_sdk::__ffi::run_json(json, true)` supports
+the development `1.1.0-alpha` MicroVM create-and-run request with captured
+stdout/stderr, exit status and timeout. Typed V1 targeting, streaming, PTY and
+public Rust container lifecycle operations are not broadened by P1.
+Distribute the complete `aci-edge-sandboxes/` directory beside the consuming
+executable. The native agent pulls the official example's public Azure Linux
+workload image on the host; guest network access remains ungranted.
+
+The host requires Windows Hypervisor Platform and hardware virtualization.
+Requests cannot include filesystem grants or denials, network or proxy policy,
+UI policy, or capture-denials. Containers must be destroyed after execution,
+without preserving policy.
+
 Backend implementations, shared runtime support, backend dispatch, and host
 probing are internal modules of this published crate. The crate root exposes
 only the versioned public SDK and explicitly hidden compatibility surfaces used
