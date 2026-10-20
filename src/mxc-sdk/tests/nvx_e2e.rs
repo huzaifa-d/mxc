@@ -121,6 +121,22 @@ mod windows_x64 {
             ("preserve", json!({"lifecycle": {"preservePolicy": true}})),
             ("timeout-limit", json!({"process": {"timeout": 3_600_001}})),
             ("parent-cwd", json!({"process": {"cwd": "/tmp/../escape"}})),
+            (
+                "parent-cwd-unc-share",
+                json!({"process": {"cwd": "//tmp/../escape"}}),
+            ),
+            (
+                "parent-cwd-unc-end",
+                json!({"process": {"cwd": "//tmp/.."}}),
+            ),
+            (
+                "parent-cwd-unc-server",
+                json!({"process": {"cwd": "//../tmp"}}),
+            ),
+            (
+                "parent-cwd-triple-slash",
+                json!({"process": {"cwd": "///tmp/../escape"}}),
+            ),
             ("relative-cwd", json!({"process": {"cwd": "relative"}})),
             (
                 "replacement-env",
@@ -141,6 +157,40 @@ mod windows_x64 {
             (
                 "null-command",
                 json!({"process": {"commandLine": "printf forbidden\0"}}),
+            ),
+        ]
+    }
+
+    fn capability_requests() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "safe-cwd-double-slash",
+                json!({"process": {"cwd": "//tmp/work"}}),
+            ),
+            (
+                "readonly",
+                json!({"filesystem": {"readonlyPaths": ["C:\\work"]}}),
+            ),
+            (
+                "readwrite",
+                json!({"filesystem": {"readwritePaths": ["C:\\work"]}}),
+            ),
+            (
+                "denied",
+                json!({"filesystem": {"deniedPaths": ["C:\\work"]}}),
+            ),
+            ("network-empty", json!({"network": {}})),
+            (
+                "network-deny",
+                json!({"network": {"egress": {"default": "deny"}}}),
+            ),
+            (
+                "network-allow",
+                json!({"network": {"egress": {"default": "allow"}}}),
+            ),
+            (
+                "proxy",
+                json!({"runtimeConfig": {"networkProxy": "http://127.0.0.1:8080"}}),
             ),
         ]
     }
@@ -212,10 +262,39 @@ mod windows_x64 {
                 assert_eq!(error.message, MIXED_BACKEND_ERROR, "{label}");
             } else if label == "fallback" {
                 assert_eq!(error.code, ErrorCode::PolicyValidation);
+            } else if label.starts_with("parent-cwd") {
+                assert_eq!(error.code, ErrorCode::PolicyValidation, "{label}");
+                assert_eq!(
+                    error.message, "NVX process.cwd must not contain '..' path components",
+                    "{label}"
+                );
+            } else if label == "relative-cwd" {
+                assert_eq!(error.code, ErrorCode::PolicyValidation);
+                assert_eq!(
+                    error.message,
+                    "NVX process.cwd must be an absolute POSIX guest path"
+                );
             }
             println!(
                 "HOST_ONLY rejected {label}: {:?}: {}",
                 error.code, error.message
+            );
+        }
+
+        // These capability-aware policies are accepted. With the signed bundle deliberately
+        // unavailable, each request must pass contract validation and stop at backend discovery.
+        for (label, patch) in capability_requests() {
+            let request = request_with_patch(patch);
+            let error = mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err();
+            assert_eq!(
+                error.code,
+                ErrorCode::BackendUnavailable,
+                "{label} must reach bundle discovery: {error:?}"
+            );
+            assert!(error.message.contains("NVX"), "{label}: {error:?}");
+            println!(
+                "HOST_ONLY accepted {label} through bundle discovery: {}",
+                error.message
             );
         }
 
@@ -231,13 +310,15 @@ mod windows_x64 {
 
         let streaming = mxc_sdk::__ffi::spawn_container_json(&request, true)
             .err()
-            .expect("P1 must reject streaming");
-        assert_eq!(streaming.code, ErrorCode::UnsupportedContainment);
+            .expect("missing bundle must prevent streaming");
+        assert_eq!(streaming.code, ErrorCode::BackendUnavailable);
+        assert!(streaming.message.contains("NVX"));
         let pty =
             mxc_sdk::__ffi::spawn_with_pty_json(&request, true, Default::default()).unwrap_err();
         assert_eq!(pty.code, ErrorCode::UnsupportedContainment);
         let lifecycle = json!({
-            "version": "1.1.0-alpha", "phase": "provision", "containment": "microvm"
+            "version": "1.1.0-alpha", "phase": "provision", "containment": "microvm",
+            "microvm": {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"}
         });
         assert!(mxc_sdk::__ffi::run_lifecycle_json(&lifecycle.to_string(), false, true).is_err());
     }
@@ -298,6 +379,20 @@ mod windows_x64 {
             );
             assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden"));
             println!("HOST_ONLY executor rejected {label}: {stderr}");
+        }
+
+        // The executor remains captured create-and-run, but capability-aware policy is
+        // valid and therefore advances to the deliberately unavailable signed-bundle boundary.
+        for (label, patch) in capability_requests() {
+            let output = executor_output(&request_with_patch(patch), true);
+            assert!(!output.status.success(), "executor ran {label}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("backend_unavailable") && stderr.contains("NVX"),
+                "{label} did not reach bundle discovery: {stderr}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden"));
+            println!("HOST_ONLY executor accepted {label}: {stderr}");
         }
     }
 
