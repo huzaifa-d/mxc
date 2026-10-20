@@ -3,10 +3,8 @@
 
 //! Minimal create-and-run adapter for the signed bundled NVX agent.
 
+use aci_edge_sandboxes::ExecOutcome;
 use std::io::Write;
-use std::time::Duration;
-
-use aci_edge_sandboxes::{ExecOutcome, ExecRequest, ProvisionRequest};
 
 use crate::mxc_common::audit::{AuditEvent, AuditEventName};
 use crate::mxc_common::logger::Logger;
@@ -53,12 +51,15 @@ impl NvxRunner {
         let prepared = (|| {
             let client = super::runtime::create_client(state_root.path())?;
             client.probe().map_err(super::runtime::map_nvx_error)?;
+            let capabilities = client.capabilities();
+            let (provision, spec) = super::policy::provision_request(request, &capabilities)?;
+            let exec = super::policy::exec_request(request, &capabilities)?;
             let provisioned = client
-                .provision_with(&ProvisionRequest::new(), &super::runtime::sandbox_spec())
+                .provision_with(&provision, &spec)
                 .map_err(super::runtime::map_nvx_error)?;
-            Ok((client, provisioned.sandbox_id))
+            Ok((client, provisioned.sandbox_id, exec))
         })();
-        let (client, sandbox_id) = match prepared {
+        let (client, sandbox_id, exec) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 let cleanup = state_root
@@ -84,7 +85,7 @@ impl NvxRunner {
                 .start(&sandbox_id)
                 .map_err(super::runtime::map_nvx_error)?;
             client
-                .exec(&sandbox_id, &exec_request(request))
+                .exec(&sandbox_id, &exec)
                 .map_err(super::runtime::map_nvx_error)?
                 .wait_with_output()
                 .map_err(super::runtime::map_nvx_error)
@@ -243,20 +244,6 @@ fn captured_to_script_response(
     })
 }
 
-fn exec_request(request: &ExecutionRequest) -> ExecRequest {
-    let mut exec = ExecRequest::command_line(request.script_code.clone());
-    if request.script_timeout != 0 {
-        exec = exec.with_timeout(Duration::from_millis(u64::from(request.script_timeout)));
-    }
-    if !request.working_directory.is_empty() {
-        exec = exec.with_cwd(request.working_directory.clone());
-    }
-    if let Some(environment) = &request.env {
-        exec = exec.with_envs(environment.clone());
-    }
-    exec.with_inherit_default_env(request.inherit_default_env)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,15 +390,21 @@ mod tests {
 
     #[test]
     fn process_mapping_preserves_command_timeout_cwd_and_environment_presence() {
+        use std::time::Duration;
+        let mut capabilities = aci_edge_sandboxes::Capabilities::new("agent");
+        capabilities.exec.command_line = true;
+        capabilities.exec.cwd = true;
+        capabilities.exec.env = true;
         let request = ExecutionRequest {
             script_code: "printf '%s' \"$KEY\"".to_owned(),
             working_directory: "/tmp".to_owned(),
             script_timeout: 250,
             env: Some(Vec::new()),
             inherit_default_env: true,
+            microvm_image: Some("python:3.12-alpine".to_owned()),
             ..Default::default()
         };
-        let mapped = exec_request(&request);
+        let mapped = super::super::policy::exec_request(&request, &capabilities).unwrap();
         assert_eq!(
             mapped.process.command,
             aci_edge_sandboxes::Command::CommandLine(request.script_code)
@@ -421,7 +414,14 @@ mod tests {
         assert_eq!(mapped.process.env, Some(Vec::new()));
         assert_eq!(mapped.process.inherit_default_env, Some(true));
 
-        let defaults = exec_request(&ExecutionRequest::default());
+        let defaults = super::super::policy::exec_request(
+            &ExecutionRequest {
+                microvm_image: Some("python:3.12-alpine".to_owned()),
+                ..Default::default()
+            },
+            &capabilities,
+        )
+        .unwrap();
         assert_eq!(defaults.process.env, None);
         assert_eq!(defaults.process.timeout, None);
         assert_eq!(defaults.process.cwd, None);

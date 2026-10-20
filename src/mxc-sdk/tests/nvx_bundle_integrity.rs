@@ -36,11 +36,12 @@ fn fixture() -> (tempfile::TempDir, Vec<(&'static str, String)>) {
 }
 
 fn verify(directory: &std::path::Path, expected: &[(&str, String)]) {
+    let directory = directory.canonicalize().expect("canonical fixture root");
     let expected: Vec<(&str, &str)> = expected
         .iter()
         .map(|(path, digest)| (*path, digest.as_str()))
         .collect();
-    build_nvx_bundled::verify_bundle_against(directory, &expected);
+    build_nvx_bundled::verify_bundle_against(&directory, &expected);
 }
 
 #[test]

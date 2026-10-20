@@ -180,23 +180,28 @@ temporary storage without creating directories.
 ### Experimental NVX create-and-run
 
 The `microvm` feature enables only Windows x64 and requires runtime experimental
-authorization. P1 uses the official signed `aci_edge_sandboxes` bundled agent at
+authorization. MXC uses the official signed `aci_edge_sandboxes` bundled agent at
 immutable Git revision `0430ce79d125203c20f0aa69243480513a774296`; it does not
 enable the standalone OpenVMM feature. This development crate has
 `publish = false`.
 
-The existing hidden JSON facade `mxc_sdk::__ffi::run_json(json, true)` supports
-the development `1.1.0-alpha` MicroVM create-and-run request with captured
-stdout/stderr, exit status and timeout. Typed V1 targeting, streaming, PTY and
-public Rust container lifecycle operations are not broadened by P1.
+`mxc_sdk::v1::experimental::run(request, options)` supports typed MicroVM
+create-and-run requests with captured stdout/stderr, exit status and timeout.
+Select `Containment::MicroVm { image: String }` with a required registry image
+reference. The hidden JSON facade `mxc_sdk::__ffi::run_json(json, true)` accepts
+the development `1.1.0-alpha` contract with root `"microvm": {"image": "..."}`.
+Stable `run` and `spawn` do not authorize this backend. Streaming, PTY and
+public Rust MicroVM container lifecycle operations are not available.
 Distribute the complete `aci-edge-sandboxes/` directory beside the consuming
-executable. The native agent pulls the official example's public Azure Linux
-workload image on the host; guest network access remains ungranted.
+executable. The native agent resolves the caller's image reference on the host;
+there is no default image or local image-file input.
 
 The host requires Windows Hypervisor Platform and hardware virtualization.
-Requests cannot include filesystem grants or denials, network or proxy policy,
-UI policy, or capture-denials. Containers must be destroyed after execution,
-without preserving policy.
+Filesystem read-only, read-write and denied paths, directional network policy
+and `runtimeConfig.networkProxy` are mapped to the NVX runtime and checked
+against its advertised capabilities before sandbox creation. Unsupported policy
+fails closed. UI policy and capture-denials are unsupported. Containers must be
+destroyed after execution without preserving policy.
 
 Backend implementations, shared runtime support, backend dispatch, and host
 probing are internal modules of this published crate. The crate root exposes

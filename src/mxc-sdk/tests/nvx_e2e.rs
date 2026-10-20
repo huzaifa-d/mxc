@@ -7,8 +7,53 @@ fn process_only_request(command: &str) -> serde_json::Value {
     serde_json::json!({
         "version": "1.1.0-alpha",
         "containment": "microvm",
+        "microvm": {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"},
         "process": { "commandLine": command, "timeout": 30_000 }
     })
+}
+
+#[test]
+fn microvm_creation_rejects_missing_and_blank_images_before_runtime() {
+    for image in [None, Some(""), Some(" "), Some("\n")] {
+        let mut request = process_only_request("printf forbidden");
+        request.as_object_mut().unwrap().remove("microvm");
+        if let Some(image) = image {
+            request["microvm"] = serde_json::json!({"image": image});
+        }
+        let error = mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
+        assert!(error.message.contains("microvm.image"), "{error}");
+    }
+}
+
+#[test]
+fn microvm_typed_stable_run_and_spawn_require_optin() {
+    for spawn in [false, true] {
+        let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+        request.containment = mxc_sdk::v1::Containment::MicroVm {
+            image: "python:3.12-alpine".to_owned(),
+        };
+        let error = if spawn {
+            mxc_sdk::v1::spawn(request, Default::default())
+                .err()
+                .expect("stable spawn must reject MicroVM")
+        } else {
+            mxc_sdk::v1::run(request, Default::default()).unwrap_err()
+        };
+        assert_eq!(error.code, ErrorCode::BackendUnavailable, "{error}");
+        assert!(error.message.contains("experimental"), "{error}");
+    }
+}
+
+#[test]
+fn microvm_experimental_typed_run_rejects_blank_image_before_runtime() {
+    let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+    request.containment = mxc_sdk::v1::Containment::MicroVm {
+        image: " ".to_owned(),
+    };
+    let error = mxc_sdk::v1::experimental::run(request, Default::default()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
+    assert!(error.message.contains("microvm.image"), "{error}");
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64", feature = "microvm")))]
@@ -49,31 +94,6 @@ mod windows_x64 {
 
     fn rejected_requests() -> Vec<(&'static str, Value)> {
         vec![
-            (
-                "readonly",
-                json!({"filesystem": {"readonlyPaths": ["C:\\work"]}}),
-            ),
-            (
-                "readwrite",
-                json!({"filesystem": {"readwritePaths": ["C:\\work"]}}),
-            ),
-            (
-                "denied",
-                json!({"filesystem": {"deniedPaths": ["C:\\work"]}}),
-            ),
-            ("network-empty", json!({"network": {}})),
-            (
-                "network-deny",
-                json!({"network": {"egress": {"default": "deny"}}}),
-            ),
-            (
-                "network-allow",
-                json!({"network": {"egress": {"default": "allow"}}}),
-            ),
-            (
-                "proxy",
-                json!({"runtimeConfig": {"networkProxy": "http://127.0.0.1:8080"}}),
-            ),
             ("ui", json!({"ui": {"disable": true}})),
             (
                 "capture",

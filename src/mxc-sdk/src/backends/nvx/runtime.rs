@@ -14,12 +14,10 @@ pub(super) fn create_client(state_root: &Path) -> Result<AciEdgeSandbox, MxcErro
     AciEdgeSandbox::agent(config).map_err(map_nvx_error)
 }
 
-pub(super) fn sandbox_spec() -> SandboxSpec {
-    // The edge initramfs is the control guest, not a workload userland. Use the official
-    // example's public image; its host-side pull does not grant the workload network access.
-    SandboxSpec::new().with_image(ImageSource::Reference(
-        "mcr.microsoft.com/azurelinux/base/core:3.0".to_owned(),
-    ))
+pub(super) fn sandbox_spec(image: &str) -> Result<SandboxSpec, MxcError> {
+    crate::mxc_contract::dev::ImageReference::validate(image)
+        .map_err(MxcError::malformed_request)?;
+    Ok(SandboxSpec::new().with_image(ImageSource::Reference(image.to_owned())))
 }
 
 pub(super) fn map_nvx_error(error: aci_edge_sandboxes::Error) -> MxcError {
