@@ -227,7 +227,7 @@ publication.
 ### 3.1 MXC integration
 
 `mxc_engine` will resolve `containment: "microvm"` to the NVX runner.
-The backend stays in `mxc-sdk` under `src/backends/nvx/`.
+The backend stays in `mxc-sdk` under `src/mxc-sdk/src/backends/nvx/`.
 [Appendix E.2](#e2-mxc-integration) describes the runner interfaces, SDK
 paths, and NVX calls.
 [Appendix A](#appendix-a-nvx-openvmm-and-guest-architecture) describes the
@@ -271,10 +271,10 @@ how NVX maps the network policy to OpenVMM.
 | `protocol: any` with ports | Yes |
 | `network.ingress.default: deny` | Yes |
 | `network.ingress.hostLoopback: deny` | Yes |
-| IPv6 rules | No |
-| ICMP-only rules | No |
+| IPv6 rules | Yes |
+| ICMP-only rules | Yes |
 | `network.ingress.default: allow` | No |
-| `network.ingress.hostLoopback: allow` | No |
+| `network.ingress.hostLoopback: allow` | Yes |
 | `runtimeConfig.networkProxy` | Yes |
 
 [Appendix F](#appendix-f-schema-and-policy-implementation-details) lists the
@@ -291,29 +291,29 @@ request shape.
 
 | MXC phase | How NVX handles it |
 | --- | --- |
-| `provision` | Resolves the OCI reference to an immutable digest. Selects or creates the converted artifact. Stores that identity with the configuration. Returns an NVX instance ID. |
+| `provision` | Resolves the OCI reference to an immutable digest. Selects or creates the converted artifact. Stores that identity with the configuration. Returns an MXC container ID. |
 | `start` | Launches OpenVMM and waits for the guest agent |
 | `exec` | Runs a workload in the running VM |
 | `stop` | Stops the VM while retaining provisioned state |
 | `deprovision` | Removes the provisioned state |
 | One-shot | MXC will compose provision, start, exec, stop, and deprovision |
 
-MXC will preserve the NVX instance ID unchanged. NVX provision returns IDs in
-the following form:
+MXC will expose container IDs in the following form:
 
 ```text
-aci-edge-sandboxes:<32 lowercase hexadecimal characters>
+microvm:<32 lowercase hexadecimal characters>
 ```
 
-MXC will register the `aci-edge-sandboxes:` prefix in
-`mxc_engine::backend_from_prefix` and state-aware dispatch so `start`, `exec`,
-`stop`, and `deprovision` route back to the NVX runner.
+MXC will register the `microvm:` prefix in state-aware dispatch so `start`,
+`exec`, `stop`, and `deprovision` route back to the NVX runner. The NVX backend
+will translate between this public ID and the native
+`aci-edge-sandboxes:<32 lowercase hexadecimal characters>` ID.
 
 [Appendix F](#appendix-f-schema-and-policy-implementation-details) describes
 ID routing, cleanup behavior, and repeated `exec` calls.
 
-- NVX runs one workload at a time. A second `exec` waits for up to 60 seconds
-  by default.
+- NVX runs up to 16 workloads at once in one sandbox. An additional `exec`
+  fails with `backend_error`.
 - `stop` waits for up to 30 seconds before forcing the VM to shut down.
 - Cancelling an SDK wait does not kill the workload. Use the execution handle
   to cancel the workload and its descendants.
@@ -330,7 +330,7 @@ ID routing, cleanup behavior, and repeated `exec` calls.
 | Separate stdout and stderr | Captured and streaming | Preserve distinct streams and the execution outcome |
 | Live stdin | Supported by the native agent | MXC streaming adapters must expose the pipe and explicit EOF ownership |
 | PTY | Unsupported | Future work needed; Reject before workload launch |
-| Guest memory override | Native capability; proposed provision setting | Use optional `microvm.provision.memoryMib`. Create-and-run memory control remains undecided. |
+| Guest memory override | Native capability; development setting | Use optional `microvm.provision.memoryMib` for create-and-run and provision. |
 | `fallback` | Unsupported | Reject. NVX does not select another backend. |
 
 [Appendix F](#appendix-f-schema-and-policy-implementation-details) describes
@@ -421,7 +421,7 @@ distinct timed-out result. `wxc-exec` is not part of the public NVX SDK API.
 | Lifecycle | Test each lifecycle phase and the exact ID prefix. Test repeated and overlapping exec calls. Test reconnect, invalid transitions, stale IDs, prefix isolation, and one-shot cleanup. |
 | Container process lifetime | Use the signed agent's process-lifetime contract, not a direct `OpenVmmConfig` setting in MXC. Verify persistence after the caller exits and reconnection from a later process. Surface host restrictions explicitly. |
 | SDKs and FFI | Rust, Node, and .NET produce the same policy and results. Verify `mxc_ffi` handle ownership and cleanup. Node registers the NVX runtime directory before `getPlatformSupport()` or execution. .NET registers both request shapes in `MxcJsonContext` and tests them in `Microsoft.Mxc.Sdk.AotSmokeTest`. |
-| Filesystem | Test read-only, read-write, and denied paths. Test files, directories, multiple mappings, and invalid combinations. Test file ownership, ACL inheritance, protected roots, aliases, reparse points, path limits, and command-line limits. |
+| Filesystem | Test read-only, read-write, and denied paths. Test files, directories, multiple mappings, and invalid combinations. Test file ownership, ACL inheritance, protected roots, ancestor and drive-root mappings, aliases, reparse points, path limits, and command-line limits. |
 | Network | Defaults, allow/deny precedence, CIDRs, exclusions, TCP/UDP ranges, and rejection of unsupported rules |
 | Process | Test command, CWD, environment, cancellation, output limits, nonzero exits, and descendant cleanup. Test timeouts through the three in-process SDK paths. Exclude the relayed `wxc-exec` path from timeout tests. |
 | PTY | Verify that the initial implementation rejects PTY requests. Add terminal tests when PTY support is available. |
@@ -524,7 +524,7 @@ NVX's `SandboxSpec`.
 | `TimedOut` through an in-process Piped SDK path | Will return the existing MXC timed-out result |
 | `TimedOut` through the `wxc-exec` Relayed path | The relay cannot return a distinct timeout. Tests exclude this path. A returned `TimedOut` value produces `backend_error`. |
 | `Cancelled` | Live handles return exit code `137`. The captured mapper treats unexpected cancellation as `backend_error`. |
-| `Failed(WorkingDirectory)` | Will return `backend_error` with the working-directory failure |
+| Working-directory setup failure | Will return exit code `126` and an `NVX-EDGE-STAGE-ERROR` diagnostic on stderr |
 | No outcome available | Will return `backend_error`. It will not invent a workload exit code. |
 
 ## Appendix C: OCI image conversion requirements
@@ -941,8 +941,10 @@ For example, `C:\nvx-work\input` maps to `/mnt/c/nvx-work/input`.
 The native-agent README describes one common export with per-path guest mounts.
 Its mount arguments must fit the guest's 1024-byte kernel command line.
 
-MXC will reject mappings at or below protected Windows host roots.
-These include Windows, Program Files, Program Files (x86), and ProgramData.
+MXC will reject mappings at or below protected Windows host roots, and
+mappings that contain a protected root. These roots include Windows, Program
+Files, Program Files (x86), and ProgramData. A drive-root mapping such as
+`C:\` is rejected because it contains protected roots.
 Use canonical paths and Windows Known Folder resolution.
 Case differences, short names, junctions, and reparse points must not bypass
 the rule.
