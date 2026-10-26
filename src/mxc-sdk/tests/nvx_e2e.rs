@@ -25,7 +25,7 @@ fn unsupported_platform_or_feature_is_fail_closed() {
 mod windows_x64 {
     use std::path::PathBuf;
     use std::process::{Command, Output, Stdio};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use mxc_sdk::v1::{ExecutionResult, WaitResult};
     use serde_json::{json, Value};
@@ -474,6 +474,106 @@ mod windows_x64 {
         assert_eq!(result.outcome, WaitResult::Exited(0));
         assert_eq!(result.stdout, b"after-overflow");
         println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/capture-limit/cleanup");
+    }
+
+    #[test]
+    #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
+    fn signed_bundle_executor_configs() {
+        let cases = [
+            (
+                "microvm_hello.json",
+                include_str!("../../../tests/configs/microvm_hello.json"),
+                0,
+                Some("sum=100"),
+                "Hello world",
+            ),
+            (
+                "microvm_exit_code.json",
+                include_str!("../../../tests/configs/microvm_exit_code.json"),
+                42,
+                None,
+                "Exit code propagation",
+            ),
+            (
+                "microvm_multiline.json",
+                include_str!("../../../tests/configs/microvm_multiline.json"),
+                0,
+                Some("fib("),
+                "Shell Fibonacci program",
+            ),
+            (
+                "microvm_stdlib.json",
+                include_str!("../../../tests/configs/microvm_stdlib.json"),
+                0,
+                Some("shell=posix"),
+                "Guest shell and OS",
+            ),
+            (
+                "microvm_large_output.json",
+                include_str!("../../../tests/configs/microvm_large_output.json"),
+                0,
+                Some("line 999"),
+                "Large stdout (1000 lines)",
+            ),
+            (
+                "microvm_error.json",
+                include_str!("../../../tests/configs/microvm_error.json"),
+                1,
+                Some("intentional test error"),
+                "Shell error",
+            ),
+            (
+                "microvm_timeout.json",
+                include_str!("../../../tests/configs/microvm_timeout.json"),
+                -1,
+                Some("NVX workload timed out"),
+                "Timeout kills VM",
+            ),
+        ];
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        for (name, source, expected_exit, expected_output, description) in cases {
+            let request: Value = serde_json::from_str(source).expect("MicroVM config fixture");
+            let started = Instant::now();
+            let output = executor_output(&request, false);
+            let elapsed = started.elapsed().as_millis();
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let passed = output.status.code() == Some(expected_exit)
+                && expected_output.is_none_or(|expected| combined.contains(expected));
+            let status = if passed { "PASS" } else { "FAIL" };
+            println!("{status} {description} ({name}): {elapsed} ms");
+            results.push(json!({
+                "test": name,
+                "description": description,
+                "status": status,
+                "exit_code": output.status.code(),
+                "wall_time_ms": elapsed,
+            }));
+            if !passed {
+                failures.push(format!(
+                    "{name}: expected exit {expected_exit}, got {:?}\n{combined}",
+                    output.status.code()
+                ));
+            }
+        }
+        let performance = json!({
+            "commit": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_owned()),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "results": results,
+        });
+        let path = std::env::temp_dir().join("microvm-perf-results.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&performance).expect("MicroVM performance JSON"),
+        )
+        .expect("write MicroVM performance results");
+        println!("MicroVM performance results: {}", path.display());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        println!("VM_EXECUTED executor configs all seven fixtures");
     }
 
     #[test]

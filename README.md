@@ -63,7 +63,7 @@ with `--with-microvm` stages the pinned signed NVX agent bundle and requires the
 runtime `--experimental` opt-in. It supports create-and-run
 execution with the command, timeout, guest working directory, and additive
 environment settings. See the
-[NVX integration notes](src/mxc-sdk/README.md#experimental-nvx-create-and-run)
+[NVX backend guide](docs/backends/nvx/nvx.md)
 for build requirements and supported execution.
 
 ## How do I use MXC?

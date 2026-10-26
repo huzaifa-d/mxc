@@ -209,15 +209,23 @@ Run them explicitly on capable machines with
 
 ```powershell
 cd src
-cargo build --features microvm --target x86_64-pc-windows-msvc
+cargo build --locked -p wxc --features microvm --target x86_64-pc-windows-msvc
 ```
 
 ### Run
 
 ```powershell
 cd src
-cargo test -p wxc_e2e_tests --target x86_64-pc-windows-msvc test_microvm_suite -- --nocapture
+cargo test --locked -p mxc-sdk --features microvm --test nvx_e2e --target x86_64-pc-windows-msvc -- --include-ignored --nocapture --test-threads=1
 ```
 
-The MicroVM suite runs 6 functional tests + 1 timeout behavior test.
-It generates `microvm-perf-results.json` with per-test timing and status data (uploaded as CI artifact).
+The SDK suite runs the seven MicroVM config scenarios plus executor and
+captured JSON checks for output, environment, working directory, timeout,
+capture limits, and cleanup. VM scenarios require a prepared Windows x64
+host and the complete signed bundle. The config scenarios write
+`microvm-perf-results.json` under the temporary directory.
+
+The unified Windows 25H2 x64 nightly job runs the prebuilt SDK suite and
+collects its logs and performance JSON. `run_microvm_tests.ps1` remains a
+local config-only helper; it is not the scheduled CI entry point. See the
+[NVX backend guide](../../docs/backends/nvx/nvx.md).

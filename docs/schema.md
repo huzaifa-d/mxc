@@ -122,8 +122,8 @@ identity-less host proxies omit `allowedProxyPeer` and require
 deployment: it opens both host-loopback directions without restricting access
 to a named proxy peer. It does not enforce a proxy-only host-loopback exception.
 
-The initial development Windows x64 NVX MicroVM backend rejects every network
-policy and `runtimeConfig.networkProxy` before creating a VM.
+For MicroVM networking and proxy support, see the
+[NVX backend capability table](backends/nvx/nvx.md#supported-operations-and-policy).
 
 ```json
 {
@@ -338,7 +338,7 @@ use:
 | Seatbelt (macOS) | Same precedence, with `~` expanded as the profile expands it; falls back to `/`. |
 | Bubblewrap (Linux) | No substitution — a policy grant is never adopted. `--chdir` is emitted only for an explicit `process.cwd`, which from 0.9 is also normalized against the sandbox root and used as `HOME`. With no explicit `cwd` there is no `--chdir` and `HOME` is unset — see [`docs/backends/bwrap/bubblewrap-backend.md`](backends/bwrap/bubblewrap-backend.md). |
 | LXC / WSL Container | The container root — see [`docs/backends/lxc/lxc-backend.md`](backends/lxc/lxc-backend.md). |
-| MicroVM | NVX on Windows x64 accepts an absolute guest working directory with no `..` components and at most 4095 UTF-8 bytes. Linux MicroVM execution is inactive in this phase. |
+| MicroVM | The guest default; see [NVX working-directory behaviour](backends/nvx/nvx.md#working-directory-and-environment). |
 | Hyperlight | Not applicable — this backend rejects a working directory outright. |
 
 Policy entries that are blank, name a file, or do not exist yet are skipped:
@@ -381,10 +381,8 @@ On the WSL Container backend it is the container image's own `ENV`, which MXC
 neither authors nor enumerates — see
 [`docs/backends/wslc/wsl-container-getting-started.md`](backends/wslc/wsl-container-getting-started.md#environment).
 
-NVX on Windows x64 requires `process.inheritDefaultEnv: true` when
-`process.env` is present. It accepts at most 256 entries and 32 KiB including
-entry terminators. Repeated names count as separate entries, with later entries
-overriding earlier ones.
+For MicroVM environment support and limits, see
+[NVX working directory and environment](backends/nvx/nvx.md#working-directory-and-environment).
 
 ### Filesystem Policy
 
@@ -396,10 +394,11 @@ The `filesystem` section defines path access policy shared across backends:
 | `readonlyPaths` | string[] | `[]` | Paths the process can read but not write. |
 | `deniedPaths` | string[] | `[]` | Paths the process cannot access at all. |
 
-The initial development Windows x64 NVX MicroVM backend rejects
-`readwritePaths`, `readonlyPaths`, and `deniedPaths`. The
-`processContainer.filesystem.enumeratePaths` field is ProcessContainer-only
-and also cannot be combined with `containment: "microvm"`.
+Backend support for filesystem policy is described in each backend guide; see
+the [NVX capability table](backends/nvx/nvx.md#supported-operations-and-policy)
+for MicroVM. Backend-specific sections, including
+`processContainer.filesystem.enumeratePaths`, can only accompany their matching
+`containment` selection.
 
 The ProcessContainer-only `processContainer.filesystem` section contains:
 

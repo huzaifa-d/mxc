@@ -11,6 +11,7 @@ use std::process::Command;
 #[cfg(any(test, feature = "microvm"))]
 use sha2::{Digest, Sha256};
 
+// Upgrade procedure: docs/backends/nvx/nvx.md#maintainers-updating-the-bundled-runtime.
 #[cfg(any(test, feature = "microvm"))]
 pub(crate) const OFFICIAL_BUNDLE_URL: &str =
     "https://github.com/microsoft/nvx/releases/download/v0.1.0-dev.0430ce79d125/aci-edge-sandboxes.zip";

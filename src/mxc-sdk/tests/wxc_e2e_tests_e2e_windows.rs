@@ -510,7 +510,7 @@ fn test_examples() {
 
 #[test]
 #[cfg(all(target_arch = "x86_64", feature = "microvm"))]
-#[ignore = "VM: run explicitly in microvm-e2e.yml on a prepared Windows host"]
+#[ignore = "VM: requires Windows x64, WHP and the signed NVX bundle"]
 fn test_microvm_basic() {
     if !cached_has_wxc_exe() {
         return;
@@ -532,7 +532,7 @@ fn test_windows_sandbox() {
 
 #[test]
 #[cfg(all(target_arch = "x86_64", feature = "microvm"))]
-#[ignore = "VM: run explicitly in microvm-e2e.yml on a prepared Windows host"]
+#[ignore = "VM: requires Windows x64, WHP and the signed NVX bundle"]
 fn test_microvm_suite() {
     if !cached_has_wxc_exe() {
         return;

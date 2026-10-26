@@ -200,18 +200,10 @@ unchanged. Exceeding it cancels and releases the execution, tears down the
 container, and returns `BackendError` instead of truncated output. Cleanup
 failures are reported alongside the capture-limit error.
 
-The host requires Windows Hypervisor Platform and hardware virtualization.
-Requests cannot include filesystem grants or denials, network or proxy policy,
-UI policy, or capture-denials. Containers must be destroyed after execution,
-without preserving policy.
-
-The guest working directory must be absolute, contain no `..` path components,
-and use at most 4095 UTF-8 bytes. Additive environment settings require
-`inheritDefaultEnv: true` and allow at most 256 entries and 32 KiB including
-entry terminators. Repeated names count as separate entries; later entries
-override earlier ones. MXC rejects these limits before bundle discovery and
-validates the mapped execution request with the native agent before probing
-the host or provisioning a container.
+See the [NVX backend guide](../../docs/backends/nvx/nvx.md) for host
+requirements, the supported-operation and policy matrix, working-directory and
+environment limits, and the maintainer bundle-upgrade procedure. Windows ARM64
+and Linux MicroVM execution are not available in this phase.
 
 Backend implementations, shared runtime support, backend dispatch, and host
 probing are internal modules of this published crate. The crate root exposes
