@@ -205,3 +205,8 @@ containing the exact pinned archive or its complete extracted contents. The
 build still verifies the pinned archive and/or file hashes. Stage the resulting
 complete `aci-edge-sandboxes` directory with the executor, and validate the
 packaged artifact on a prepared host before accepting the upgrade.
+
+Cargo output directories may be reached through a junction or directory
+symlink. Caller-supplied extracted bundle directories, including their
+ancestors, must not contain links or reparse points; use a direct path to the
+verified bundle instead.

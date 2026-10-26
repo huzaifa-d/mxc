@@ -111,29 +111,53 @@ pub(crate) fn run() {
 #[cfg(feature = "microvm")]
 fn stage_official_bundle() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set"));
-    let source = match std::env::var_os(BUNDLE_DIR_ENV).filter(|value| !value.is_empty()) {
+    let bundle_dir = std::env::var_os(BUNDLE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    stage_bundle_against(
+        &out_dir,
+        bundle_dir.as_deref(),
+        OFFICIAL_BUNDLE_ZIP_SHA256,
+        OFFICIAL_BUNDLE_FILES,
+    );
+}
+
+#[cfg(feature = "microvm")]
+pub(crate) fn stage_bundle_against(
+    out_dir: &Path,
+    bundle_dir: Option<&Path>,
+    expected_archive_sha256: &str,
+    expected_files: &[(&str, &str)],
+) {
+    // Cargo owns these roots; caller-supplied bundle paths remain unresolved.
+    let out_dir = out_dir.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "cannot resolve Cargo OUT_DIR {}: {error}",
+            out_dir.display()
+        )
+    });
+    let source = match bundle_dir {
         Some(directory) => {
-            let directory = PathBuf::from(directory);
             let archive = directory.join("aci-edge-sandboxes.zip");
             if archive.is_file() && !directory.join("SOURCE-MANIFEST.json").is_file() {
                 println!("cargo:rerun-if-changed={}", archive.display());
                 let extracted = out_dir.join("aci-edge-sandboxes");
-                if !is_verified_bundle(&extracted, OFFICIAL_BUNDLE_FILES) {
+                if !is_verified_bundle(&extracted, expected_files) {
                     extract_verified_archive_against(
                         &archive,
                         &extracted,
-                        OFFICIAL_BUNDLE_ZIP_SHA256,
-                        OFFICIAL_BUNDLE_FILES,
+                        expected_archive_sha256,
+                        expected_files,
                     );
                 }
                 extracted
             } else {
-                directory
+                directory.to_path_buf()
             }
         }
-        None => acquire_cached_bundle(&out_dir),
+        None => acquire_cached_bundle(&out_dir, expected_archive_sha256, expected_files),
     };
-    verify_bundle(&source);
+    verify_bundle_against(&source, expected_files);
 
     let target = out_dir
         .ancestors()
@@ -141,19 +165,23 @@ fn stage_official_bundle() {
         .expect("OUT_DIR has target/profile ancestors")
         .join("aci-edge-sandboxes");
     copy_bundle(&source, &target);
-    verify_bundle(&target);
+    verify_bundle_against(&target, expected_files);
 }
 
 #[cfg(feature = "microvm")]
-fn acquire_cached_bundle(out_dir: &Path) -> PathBuf {
+fn acquire_cached_bundle(
+    out_dir: &Path,
+    expected_archive_sha256: &str,
+    expected_files: &[(&str, &str)],
+) -> PathBuf {
     let extracted = out_dir.join("aci-edge-sandboxes");
-    if is_verified_bundle(&extracted, OFFICIAL_BUNDLE_FILES) {
+    if is_verified_bundle(&extracted, expected_files) {
         return extracted;
     }
 
     let archive = out_dir.join("aci-edge-sandboxes.zip");
     let archive_ok =
-        archive.is_file() && sha256(&archive).eq_ignore_ascii_case(OFFICIAL_BUNDLE_ZIP_SHA256);
+        archive.is_file() && sha256(&archive).eq_ignore_ascii_case(expected_archive_sha256);
     if !archive_ok {
         let _ = std::fs::remove_file(&archive);
         download_archive(OFFICIAL_BUNDLE_URL, &archive);
@@ -161,8 +189,8 @@ fn acquire_cached_bundle(out_dir: &Path) -> PathBuf {
     extract_verified_archive_against(
         &archive,
         &extracted,
-        OFFICIAL_BUNDLE_ZIP_SHA256,
-        OFFICIAL_BUNDLE_FILES,
+        expected_archive_sha256,
+        expected_files,
     );
     extracted
 }
@@ -348,11 +376,6 @@ fn sha256(path: &Path) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-#[cfg(feature = "microvm")]
-fn verify_bundle(source: &Path) {
-    verify_bundle_against(source, OFFICIAL_BUNDLE_FILES);
 }
 
 #[cfg(any(test, feature = "microvm"))]
