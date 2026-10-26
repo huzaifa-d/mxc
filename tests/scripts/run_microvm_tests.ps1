@@ -19,7 +19,7 @@
     Explicit binary directory. Overrides -Release logic when provided.
 
 .PARAMETER ConfigDir
-    Path to test configs directory. Defaults to <repo-root>\tests\configs
+    Path to test configs directory. Defaults to <repo-root>\src\mxc-sdk\tests\fixtures\microvm
 
 .EXAMPLE
     .\run_microvm_tests.ps1
@@ -45,7 +45,7 @@ if (-not $BinDir) {
 }
 
 if (-not $ConfigDir) {
-    $ConfigDir = Join-Path $RepoRoot "tests\configs"
+    $ConfigDir = Join-Path $RepoRoot "src\mxc-sdk\tests\fixtures\microvm"
 }
 
 $WxcExePath = Join-Path $BinDir "wxc-exec.exe"

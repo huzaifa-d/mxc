@@ -100,6 +100,14 @@ mod windows_x64 {
                 json!({"processContainer": {"filesystem": {"enumeratePaths": ["C:\\work"]}}}),
             ),
             ("fallback", json!({"fallback": {}})),
+            (
+                "fallback-allow",
+                json!({"fallback": {"allowDaclMutation": true}}),
+            ),
+            (
+                "fallback-deny",
+                json!({"fallback": {"allowDaclMutation": false}}),
+            ),
             ("destroy", json!({"lifecycle": {"destroyOnExit": false}})),
             ("preserve", json!({"lifecycle": {"preservePolicy": true}})),
             ("timeout-limit", json!({"process": {"timeout": 3_600_001}})),
@@ -240,8 +248,9 @@ mod windows_x64 {
                     "{label} must use the parser error contract"
                 );
                 assert_eq!(error.message, MIXED_BACKEND_ERROR, "{label}");
-            } else if label == "fallback" {
+            } else if matches!(label, "fallback" | "fallback-allow" | "fallback-deny") {
                 assert_eq!(error.code, ErrorCode::PolicyValidation);
+                assert_eq!(error.message, "NVX does not support fallback policy");
             }
             if let Some(expected) = process_limit_error(label) {
                 assert_eq!(error.code, ErrorCode::PolicyValidation, "{label}");
@@ -482,49 +491,49 @@ mod windows_x64 {
         let cases = [
             (
                 "microvm_hello.json",
-                include_str!("../../../tests/configs/microvm_hello.json"),
+                include_str!("fixtures/microvm/microvm_hello.json"),
                 0,
                 Some("sum=100"),
                 "Hello world",
             ),
             (
                 "microvm_exit_code.json",
-                include_str!("../../../tests/configs/microvm_exit_code.json"),
+                include_str!("fixtures/microvm/microvm_exit_code.json"),
                 42,
                 None,
                 "Exit code propagation",
             ),
             (
                 "microvm_multiline.json",
-                include_str!("../../../tests/configs/microvm_multiline.json"),
+                include_str!("fixtures/microvm/microvm_multiline.json"),
                 0,
                 Some("fib("),
                 "Shell Fibonacci program",
             ),
             (
                 "microvm_stdlib.json",
-                include_str!("../../../tests/configs/microvm_stdlib.json"),
+                include_str!("fixtures/microvm/microvm_stdlib.json"),
                 0,
                 Some("shell=posix"),
                 "Guest shell and OS",
             ),
             (
                 "microvm_large_output.json",
-                include_str!("../../../tests/configs/microvm_large_output.json"),
+                include_str!("fixtures/microvm/microvm_large_output.json"),
                 0,
                 Some("line 999"),
                 "Large stdout (1000 lines)",
             ),
             (
                 "microvm_error.json",
-                include_str!("../../../tests/configs/microvm_error.json"),
+                include_str!("fixtures/microvm/microvm_error.json"),
                 1,
                 Some("intentional test error"),
                 "Shell error",
             ),
             (
                 "microvm_timeout.json",
-                include_str!("../../../tests/configs/microvm_timeout.json"),
+                include_str!("fixtures/microvm/microvm_timeout.json"),
                 -1,
                 Some("NVX workload timed out"),
                 "Timeout kills VM",

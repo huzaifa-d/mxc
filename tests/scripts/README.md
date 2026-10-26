@@ -10,6 +10,9 @@ of shelling through these scripts.
 Arguments and build-profile defaults vary by suite. Use the script's help or
 header comment for its supported parameters.
 
+The MicroVM scripts use the packaged fixtures under
+`src/mxc-sdk/tests/fixtures/microvm`, not `tests/configs`.
+
 ## Prerequisites
 
 Shared:

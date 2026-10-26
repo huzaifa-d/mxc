@@ -59,6 +59,15 @@ needs access to the registry even though guest networking is not enabled.
 Schema-valid fields do not imply backend support. MXC rejects unsupported
 policy before creating a VM rather than ignoring it.
 
+The table describes this MXC integration, not every capability of NVX. The
+signed agent limits workloads to one hour and constrains their working
+directories and environments as described below. Fixed image selection,
+captured-only execution, and refusal of filesystem, network, UI, fallback,
+and public lifecycle policies are MXC Phase 1 restrictions.
+The [signed-agent documentation](https://github.com/microsoft/nvx/blob/0430ce79d125203c20f0aa69243480513a774296/aci_edge_sandboxes/README.md#agent-backend-opt-in)
+describes its contract; the direct OpenVMM backend uses a different guest and
+does not define the limits of this integration.
+
 | Surface | Phase 1 support |
 |---|---|
 | Host platforms | Windows x64 with WHP. Windows ARM64 and Linux execution are unavailable. |
@@ -113,6 +122,20 @@ A workload timeout preserves captured partial output and tears down the
 container. Each create-and-run request gets fresh workload state; this phase
 does not offer persistent containers or manual lifecycle operations.
 
+### Temporary agent workspace
+
+MXC allocates a private temporary directory for each create-and-run operation.
+The signed agent owns the sandbox records, VM control data, diagnostics, and
+image registry/cache stored there. MXC coordinates the agent's stop and
+deprovision operations, closes the client, and removes the directory after
+successful deprovisioning; it does not maintain a persistent container database.
+
+If deprovisioning fails, MXC reports the failure and retains the directory,
+including its location in the error. This preserves the agent's resource
+records rather than deleting them while a VM might remain. Retention does not
+provide automatic recovery. Confirm that the operation's VM has stopped before
+manually removing retained storage.
+
 ## Validation
 
 Host-only policy and bundle-integrity checks run in normal Windows x64 PR
@@ -126,6 +149,11 @@ stdout/stderr, exit codes, environment and working-directory settings,
 timeouts, capture limits, cleanup, and the seven MicroVM config fixtures.
 Missing prerequisites, skipped scenarios, and empty test runs fail validation.
 See the [CI validation runbook](../../development/build-and-test/ci-validation-infrastructure.md).
+
+The seven executor configuration fixtures live in
+`src/mxc-sdk/tests/fixtures/microvm` and are included in the Rust crate.
+Windows x64 PR builds also compile `nvx_e2e` from the extracted crate archive
+with `microvm` enabled, without running a VM.
 
 To run the suite locally on a prepared Windows x64 host, from `src`:
 

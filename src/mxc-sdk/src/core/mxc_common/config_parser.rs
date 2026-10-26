@@ -1439,11 +1439,6 @@ fn normalize_common_request_ir(
     // the newer BaseContainer implementation (ui).
     let mut process_container_network = None;
     if let Some(ac) = cfg.process_container {
-        policy.least_privilege_specified = ac.least_privilege.is_some();
-        policy.learning_mode_specified = ac.learning_mode.is_some();
-        policy.capabilities_specified = ac.capabilities.is_some();
-        policy.base_process_ui_specified = ac.ui.is_some();
-
         if let Some(lp) = ac.least_privilege {
             policy.least_privilege_mode = lp;
         }
@@ -1873,6 +1868,49 @@ mod tests {
         assert_eq!(request.containment, ContainmentBackend::MicroVm);
     }
 
+    #[test]
+    fn preserves_fallback_presence_without_changing_backend_defaults() {
+        for containment in ["microvm", "processcontainer"] {
+            for (fallback, supplied, allow_dacl_mutation) in [
+                (None, false, true),
+                (Some(serde_json::json!({})), true, true),
+                (
+                    Some(serde_json::json!({"allowDaclMutation": true})),
+                    true,
+                    true,
+                ),
+                (
+                    Some(serde_json::json!({"allowDaclMutation": false})),
+                    true,
+                    false,
+                ),
+            ] {
+                let mut json = serde_json::json!({
+                    "version": "1.1.0-alpha",
+                    "containment": containment,
+                    "process": {"commandLine": "echo hello"}
+                });
+                if let Some(fallback) = fallback {
+                    json["fallback"] = fallback;
+                }
+                let MxcRequest::OneShot(request) =
+                    load_mxc_request_from_json(&json.to_string(), &mut test_logger()).unwrap()
+                else {
+                    panic!("expected a create-and-run request");
+                };
+                assert_eq!(request.policy.fallback_specified, supplied);
+                assert_eq!(
+                    request.policy.fallback.allow_dacl_mutation,
+                    allow_dacl_mutation
+                );
+                assert!(serde_json::to_value(request.policy)
+                    .unwrap()
+                    .get("fallback_specified")
+                    .is_none());
+            }
+        }
+    }
+
     fn parse_exact_for_test(json: &str) -> Result<MxcRequest, ParseError> {
         parse_exact_mxc_request_json(json, &mut test_logger())
     }
@@ -1892,10 +1930,6 @@ mod tests {
         network_mode_specified: bool,
         runtime_network_proxy_specified: bool,
         ui_specified: bool,
-        least_privilege_specified: bool,
-        learning_mode_specified: bool,
-        capabilities_specified: bool,
-        base_process_ui_specified: bool,
         fallback_specified: bool,
         requested_sandbox_kind: Option<&'static str>,
     }
@@ -1917,10 +1951,6 @@ mod tests {
                 network_mode_specified: request.policy.network_mode_specified,
                 runtime_network_proxy_specified: request.policy.runtime_network_proxy_specified,
                 ui_specified: request.policy.ui_specified,
-                least_privilege_specified: request.policy.least_privilege_specified,
-                learning_mode_specified: request.policy.learning_mode_specified,
-                capabilities_specified: request.policy.capabilities_specified,
-                base_process_ui_specified: request.policy.base_process_ui_specified,
                 fallback_specified: request.policy.fallback_specified,
                 requested_sandbox_kind: request
                     .telemetry

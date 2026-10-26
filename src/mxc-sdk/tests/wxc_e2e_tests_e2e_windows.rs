@@ -123,7 +123,11 @@ fn examples() {
 
 #[cfg(all(target_arch = "x86_64", feature = "microvm"))]
 fn microvm_basic() {
-    assert_wxc_success("microvm_hello.json", &["--debug", "--experimental"]);
+    let config = microvm_configs_dir().join("microvm_hello.json");
+    assert_wxc_success(
+        &config.display().to_string(),
+        &["--debug", "--experimental"],
+    );
 }
 
 /// Drives `processContainer.captureDenials` end to end and asserts the
@@ -690,6 +694,14 @@ fn run_sandbox_case(case: &SandboxCase) {
 // MicroVM suite
 // ---------------------------------------------------------------------------
 
+#[cfg(all(target_arch = "x86_64", feature = "microvm"))]
+fn microvm_configs_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("microvm")
+}
+
 #[derive(Debug)]
 #[cfg(all(target_arch = "x86_64", feature = "microvm"))]
 struct MicrovmCase {
@@ -776,14 +788,18 @@ fn microvm_suite() {
     let mut failures = Vec::new();
 
     for case in cases {
-        let config_path = test_configs_dir().join(case.config);
-        if !config_path.exists() {
-            println!("SKIPPED: config not found: {}", config_path.display());
-            continue;
-        }
+        let config_path = microvm_configs_dir().join(case.config);
+        assert!(
+            config_path.is_file(),
+            "Missing MicroVM fixture: {}",
+            config_path.display()
+        );
 
         println!("--- {} ({}) ---", case.description, case.config);
-        let result = run_wxc_config(case.config, &["--debug", "--experimental"]);
+        let result = run_wxc_config(
+            &config_path.display().to_string(),
+            &["--debug", "--experimental"],
+        );
         let status = if command_matches(&result, &case) {
             "PASS"
         } else {

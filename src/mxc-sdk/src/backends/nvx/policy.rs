@@ -48,26 +48,6 @@ pub(super) fn validate_request(request: &ExecutionRequest) -> Result<(), MxcErro
             "NVX does not support processContainer.captureDenials",
         ));
     }
-    if request.policy.least_privilege_specified {
-        return Err(MxcError::policy_validation(
-            "NVX does not support processContainer.leastPrivilege",
-        ));
-    }
-    if request.policy.learning_mode_specified {
-        return Err(MxcError::policy_validation(
-            "NVX does not support processContainer.learningMode",
-        ));
-    }
-    if request.policy.capabilities_specified {
-        return Err(MxcError::policy_validation(
-            "NVX does not support processContainer.capabilities",
-        ));
-    }
-    if request.policy.base_process_ui_specified {
-        return Err(MxcError::policy_validation(
-            "NVX does not support processContainer.ui",
-        ));
-    }
     if request.policy.fallback_specified {
         return Err(MxcError::policy_validation(
             "NVX does not support fallback policy",

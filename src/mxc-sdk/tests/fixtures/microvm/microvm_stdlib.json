@@ -1,5 +1,5 @@
 {
-    "$schema": "../../schemas/dev/mxc-config.schema.1.1.0-alpha.json",
+    "$schema": "https://raw.githubusercontent.com/microsoft/mxc/main/schemas/dev/mxc-config.schema.1.1.0-alpha.json",
     "version": "1.1.0-alpha",
     "process": {
         "commandLine": "printf 'shell=posix\\n'; uname -s",

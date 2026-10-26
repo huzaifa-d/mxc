@@ -177,33 +177,14 @@ temporary storage without creating directories.
 
 ## Internal modules and executor binaries
 
-### Experimental NVX create-and-run
+### Experimental MicroVM support
 
-The `microvm` feature enables only Windows x64 and requires runtime experimental
-authorization. P1 stages the official signed `aci-edge-sandboxes.zip` release
-bundle (`v0.1.0-dev.0430ce79d125` from NVX revision
-`0430ce79d125203c20f0aa69243480513a774296`) during the crate build and loads the
-verified `bin/aci_edge_agent.dll` C ABI v1 in-process without unpublished Rust
-dependencies; it does not enable standalone OpenVMM execution.
-
-The existing hidden JSON facade `mxc_sdk::__ffi::run_json(json, true)` supports
-the development `1.1.0-alpha` MicroVM create-and-run request with captured
-stdout/stderr, exit status and timeout. Typed V1 targeting, streaming, PTY and
-public Rust container lifecycle operations are not broadened by P1.
-Distribute the complete `aci-edge-sandboxes/` directory beside the consuming
-executable. The native agent pulls the official example's public Azure Linux
-workload image on the host; guest network access remains ungranted.
-
-NVX captures at most 64 MiB (67,108,864 bytes) of stdout and stderr combined,
-including when the process timeout is zero. Output up to that limit is returned
-unchanged. Exceeding it cancels and releases the execution, tears down the
-container, and returns `BackendError` instead of truncated output. Cleanup
-failures are reported alongside the capture-limit error.
-
-See the [NVX backend guide](../../docs/backends/nvx/nvx.md) for host
-requirements, the supported-operation and policy matrix, working-directory and
-environment limits, and the maintainer bundle-upgrade procedure. Windows ARM64
-and Linux MicroVM execution are not available in this phase.
+Enable the `microvm` Cargo feature to build experimental MicroVM support on
+Windows x64. Execution also requires runtime experimental opt-in. This phase
+supports development JSON create-and-run requests, not MicroVM targeting through
+the typed V1 SDK APIs, streaming, PTY, or container lifecycle operations. See the
+[NVX backend guide](https://github.com/microsoft/mxc/blob/main/docs/backends/nvx/nvx.md)
+for prerequisites and usage.
 
 Backend implementations, shared runtime support, backend dispatch, and host
 probing are internal modules of this published crate. The crate root exposes

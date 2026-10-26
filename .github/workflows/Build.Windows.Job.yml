@@ -88,6 +88,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: node --test scripts/tests/microvm-validation.test.js
 
+      - name: Verify packaged MicroVM tests
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        env:
+          ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR: ${{ github.workspace }}/src/target/${{ matrix.target }}/release/aci-edge-sandboxes
+        run: |
+          & ./scripts/ci/Invoke-CratePackage.ps1 `
+            -OutDir (Join-Path $env:RUNNER_TEMP 'microvm-crate') `
+            -VerifyMicrovmTests
+
       - name: Stage SDK MicroVM tests for scheduled validation
         if: matrix.target == 'x86_64-pc-windows-msvc'
         working-directory: ${{ github.workspace }}

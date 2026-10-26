@@ -21,6 +21,16 @@ const { stripVTControlCharacters } = require("node:util");
 const root = resolve(__dirname, "..", "..");
 const dispatcher = join(root, "scripts", "ci", "run_backend_validation_tests.ps1");
 const staging = join(root, "scripts", "ci", "stage-nvx-validation-tests.ps1");
+const packaging = join(root, "scripts", "ci", "Invoke-CratePackage.ps1");
+const microvmFixtures = [
+  "microvm_hello.json",
+  "microvm_exit_code.json",
+  "microvm_multiline.json",
+  "microvm_stdlib.json",
+  "microvm_large_output.json",
+  "microvm_error.json",
+  "microvm_timeout.json",
+];
 let scratch;
 let fixture;
 let tools;
@@ -58,11 +68,39 @@ fn main() {
     let mode = env::var("MXC_CI_FIXTURE_MODE").unwrap_or_default();
     let exe = env::current_exe().unwrap();
     if exe.file_stem().unwrap() == "cargo" {
+        if args.first().map(String::as_str) == Some("metadata") {
+            let target = env::var("MXC_CI_PACKAGE_TARGET").unwrap();
+            let manifest = env::var("MXC_CI_PACKAGE_MANIFEST").unwrap();
+            println!(r#"{{"packages":[{{"name":"mxc-sdk","version":"1.0.0","manifest_path":{manifest:?},"description":"fixture","repository":"https://github.com/microsoft/mxc","license":"MIT","dependencies":[]}}],"target_directory":{target:?}}}"#);
+            return;
+        }
+        if args.first().map(String::as_str) == Some("fetch") {
+            return;
+        }
+        if args.first().map(String::as_str) == Some("package") {
+            assert!(args.contains(&"--no-verify".to_owned()));
+            let directory = Path::new(&env::var("MXC_CI_PACKAGE_TARGET").unwrap()).join("package");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::copy(env::var("MXC_CI_PACKAGE_ARCHIVE").unwrap(), directory.join("mxc-sdk-1.0.0.crate")).unwrap();
+            return;
+        }
         assert!(args.contains(&"--locked".to_owned()));
         assert!(args.contains(&"--release".to_owned()));
         assert!(args.contains(&"--no-run".to_owned()));
         assert!(args.windows(2).any(|pair| pair == ["--test", "nvx_e2e"]));
         assert!(args.windows(2).any(|pair| pair == ["--target", "x86_64-pc-windows-msvc"]));
+        if let Some(index) = args.iter().position(|arg| arg == "--manifest-path") {
+            let manifest = Path::new(&args[index + 1]);
+            assert!(manifest.is_file());
+            assert_eq!(manifest.parent().unwrap().file_name().unwrap(), "mxc-sdk-1.0.0");
+            assert!(args.contains(&"--offline".to_owned()));
+            if mode == "packaged-build-failure" {
+                eprintln!("fixture packaged compilation failed");
+                process::exit(29);
+            }
+            println!("PACKAGE_COMPILED extracted nvx_e2e target");
+            return;
+        }
         if mode == "cargo-failure" {
             eprintln!("fixture cargo failed");
             process::exit(17);
@@ -171,8 +209,75 @@ test("Windows builds stage and upload the SDK tests and the complete runtime bun
   assert.match(workflow, /scripts\/ci\/stage-nvx-validation-tests\.ps1/);
   assert.ok(workflow.includes("src/target/${{ matrix.target }}/release/nvx-e2e-tests.exe"));
   assert.ok(workflow.includes("src/target/${{ matrix.target }}/release/aci-edge-sandboxes/"));
+  assert.match(workflow, /Invoke-CratePackage\.ps1[\s\S]*-VerifyMicrovmTests/);
+  assert.match(workflow, /ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR:/);
   assert.equal(existsSync(join(root, ".github", "workflows", "microvm-e2e.yml")), false);
 });
+
+test("MicroVM fixtures are canonical packaged inputs and remain in schema validation", () => {
+  const fixtureRoot = join(root, "src", "mxc-sdk", "tests", "fixtures", "microvm");
+  const sdkTests = readFileSync(join(root, "src", "mxc-sdk", "tests", "nvx_e2e.rs"), "utf8");
+  for (const name of microvmFixtures) {
+    const request = JSON.parse(readFileSync(join(fixtureRoot, name), "utf8"));
+    assert.equal(request.version, "1.1.0-alpha");
+    assert.equal(request.containment, "microvm");
+    assert.equal(existsSync(join(root, "tests", "configs", name)), false);
+    assert.ok(sdkTests.includes(`include_str!("fixtures/microvm/${name}")`), name);
+  }
+  const validation = readFileSync(join(root, "scripts", "versioning", "validate-configs.js"), "utf8");
+  assert.ok(validation.includes('join("src", "mxc-sdk", "tests", "fixtures", "microvm")'));
+});
+
+function verifyPackage(mode = "") {
+  const directory = mkdtempSync(join(scratch, "package-"));
+  const inputs = join(directory, "inputs");
+  const packageRoot = join(inputs, "mxc-sdk-1.0.0");
+  const fixtureRoot = join(packageRoot, "tests", "fixtures", "microvm");
+  mkdirSync(fixtureRoot, { recursive: true });
+  const manifest = join(packageRoot, "Cargo.toml");
+  writeFileSync(manifest, '[package]\nname = "mxc-sdk"\nversion = "1.0.0"\n');
+  for (const name of microvmFixtures) {
+    if (mode === "packaged-missing-fixture" && name === "microvm_timeout.json") continue;
+    copyFileSync(join(root, "src", "mxc-sdk", "tests", "fixtures", "microvm", name), join(fixtureRoot, name));
+  }
+  const archive = join(directory, "fixture.crate");
+  const packed = spawnSync(
+    "tar",
+    ["--create", "--gzip", "--file", archive, "--directory", inputs, "mxc-sdk-1.0.0"],
+    { encoding: "utf8", timeout: 30_000 }
+  );
+  assert.ifError(packed.error);
+  assert.equal(packed.status, 0, packed.stdout + packed.stderr);
+  return runScript(
+    packaging,
+    ["-OutDir", join(directory, "output"), "-VerifyMicrovmTests"],
+    {
+      PATH: tools + delimiter + process.env.PATH,
+      MXC_CI_FIXTURE_MODE: mode,
+      MXC_CI_PACKAGE_ARCHIVE: archive,
+      MXC_CI_PACKAGE_TARGET: join(directory, "target"),
+      MXC_CI_PACKAGE_MANIFEST: manifest,
+    }
+  );
+}
+
+test("package gate compiles MicroVM tests from the extracted archive", () => {
+  const result = verifyPackage();
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /PACKAGE_COMPILED extracted nvx_e2e target/);
+});
+
+for (const [mode, message] of [
+  ["packaged-missing-fixture", /Packaged MicroVM fixture is missing: microvm_timeout\.json/],
+  ["packaged-build-failure", /packaged MicroVM test compilation failed with exit 29/],
+]) {
+  test(`package gate rejects ${mode}`, () => {
+    const result = verifyPackage(mode);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, message);
+    assert.doesNotMatch(result.output, /Compiled the MicroVM test target/);
+  });
+}
 
 test("artifact dispatcher executes prebuilt SDK tests and preserves the log", () => {
   const directory = artifact();
