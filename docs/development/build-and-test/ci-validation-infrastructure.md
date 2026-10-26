@@ -32,6 +32,7 @@ the individual local test scripts are documented in
 | `.github/workflows/Validation.Tests.Matrix.Job.yml` | `workflow_call`-only. Resolves the plan and runs the per-family test jobs. |
 | `.github/workflows/Package.IsolationSession.TestBundle.Job.yml` | `workflow_call`-only. Builds the IsolationSession test bundle natively on x64 and arm64 and uploads it as `isolation-session-test-bundle-<target>`. |
 | `scripts/ci/build-isolation-session-test-bundle.ps1` | Builds and assembles the IsolationSession test bundle, and checks that each payload discovers its tests. |
+| `scripts/ci/stage-nvx-validation-tests.ps1` | Stages the compiled Windows x64 SDK MicroVM tests in the existing Windows artifact and checks required test discovery. |
 | `scripts/ci/validation-test-matrix.json` | The matrix: OS versions, backends, triggers, job staggering. |
 | `scripts/ci/resolve-validation-test-matrix.mjs` | Matrix validator + plan expander. Emits the GitHub Actions matrices. |
 | `scripts/ci/prepare-windows-host.ps1` | Per-backend Windows host preparation / prerequisite assertions, plus the `winget` repair and the workload-tooling install. Runs in Windows PowerShell, because it installs the `pwsh` the steps after it use. |
@@ -64,7 +65,7 @@ test jobs only ever `download-artifact`.
 | Job | What it does |
 |-----|--------------|
 | `dependency-feed-check` | Resolves the locked crate graph through the public `MxcDependencies` feed. Gates the builds. |
-| `windows` | `Build.Windows.Job.yml` — x64 + arm64 release build, unit tests, uploads `wxc-binaries-<target>`. |
+| `windows` | `Build.Windows.Job.yml` — x64 + arm64 release build, unit tests, uploads `wxc-binaries-<target>`. The x64 artifact also includes SDK MicroVM tests and the complete signed NVX bundle. |
 | `linux` | `Build.Linux.Job.yml` — x64 + arm64 release build, unit tests, Bubblewrap SDK streaming/PTY tests, `wxc_e2e_tests`, uploads `lxc-binaries-<target>`. |
 | `macos` | `Build.MacOS.Job.yml` — arm64 release build, unit tests, Seatbelt SDK streaming/PTY tests, `wxc_e2e_tests`, uploads `mxc-binaries-aarch64-apple-darwin`. |
 | `isolation-session-bundle` | `Package.IsolationSession.TestBundle.Job.yml` — uploads `isolation-session-test-bundle-<target>` for x64 + arm64. |
@@ -122,7 +123,7 @@ Current platforms:
 | `windows-24h2` | windows | `1es-mxc-e2e-windows-24h2-pro-x64` | `1es-mxc-e2e-windows-24h2-pro-arm64` | process-t1, wslc, windows-sandbox, microvm | process-t1, isolation-session |
 | `windows-23h2` | windows | `1es-mxc-e2e-windows-23h2-enterprise-x64` | *(dormant)* | process-t3, wslc, windows-sandbox, microvm | — |
 | `ubuntu-26.04` | linux | `1es-mxc-e2e-ubuntu-26.04-x64` | *(dormant)* | bubblewrap, lxc | — |
-| `ubuntu-24.04` | linux | `1es-mxc-e2e-ubuntu-24.04-x64` | *(dormant)* | bubblewrap, microvm, lxc | — |
+| `ubuntu-24.04` | linux | `1es-mxc-e2e-ubuntu-24.04-x64` | *(dormant)* | bubblewrap, lxc | — |
 | `rhel-10` | linux | `1es-mxc-e2e-rhel-10-x64` | *(dormant)* | bubblewrap, lxc | — |
 | `debian-13` | linux | `1es-mxc-e2e-debian-13-x64` | *(dormant)* | bubblewrap, lxc | — |
 | `macos-27` | macos | — | runner `xcode-27` (public preview) | — | seatbelt |
@@ -233,7 +234,7 @@ get fixed or wired.
 | WSLC | ✅ Good | Might have to retry hung jobs - this is an issue with overzealous agent reclaiming. |
 | IsolationSession | ✅ Good | Runs the one-shot and state-aware suites, the Rust SDK in-process and helper tests, the C# end-to-end tests, the Node SDK suite and the COM apartment probe. Fails when the host cannot run isolation sessions, when a suite executes nothing, or when the run changes the set of local accounts. |
 | Windows Sandbox | ⛔ Blocked | Images don't support `Containers-DisposableClientVM` opt. feature |
-| MicroVM | Experimental | Signed NVX on Windows x64, covered daily and on PRs by `microvm-e2e.yml`. Real-VM SDK scenarios cover image selection, filesystem restrictions, network allow/deny and port matching, and blocked direct egress alongside successful proxy traffic. Network scenarios use host-controlled endpoints with positive reachability controls before and after restrictions; the host needs a non-loopback IPv4 route outside the fixed `10.0.0.0/24` guest network. |
+| MicroVM | Experimental | Windows 25H2 x64 nightly runs the prebuilt `mxc-sdk/tests/nvx_e2e.rs` suite, including image selection, filesystem restrictions, network allow/deny and port matching, and blocked direct egress alongside successful proxy traffic. Network scenarios use host-controlled endpoints with positive reachability controls before and after restrictions; the host needs a non-loopback IPv4 route outside the fixed `10.0.0.0/24` guest network. Host-only checks remain in normal PR builds. |
 | Seatbelt | ✅ Good | Failures are genuine MXC bugs. |
 
 ## Host preparation
@@ -248,9 +249,11 @@ every entry.
   `prepare-null-device --no-sacl`. T1 needs them too: the suite deliberately
   drives the AppContainer fallback tiers, and an unprepared host fails those
   launches with `WIN32_ERROR(5)` instead of reporting a policy result.
-- `microvm` — asserts the NanVix payload is in the artifact, adds a Defender
-  exclusion for the binary directory, and requires the Windows Hypervisor
-  Platform feature *and* a running hypervisor.
+- `microvm` — asserts the SDK test executable and signed NVX runtime files are
+  in the artifact, adds a Defender exclusion for the binary directory, and
+  requires the Windows Hypervisor Platform feature *and* a running hypervisor.
+  The dispatcher runs the prebuilt SDK tests without Cargo and fails on missing
+  VM completion markers, empty suites, skipped tests, or filtered tests.
 - `wslc` — asserts `wslcsdk.dll` shipped, requires the WSL and
   VirtualMachinePlatform optional features to be baked into the image, then
   installs/updates the WSL runtime (including the pre-release ring) up to the
@@ -284,7 +287,9 @@ a process-container job selects follows from that build.
   LXC after RHEL 7 and ships no replacement. Without the zone assignment the
   default zone rejects the container's IPv4 DHCP, and a container holding only
   an IPv6 address fails every network test.
-- `microvm` — asserts the NanVix payload exists.
+
+The historical Linux `microvm` preparation branch is not scheduled. The
+Phase 1 NVX runtime supports only Windows x64.
 
 Every install above goes through two shared helpers rather than its own
 package-manager chain: `resolve_package_manager` picks the first of `apt-get`,
@@ -397,6 +402,12 @@ step tees that into `$RUNNER_TEMP/mxc-ci.log`.
 
 The IsolationSession test bundle downloads under `artifacts/bin`, outside
 `$RUNNER_TEMP`, so it is not uploaded again with the logs.
+
+MicroVM validation writes `microvm-nvx.log` and `microvm-perf-results.json`
+under the redirected temporary directory, so the normal Windows log upload
+collects both. The signed NVX bundle stays under `artifacts/bin` and is not
+uploaded again. The former standalone `microvm-e2e.yml` workflow is retired;
+real VM execution is scheduled rather than run on each PR.
 
 ## Runbook
 
