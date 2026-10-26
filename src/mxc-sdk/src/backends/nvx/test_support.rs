@@ -1,14 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::io::{Read, Write};
+use std::os::windows::io::IntoRawHandle;
 use std::sync::{Arc, Mutex};
 
-use aci_edge_sandboxes::{
-    Backend, Capabilities, DeprovisionResult, Error, ExecControl, ExecIo, ExecOutcome, ExecRequest,
-    ProvisionRequest, ProvisionResult, SandboxId, SandboxSpec, StartResult, StopResult,
-};
+use super::abi::{Capabilities, ExecOutcome, ExecRequest, ImageSource, ProvisionInput};
+use super::execution::ExecControl;
+use super::runtime::{ExecOutput, Execution, SandboxClient, SandboxId};
+use crate::mxc_common::mxc_error::MxcError;
+use crate::mxc_common::process_util::{InterruptiblePipeReader, OwnedHandle, PipeReadCanceller};
+use crate::mxc_common::sandbox_process::StreamCloser;
+use windows::Win32::Foundation::HANDLE;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(super) struct Fixture {
     pub events: Arc<Mutex<Vec<&'static str>>>,
     pub fail: Option<&'static str>,
@@ -16,11 +21,11 @@ pub(super) struct Fixture {
     pub deprovision_fails: bool,
     pub outcome: Option<ExecOutcome>,
     pub capabilities: Option<Capabilities>,
-    pub image: Arc<Mutex<Option<aci_edge_sandboxes::ImageSource>>>,
+    pub image: Arc<Mutex<Option<ImageSource>>>,
     pub stdin_piped: Arc<Mutex<Option<bool>>>,
     pub require_stdin_eof: bool,
-    pub stdin_reader: Arc<Mutex<Option<aci_edge_sandboxes::InputSource>>>,
-    pub stdin_closer: Arc<Mutex<Option<aci_edge_sandboxes::InputCloser>>>,
+    pub stdin_reader: Arc<Mutex<Option<InterruptiblePipeReader>>>,
+    pub stdin_closer: Arc<Mutex<Option<PipeReadCanceller>>>,
     pub stop_gate: Option<Arc<CleanupGate>>,
 }
 
@@ -48,10 +53,12 @@ impl CleanupGate {
 }
 
 impl Fixture {
-    pub fn event(&self, stage: &'static str) -> aci_edge_sandboxes::Result<()> {
+    pub fn event(&self, stage: &'static str) -> Result<(), MxcError> {
         self.events.lock().unwrap().push(stage);
         if self.fail == Some(stage) {
-            Err(Error::backend_error(format!("injected {stage} failure")))
+            Err(MxcError::backend_error(format!(
+                "NVX signed bundled agent: injected {stage} failure"
+            )))
         } else {
             Ok(())
         }
@@ -62,7 +69,7 @@ impl Fixture {
     }
 
     pub fn supported_capabilities() -> Capabilities {
-        let mut capabilities = Capabilities::new("nvx-test");
+        let mut capabilities = Capabilities::default();
         capabilities.exec.command_line = true;
         capabilities.exec.stdin = true;
         capabilities.exec.cancel = true;
@@ -74,110 +81,110 @@ impl Fixture {
     }
 }
 
-impl Backend for Fixture {
-    fn name(&self) -> &str {
-        "nvx-test"
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.capabilities
+impl SandboxClient for Fixture {
+    fn capabilities(&self) -> Result<Capabilities, MxcError> {
+        Ok(self
+            .capabilities
             .clone()
-            .unwrap_or_else(Self::supported_capabilities)
+            .unwrap_or_else(Self::supported_capabilities))
     }
-
-    fn probe(&self) -> aci_edge_sandboxes::Result<()> {
+    fn probe(&self) -> Result<(), MxcError> {
         self.event("probe")
     }
-
-    fn validate_provision_with(
-        &self,
-        _request: &ProvisionRequest,
-        _spec: &SandboxSpec,
-    ) -> aci_edge_sandboxes::Result<()> {
+    fn validate_provision(&self, _input: &ProvisionInput) -> Result<(), MxcError> {
         self.event("validate_provision")
     }
-
-    fn validate_exec(&self, _request: &ExecRequest) -> aci_edge_sandboxes::Result<()> {
+    fn validate_exec(&self, _request: &ExecRequest) -> Result<(), MxcError> {
         self.event("validate_exec")
     }
-
-    fn provision(&self, request: &ProvisionRequest) -> aci_edge_sandboxes::Result<ProvisionResult> {
-        self.provision_with(request, &SandboxSpec::new())
-    }
-
-    fn provision_with(
-        &self,
-        _request: &ProvisionRequest,
-        spec: &SandboxSpec,
-    ) -> aci_edge_sandboxes::Result<ProvisionResult> {
-        *self.image.lock().unwrap() = spec.image.clone();
+    fn provision(&self, input: &ProvisionInput) -> Result<SandboxId, MxcError> {
+        *self.image.lock().unwrap() = input.spec.image.clone();
         self.event("provision")?;
-        Ok(ProvisionResult {
-            sandbox_id: Self::id(),
-            metadata: None,
-        })
+        Ok(Self::id())
     }
-
-    fn start(&self, _id: &SandboxId) -> aci_edge_sandboxes::Result<StartResult> {
-        self.event("start")?;
-        Ok(StartResult::default())
+    fn start(&self, _id: &SandboxId) -> Result<(), MxcError> {
+        self.event("start")
     }
-
-    fn exec(
+    fn exec(&self, _id: &SandboxId, request: &ExecRequest) -> Result<Execution, MxcError> {
+        self.validate_exec(request)?;
+        *self.stdin_piped.lock().unwrap() = Some(request.stdin);
+        self.event("exec")?;
+        let (stdout, mut output) = std::io::pipe().unwrap();
+        let (stderr, mut errors) = std::io::pipe().unwrap();
+        output.write_all(b"out").unwrap();
+        errors.write_all(b"err").unwrap();
+        let stdin = if request.stdin {
+            let (reader, writer) = std::io::pipe().unwrap();
+            if self.require_stdin_eof {
+                let reader = InterruptiblePipeReader::new(OwnedHandle::new(HANDLE(
+                    reader.into_raw_handle(),
+                )));
+                *self.stdin_closer.lock().unwrap() = Some(reader.canceller());
+                *self.stdin_reader.lock().unwrap() = Some(reader);
+            }
+            Some(writer)
+        } else {
+            None
+        };
+        Ok(Execution::new(
+            Arc::new(self.clone()),
+            stdin,
+            stdout,
+            stderr,
+        ))
+    }
+    fn exec_and_wait(
         &self,
         _id: &SandboxId,
         _request: &ExecRequest,
-        mut io: ExecIo,
-    ) -> aci_edge_sandboxes::Result<Box<dyn ExecControl>> {
-        *self.stdin_piped.lock().unwrap() = Some(io.stdin.is_some());
+    ) -> Result<ExecOutput, MxcError> {
         self.event("exec")?;
-        io.stdout.write(b"out").unwrap();
-        io.stderr.write(b"err").unwrap();
-        if self.require_stdin_eof {
-            *self.stdin_closer.lock().unwrap() =
-                io.stdin.as_ref().map(|stdin| stdin.close_handle());
-            *self.stdin_reader.lock().unwrap() = io.stdin.take();
-        }
-        drop(io);
-        Ok(Box::new(self.clone()))
+        Ok(ExecOutput {
+            outcome: self.outcome.unwrap_or(ExecOutcome::Exited(7)),
+            stdout: b"out".to_vec(),
+            stderr: b"err".to_vec(),
+        })
     }
-
-    fn stop(&self, _id: &SandboxId) -> aci_edge_sandboxes::Result<StopResult> {
+    fn stop(&self, _id: &SandboxId) -> Result<(), MxcError> {
         self.event("stop")?;
         if let Some(gate) = &self.stop_gate {
             gate.wait();
         }
         if self.stop_fails {
-            Err(Error::backend_error("injected stop failure"))
+            Err(MxcError::backend_error(
+                "NVX signed bundled agent: injected stop failure",
+            ))
         } else {
-            Ok(StopResult::default())
+            Ok(())
         }
     }
-
-    fn deprovision(&self, _id: &SandboxId) -> aci_edge_sandboxes::Result<DeprovisionResult> {
+    fn deprovision(&self, _id: &SandboxId) -> Result<(), MxcError> {
         self.event("deprovision")?;
         if self.deprovision_fails {
-            Err(Error::backend_error("injected deprovision failure"))
+            Err(MxcError::backend_error(
+                "NVX signed bundled agent: injected deprovision failure",
+            ))
         } else {
-            Ok(DeprovisionResult::default())
+            Ok(())
         }
+    }
+    fn close(&mut self) -> Result<(), MxcError> {
+        Ok(())
     }
 }
 
 impl ExecControl for Fixture {
-    fn wait(&self) -> aci_edge_sandboxes::Result<ExecOutcome> {
+    fn wait(&self) -> Result<ExecOutcome, MxcError> {
         self.event("wait")?;
         if let Some(mut stdin) = self.stdin_reader.lock().unwrap().take() {
-            use std::io::Read;
             let mut input = Vec::new();
             stdin
                 .read_to_end(&mut input)
-                .map_err(|error| Error::backend_error(format!("stdin read failed: {error}")))?;
+                .map_err(|error| MxcError::backend_error(format!("stdin read failed: {error}")))?;
         }
         Ok(self.outcome.unwrap_or(ExecOutcome::Exited(7)))
     }
-
-    fn cancel(&self) -> aci_edge_sandboxes::Result<()> {
+    fn cancel(&self) -> Result<(), MxcError> {
         self.event("cancel")?;
         if let Some(closer) = self.stdin_closer.lock().unwrap().as_ref() {
             closer.close();

@@ -17,6 +17,9 @@ It requires the `microvm` build feature and
 `Containment::MicroVm { image: String, memory_mib: Option<u32> }`. Stable operations do not authorize
 MicroVM. Live execution uses `v1::experimental::spawn`, and container lifecycle
 operations use `v1::experimental::container`, as described below.
+These entry points do not imply that every operation is implemented by the
+selected backend. See the [NVX support matrix](../../../backends/nvx/nvx.md#supported-operations-and-policy)
+for the operations and settings supported by the current runtime.
 
 | Output | Create and run a container | Run in an existing container | Result |
 |---|---|---|---|

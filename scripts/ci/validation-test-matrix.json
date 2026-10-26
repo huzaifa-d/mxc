@@ -220,7 +220,6 @@
           "pool": "1es-mxc-e2e-ubuntu-24.04-x64",
           "backends": [
             "bubblewrap",
-            "microvm",
             "lxc"
           ]
         },
@@ -367,7 +366,8 @@
         "os": "windows-25h2",
         "backends": [
           "process-t1",
-          "wslc"
+          "wslc",
+          "microvm"
         ]
       },
       {

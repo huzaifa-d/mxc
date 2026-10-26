@@ -64,6 +64,8 @@ export interface DeprovisionRequest {
   version: Version;
 }
 
+export type DeprovisionSessionPhase = "deprovision-session";
+
 export type ExecPhase = "exec";
 
 /**
@@ -688,6 +690,8 @@ export type ProcessContainerUiSystemSettings = "none" | "parameters" | "display"
 
 export type ProvisionPhase = "provision";
 
+export type ProvisionSessionPhase = "provision-session";
+
 /**
  * Runtime configuration supplied alongside the sandbox policy.
  */
@@ -788,6 +792,13 @@ export interface StateAwareWslc {
    * Optional provision-phase settings.
    */
   provision?: WslcProvision;
+}
+
+/**
+ * WSLc settings for provisioning a shared utility VM.
+ */
+export interface StateAwareWslcSession {
+  provisionSession?: WslcProvisionSession;
 }
 
 export type StopPhase = "stop";
@@ -905,6 +916,28 @@ export interface WindowsSandboxProvisionRequest {
 export type WslcContainment = "wslc";
 
 /**
+ * Request to release an empty WSLc session.
+ */
+export interface WslcDeprovisionSessionRequest {
+  /**
+   * JSON Schema URL for editor validation.
+   */
+  $schema?: string;
+  /**
+   * Annotation ignored by the runtime.
+   */
+  _comment?: unknown;
+  containment: WslcContainment;
+  phase: DeprovisionSessionPhase;
+  /**
+   * Session identifier returned by provision-session.
+   */
+  sessionId: string;
+  telemetry?: Telemetry;
+  version: Version;
+}
+
+/**
  * WSLC settings accepted during provisioning.
  */
 export interface WslcProvision {
@@ -920,6 +953,10 @@ export interface WslcProvision {
    * Optional host-to-container TCP port mappings.
    */
   portMappings?: PortMapping[];
+  /**
+   * Session to join; omitted to use the shared default VM.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -965,6 +1002,43 @@ export interface WslcProvisionRequest {
 }
 
 /**
+ * Utility VM sizing shared by every sandbox in the session.
+ */
+export interface WslcProvisionSession {
+  /**
+   * Virtual CPUs available to the session's utility VM.
+   */
+  cpuCount?: number;
+  /**
+   * Enable GPU passthrough for the session's utility VM.
+   */
+  gpu?: boolean;
+  /**
+   * Utility VM memory ceiling, in megabytes.
+   */
+  memoryMb?: number;
+}
+
+/**
+ * Request to create a WSLc session.
+ */
+export interface WslcProvisionSessionRequest {
+  /**
+   * JSON Schema URL for editor validation.
+   */
+  $schema?: string;
+  /**
+   * Annotation ignored by the runtime.
+   */
+  _comment?: unknown;
+  containment: WslcContainment;
+  phase: ProvisionSessionPhase;
+  telemetry?: Telemetry;
+  version: Version;
+  wslc?: StateAwareWslcSession;
+}
+
+/**
  * Exact mutable MXC development configuration contract.
  */
-export type MXCConfiguration = OneShotRequest | DeprovisionRequest | StopRequest | ExecRequest | StartRequest | WslcProvisionRequest | MicroVmProvisionRequest | IsolationSessionProvisionRequest | WindowsSandboxProvisionRequest;
+export type MXCConfiguration = OneShotRequest | WslcDeprovisionSessionRequest | DeprovisionRequest | StopRequest | ExecRequest | StartRequest | WslcProvisionRequest | MicroVmProvisionRequest | IsolationSessionProvisionRequest | WindowsSandboxProvisionRequest | WslcProvisionSessionRequest;

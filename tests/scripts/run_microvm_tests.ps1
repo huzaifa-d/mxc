@@ -7,7 +7,7 @@
 
 .DESCRIPTION
     - Locates wxc-exec.exe (built with --features microvm)
-    - Uses the signed agent release bundled by the Cargo dependency
+    - Uses the signed agent release staged by the mxc-sdk build script
     - Runs each test config via wxc-exec, validates exit codes and stdout content
     - Reports pass/fail summary with per-test performance timing
     - Writes microvm-perf-results.json for CI artifact consumption

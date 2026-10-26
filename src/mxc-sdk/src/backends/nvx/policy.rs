@@ -3,9 +3,10 @@
 
 use std::path::{Component, PathBuf};
 
-use aci_edge_sandboxes::{
+use super::abi::{
     Access, Capabilities, EgressPolicy, ExecRequest, FilesystemPolicy, IngressPolicy, NetworkPeer,
-    NetworkPolicy, NetworkPort, NetworkRule, Protocol, ProvisionRequest, SandboxSpec, StdinMode,
+    NetworkPolicy, NetworkPort, NetworkRule, Protocol, ProvisionRequest, RuntimeConfig,
+    SandboxSpec,
 };
 
 use crate::mxc_common::models::{
@@ -17,6 +18,8 @@ use crate::mxc_common::mxc_error::MxcError;
 
 const MAX_ENVIRONMENT_BYTES: usize = 32 * 1024;
 const MAX_TIMEOUT_MS: u32 = 3_600_000;
+const MAX_ENVIRONMENT_ENTRIES: usize = 256;
+const MAX_CWD_BYTES: usize = 4095;
 const PROXY_ENVIRONMENT_KEYS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"];
 
 pub(super) fn provision_request(
@@ -39,19 +42,19 @@ pub(super) fn provision_request(
     }
     validate_provision_capabilities(request, config, capabilities)?;
 
-    let mut provision = ProvisionRequest::new();
-    if let Some(filesystem) = filesystem_policy(request) {
-        provision = provision.with_filesystem(filesystem);
-    }
-    if let Some(network) = network_policy(request)? {
-        provision = provision.with_network(network);
-    }
-    if let Some(proxy) = request.policy.network_proxy.address.as_ref() {
-        provision = provision.with_network_proxy(proxy.to_url());
-    }
     if let Some(memory) = config.map_or(request.microvm_memory_mib, |config| config.memory_mib) {
         spec = spec.with_memory_mib(memory);
     }
+    let provision =
+        ProvisionRequest {
+            filesystem: filesystem_policy(request),
+            network: network_policy(request)?,
+            runtime_config: request.policy.network_proxy.address.as_ref().map(|proxy| {
+                RuntimeConfig {
+                    network_proxy: Some(proxy.to_url()),
+                }
+            }),
+        };
     Ok((provision, spec))
 }
 
@@ -83,13 +86,9 @@ pub(super) fn exec_request(
 
     let mut exec = ExecRequest::command_line(request.script_code.clone())
         .with_inherit_default_env(request.inherit_default_env);
-    if piped_stdin {
-        exec = exec.with_stdin(StdinMode::Piped);
-    }
+    exec.stdin = piped_stdin;
     if request.script_timeout != 0 {
-        exec = exec.with_timeout(std::time::Duration::from_millis(u64::from(
-            request.script_timeout,
-        )));
+        exec = exec.with_timeout_ms(u64::from(request.script_timeout));
     }
     if !request.working_directory.is_empty() {
         exec = exec.with_cwd(request.working_directory.clone());
@@ -170,10 +169,20 @@ pub(super) fn validate_request(request: &ExecutionRequest) -> Result<(), MxcErro
             "NVX process.cwd must be an absolute POSIX guest path",
         ));
     }
+    if request.working_directory.len() > MAX_CWD_BYTES {
+        return Err(MxcError::policy_validation(
+            "NVX process.cwd must not exceed 4095 UTF-8 bytes",
+        ));
+    }
     if let Some(environment) = &request.env {
         if !request.inherit_default_env {
             return Err(MxcError::policy_validation(
                 "NVX process.env requires inheritDefaultEnv=true",
+            ));
+        }
+        if environment.len() > MAX_ENVIRONMENT_ENTRIES {
+            return Err(MxcError::policy_validation(
+                "NVX process.env must not exceed 256 entries",
             ));
         }
         let bytes = environment
@@ -387,7 +396,7 @@ mod tests {
     }
 
     fn capabilities() -> Capabilities {
-        let mut capabilities = Capabilities::new("agent");
+        let mut capabilities = Capabilities::default();
         capabilities.exec.command_line = true;
         capabilities.exec.stdin = true;
         capabilities.exec.cancel = true;
@@ -563,7 +572,7 @@ mod tests {
         let (_, spec) = provision_request(&request, None, &capabilities()).unwrap();
         assert_eq!(
             spec.image,
-            Some(aci_edge_sandboxes::ImageSource::Reference(
+            Some(super::super::abi::ImageSource::Reference(
                 "python:3.12-alpine".to_owned()
             ))
         );
@@ -574,7 +583,7 @@ mod tests {
         let (_, spec) = provision_request(&request, Some(&config), &capabilities()).unwrap();
         assert_eq!(
             spec.image,
-            Some(aci_edge_sandboxes::ImageSource::Reference(config.image))
+            Some(super::super::abi::ImageSource::Reference(config.image))
         );
     }
 
@@ -609,7 +618,7 @@ mod tests {
                 provision_request(&prepared.inner, None, &capabilities()).unwrap();
             assert_eq!(
                 spec.image,
-                Some(aci_edge_sandboxes::ImageSource::Reference(image.to_owned()))
+                Some(super::super::abi::ImageSource::Reference(image.to_owned()))
             );
             let filesystem = provision.filesystem.unwrap();
             assert_eq!(filesystem.readonly_paths, vec![PathBuf::from(r"C:\ro")]);
@@ -828,6 +837,35 @@ mod tests {
         let mut timeout = request();
         timeout.script_timeout = MAX_TIMEOUT_MS + 1;
         assert_policy_error(&timeout, "one hour");
+    }
+
+    #[test]
+    fn environment_entry_limit_counts_duplicates_and_preserves_absent_and_empty() {
+        let mut request = request();
+        assert!(validate_request(&request).is_ok());
+        request.env = Some(Vec::new());
+        assert_policy_error(&request, "inheritDefaultEnv=true");
+        request.inherit_default_env = true;
+        assert!(validate_request(&request).is_ok());
+        request.env = Some(vec!["KEY=value".to_owned(); MAX_ENVIRONMENT_ENTRIES]);
+        assert!(validate_request(&request).is_ok());
+        request.env.as_mut().unwrap().push("KEY=later".to_owned());
+        assert_policy_error(&request, "must not exceed 256 entries");
+    }
+
+    #[test]
+    fn cwd_limit_counts_utf8_bytes_instead_of_characters() {
+        let mut request = request();
+        for directory in [
+            format!("/{}", "x".repeat(MAX_CWD_BYTES - 1)),
+            format!("/{}", "\u{00e9}".repeat((MAX_CWD_BYTES - 1) / 2)),
+        ] {
+            assert_eq!(directory.len(), MAX_CWD_BYTES);
+            request.working_directory = directory;
+            assert!(validate_request(&request).is_ok());
+            request.working_directory.push('x');
+            assert_policy_error(&request, "must not exceed 4095 UTF-8 bytes");
+        }
     }
 
     #[test]

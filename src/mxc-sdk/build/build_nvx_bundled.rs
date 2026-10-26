@@ -1,12 +1,27 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#[cfg(any(test, feature = "microvm"))]
 use std::collections::BTreeMap;
+#[cfg(any(test, feature = "microvm"))]
 use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "microvm")]
+use std::process::Command;
 
+#[cfg(any(test, feature = "microvm"))]
 use sha2::{Digest, Sha256};
 
-const OFFICIAL_BUNDLE_FILES: &[(&str, &str)] = &[
+// Upgrade procedure: docs/backends/nvx/nvx.md#maintainers-updating-the-bundled-runtime.
+#[cfg(any(test, feature = "microvm"))]
+pub(crate) const OFFICIAL_BUNDLE_URL: &str =
+    "https://github.com/microsoft/nvx/releases/download/v0.1.0-dev.0430ce79d125/aci-edge-sandboxes.zip";
+#[cfg(any(test, feature = "microvm"))]
+pub(crate) const OFFICIAL_BUNDLE_ZIP_SHA256: &str =
+    "98e3d6011b0664fad6fa783768370a34209639463f5ab812b7776840660ac24e";
+const BUNDLE_DIR_ENV: &str = "ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR";
+
+#[cfg(any(test, feature = "microvm"))]
+pub(crate) const OFFICIAL_BUNDLE_FILES: &[(&str, &str)] = &[
     (
         "SHA256SUMS",
         "d86b7768ca51e6ea93c40880cc027c85280e718e960e1efe3e0e80bd23727fce",
@@ -83,32 +98,273 @@ const OFFICIAL_BUNDLE_FILES: &[(&str, &str)] = &[
 
 pub(crate) fn run() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_MICROVM");
-    println!("cargo:rerun-if-env-changed=DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR");
-    if std::env::var_os("CARGO_FEATURE_MICROVM").is_none()
-        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
-        || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
+    println!("cargo:rerun-if-env-changed={BUNDLE_DIR_ENV}");
+    #[cfg(feature = "microvm")]
+    if std::env::var_os("CARGO_FEATURE_MICROVM").is_some()
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
     {
-        return;
+        stage_official_bundle();
     }
+}
 
-    // Cargo does not inherit a dependency checkout's .cargo/config.toml. Authenticate the exact
-    // extracted release here so downstream path and Git consumers cannot select another bundle.
-    let source = PathBuf::from(
-        std::env::var_os("DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR")
-            .expect("microvm requires the official signed agent-bundled NVX release"),
-    );
-    verify_bundle(&source);
-
+#[cfg(feature = "microvm")]
+fn stage_official_bundle() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+    let bundle_dir = std::env::var_os(BUNDLE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    stage_bundle_against(
+        &out_dir,
+        bundle_dir.as_deref(),
+        OFFICIAL_BUNDLE_ZIP_SHA256,
+        OFFICIAL_BUNDLE_FILES,
+    );
+}
+
+#[cfg(feature = "microvm")]
+pub(crate) fn stage_bundle_against(
+    out_dir: &Path,
+    bundle_dir: Option<&Path>,
+    expected_archive_sha256: &str,
+    expected_files: &[(&str, &str)],
+) {
+    // Cargo owns these roots; caller-supplied bundle paths remain unresolved.
+    let out_dir = out_dir.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "cannot resolve Cargo OUT_DIR {}: {error}",
+            out_dir.display()
+        )
+    });
+    let source = match bundle_dir {
+        Some(directory) => {
+            let archive = directory.join("aci-edge-sandboxes.zip");
+            if archive.is_file() && !directory.join("SOURCE-MANIFEST.json").is_file() {
+                println!("cargo:rerun-if-changed={}", archive.display());
+                let extracted = out_dir.join("aci-edge-sandboxes");
+                if !is_verified_bundle(&extracted, expected_files) {
+                    extract_verified_archive_against(
+                        &archive,
+                        &extracted,
+                        expected_archive_sha256,
+                        expected_files,
+                    );
+                }
+                extracted
+            } else {
+                directory.to_path_buf()
+            }
+        }
+        None => acquire_cached_bundle(&out_dir, expected_archive_sha256, expected_files),
+    };
+    verify_bundle_against(&source, expected_files);
+
     let target = out_dir
         .ancestors()
         .nth(3)
         .expect("OUT_DIR has target/profile ancestors")
         .join("aci-edge-sandboxes");
     copy_bundle(&source, &target);
-    verify_bundle(&target);
+    verify_bundle_against(&target, expected_files);
 }
 
+#[cfg(feature = "microvm")]
+fn acquire_cached_bundle(
+    out_dir: &Path,
+    expected_archive_sha256: &str,
+    expected_files: &[(&str, &str)],
+) -> PathBuf {
+    let extracted = out_dir.join("aci-edge-sandboxes");
+    if is_verified_bundle(&extracted, expected_files) {
+        return extracted;
+    }
+
+    let archive = out_dir.join("aci-edge-sandboxes.zip");
+    let archive_ok =
+        archive.is_file() && sha256(&archive).eq_ignore_ascii_case(expected_archive_sha256);
+    if !archive_ok {
+        let _ = std::fs::remove_file(&archive);
+        download_archive(OFFICIAL_BUNDLE_URL, &archive);
+    }
+    extract_verified_archive_against(
+        &archive,
+        &extracted,
+        expected_archive_sha256,
+        expected_files,
+    );
+    extracted
+}
+
+#[cfg(feature = "microvm")]
+fn download_archive(url: &str, destination: &Path) {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", parent.display()));
+    }
+    let partial = destination.with_extension("zip.part");
+    let _ = std::fs::remove_file(&partial);
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--retry",
+            "5",
+            "--retry-delay",
+            "5",
+            "--retry-all-errors",
+            "--output",
+        ])
+        .arg(&partial)
+        .arg(url)
+        .output()
+        .unwrap_or_else(|error| {
+            let _ = std::fs::remove_file(&partial);
+            panic!(
+                "cannot invoke curl to download signed NVX bundle from {url}: {error}; \
+                 set {BUNDLE_DIR_ENV} to a pre-fetched bundle directory for offline builds"
+            )
+        });
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&partial);
+        panic!(
+            "curl failed to download signed NVX bundle from {url} ({}): {}; \
+             set {BUNDLE_DIR_ENV} to a pre-fetched bundle directory for offline builds",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    std::fs::rename(&partial, destination).unwrap_or_else(|error| {
+        let _ = std::fs::remove_file(&partial);
+        panic!(
+            "cannot finalize downloaded NVX bundle ({} -> {}): {error}",
+            partial.display(),
+            destination.display()
+        )
+    });
+}
+
+#[cfg(any(test, feature = "microvm"))]
+pub(crate) fn extract_verified_archive_against(
+    archive_path: &Path,
+    destination: &Path,
+    expected_archive_sha256: &str,
+    expected_files: &[(&str, &str)],
+) {
+    let actual_archive_sha256 = sha256(archive_path);
+    if !actual_archive_sha256.eq_ignore_ascii_case(expected_archive_sha256) {
+        let _ = std::fs::remove_file(archive_path);
+        panic!(
+            "microvm requires the signed v0.1.0-dev.0430ce79d125 archive {}: \
+             expected SHA-256 {expected_archive_sha256}, got {actual_archive_sha256}",
+            archive_path.display()
+        );
+    }
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", parent.display()));
+    }
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("aci-edge-sandboxes");
+    let staging = destination.with_file_name(format!("{name}.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .unwrap_or_else(|error| panic!("cannot create {}: {error}", staging.display()));
+
+    let unpack_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unpack_zip_strict(archive_path, &staging);
+        verify_bundle_against(&staging, expected_files);
+    }));
+    if let Err(payload) = unpack_result {
+        let _ = std::fs::remove_dir_all(&staging);
+        std::panic::resume_unwind(payload);
+    }
+
+    let _ = std::fs::remove_dir_all(destination);
+    std::fs::rename(&staging, destination).unwrap_or_else(|error| {
+        let _ = std::fs::remove_dir_all(&staging);
+        panic!(
+            "cannot publish extracted NVX bundle to {}: {error}",
+            destination.display()
+        )
+    });
+}
+
+#[cfg(any(test, feature = "microvm"))]
+fn unpack_zip_strict(archive_path: &Path, destination: &Path) {
+    let file = std::fs::File::open(archive_path)
+        .unwrap_or_else(|error| panic!("cannot open {}: {error}", archive_path.display()));
+    let mut archive = zip::ZipArchive::new(file).unwrap_or_else(|error| {
+        panic!(
+            "cannot read NVX bundle archive {}: {error}",
+            archive_path.display()
+        )
+    });
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .unwrap_or_else(|error| panic!("cannot read NVX zip entry {index}: {error}"));
+        assert!(
+            !entry.is_symlink(),
+            "NVX bundle archive must not contain links: {}",
+            entry.name()
+        );
+        let relative = entry.enclosed_name().unwrap_or_else(|| {
+            panic!(
+                "NVX bundle archive entry path is not safe: {}",
+                entry.name()
+            )
+        });
+        assert!(
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+            "NVX bundle archive entry path is not safe: {}",
+            entry.name()
+        );
+        let out_path = destination.join(&relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)
+                .unwrap_or_else(|error| panic!("cannot create {}: {error}", out_path.display()));
+        } else {
+            assert!(
+                entry.is_file(),
+                "NVX bundle archive must contain only regular files and directories: {}",
+                entry.name()
+            );
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .unwrap_or_else(|error| panic!("cannot create {}: {error}", parent.display()));
+            }
+            assert!(
+                !out_path.exists(),
+                "duplicate NVX bundle archive entry: {}",
+                relative.display()
+            );
+            let mut output = std::fs::File::create(&out_path)
+                .unwrap_or_else(|error| panic!("cannot create {}: {error}", out_path.display()));
+            std::io::copy(&mut entry, &mut output)
+                .unwrap_or_else(|error| panic!("cannot write {}: {error}", out_path.display()));
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn is_verified_bundle(source: &Path, expected_files: &[(&str, &str)]) -> bool {
+    source.is_dir()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_bundle_against(source, expected_files);
+        }))
+        .is_ok()
+}
+
+#[cfg(any(test, feature = "microvm"))]
 fn sha256(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap_or_else(|error| {
         panic!(
@@ -122,10 +378,7 @@ fn sha256(path: &Path) -> String {
         .collect()
 }
 
-fn verify_bundle(source: &Path) {
-    verify_bundle_against(source, OFFICIAL_BUNDLE_FILES);
-}
-
+#[cfg(any(test, feature = "microvm"))]
 pub(crate) fn verify_bundle_against(source: &Path, expected_files: &[(&str, &str)]) {
     assert_safe_directory(source, "NVX bundle source");
     let expected: BTreeMap<&str, &str> = expected_files.iter().copied().collect();
@@ -154,6 +407,7 @@ pub(crate) fn verify_bundle_against(source: &Path, expected_files: &[(&str, &str
     }
 }
 
+#[cfg(any(test, feature = "microvm"))]
 fn collect_bundle_files(source: &Path, directory: &Path, files: &mut BTreeMap<String, PathBuf>) {
     for entry in std::fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("cannot list {}: {error}", directory.display()))
@@ -193,6 +447,7 @@ fn collect_bundle_files(source: &Path, directory: &Path, files: &mut BTreeMap<St
     }
 }
 
+#[cfg(any(test, feature = "microvm"))]
 fn copy_bundle(source: &Path, target: &Path) {
     assert_safe_directory(source, "NVX bundle source");
     assert_safe_destination(target);
@@ -233,6 +488,7 @@ fn copy_bundle(source: &Path, target: &Path) {
     }
 }
 
+#[cfg(any(test, feature = "microvm"))]
 fn assert_safe_directory(path: &Path, description: &str) {
     assert_safe_ancestors(path, description, false);
     let metadata = std::fs::symlink_metadata(path)
@@ -244,10 +500,12 @@ fn assert_safe_directory(path: &Path, description: &str) {
     );
 }
 
+#[cfg(any(test, feature = "microvm"))]
 fn assert_safe_destination(target: &Path) {
     assert_safe_ancestors(target, "NVX bundle destination", true);
 }
 
+#[cfg(any(test, feature = "microvm"))]
 fn assert_safe_ancestors(target: &Path, description: &str, allow_missing: bool) {
     let absolute = if target.is_absolute() {
         target.to_path_buf()
@@ -274,7 +532,7 @@ fn assert_safe_ancestors(target: &Path, description: &str, allow_missing: bool) 
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(any(test, feature = "microvm"), target_os = "windows"))]
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
@@ -282,7 +540,7 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(any(test, feature = "microvm"), not(target_os = "windows")))]
 fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
     false
 }

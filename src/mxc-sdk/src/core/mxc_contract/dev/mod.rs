@@ -251,6 +251,7 @@ pub use stable::{
 pub use state_aware::{probe_containment, Containment, ContainmentProbeError};
 pub use state_aware::{probe_phase, Phase, PhaseProbeError};
 pub use state_aware::{DeprovisionPhase, DeprovisionRequest};
+pub use state_aware::{DeprovisionSessionPhase, WslcDeprovisionSessionRequest};
 pub use state_aware::{ExecPhase, ExecRequest};
 pub use state_aware::{
     IsolationSessionContainment, IsolationSessionNetwork, IsolationSessionNetworkAllow,
@@ -259,6 +260,9 @@ pub use state_aware::{
     MicroVmProvisionRequest, StateAwareIsolationSession, StateAwareMicroVm,
 };
 pub use state_aware::{ProvisionPhase, ProvisionRequest};
+pub use state_aware::{
+    ProvisionSessionPhase, StateAwareWslcSession, WslcProvisionSession, WslcProvisionSessionRequest,
+};
 pub use state_aware::{StartPhase, StartRequest};
 pub use state_aware::{StateAwareWslc, WslcContainment, WslcProvision, WslcProvisionRequest};
 pub use state_aware::{StopPhase, StopRequest};

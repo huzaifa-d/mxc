@@ -8,7 +8,6 @@ repository = "https://github.com/microsoft/mxc"
 readme = "README.md"
 build = "build.rs"
 autobins = false
-publish = false
 
 [lib]
 name = "mxc_sdk"
@@ -33,7 +32,7 @@ wslc = ["link-wslcsdk", "dep:libloading", "dep:tar"]
 link-wslcsdk = ["dep:zip"]
 isolation_session = ["dep:windows-collections", "dep:windows-future"]
 test-support = []
-microvm = ["dep:aci_edge_sandboxes"]
+microvm = ["dep:libloading", "dep:zip"]
 hyperlight = [
     "dep:hyperlight-unikraft",
     "dep:ureq",
@@ -83,11 +82,12 @@ quick-xml.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 flate2 = { version = "1", optional = true }
 hyperlight-unikraft = { version = "=0.17.0", default-features = false, optional = true }
-ureq = { version = "3", optional = true }
+ureq = { version = "3", default-features = false, features = ["native-tls", "gzip"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tracelogging.workspace = true
@@ -103,9 +103,6 @@ windows-collections = { version = "0.3", optional = true }
 windows-core.workspace = true
 windows-future = { version = "0.3", optional = true }
 winreg.workspace = true
-
-[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
-aci_edge_sandboxes = { git = "https://github.com/microsoft/nvx", rev = "0430ce79d125203c20f0aa69243480513a774296", default-features = false, features = ["agent-bundled"], optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 cc = "1"

@@ -1,12 +1,4 @@
 
-[env]
-# Keep the official dependency's verifier in the download/staging path while pinning the exact
-# release archive approved for this NVX revision. `force` prevents ambient build variables from
-# selecting another URL, digest, or the verifier's explicit skip mode.
-ACI_EDGE_SANDBOXES_AGENT_BUNDLE = { value = "required", force = true }
-ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL = { value = "https://github.com/microsoft/nvx/releases/download/v0.1.0-dev.0430ce79d125/aci-edge-sandboxes.zip", force = true }
-ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256 = { value = "98e3d6011b0664fad6fa783768370a34209639463f5ab812b7776840660ac24e", force = true }
-
 # Hardening flags for Windows targets. Most flags apply to both arches;
 # /CETCOMPAT is x86/x64 only (Intel Control-flow Enforcement Technology;
 # ARM64 uses Pointer Authentication / BTI instead).

@@ -4,7 +4,8 @@
 use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use aci_edge_sandboxes::{ExecOutcome as NvxExecOutcome, Execution};
+use super::abi::ExecOutcome as NvxExecOutcome;
+use super::runtime::Execution;
 use windows::Win32::Foundation::HANDLE;
 
 use crate::mxc_common::mxc_error::MxcError;
@@ -67,7 +68,6 @@ pub(super) fn into_exec_handle(
                 .ok_or_else(|| MxcError::backend_error("NVX execution was already waited"))?;
             let outcome = execution
                 .wait()
-                .map_err(super::runtime::map_nvx_error)
                 .and_then(|outcome| map_outcome_for_stdio(outcome, stdio));
             let mut state = waiter_state.lock().unwrap_or_else(PoisonError::into_inner);
             state.stdin = None;
@@ -75,7 +75,7 @@ pub(super) fn into_exec_handle(
             state.stderr = None;
             outcome
         }),
-        terminator: Box::new(move || canceller.cancel().map_err(super::runtime::map_nvx_error)),
+        terminator: Box::new(move || canceller.cancel()),
         stdin_closer,
     })
 }
@@ -120,7 +120,9 @@ fn map_outcome(outcome: NvxExecOutcome) -> Result<ExecOutcome, MxcError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::runtime::SandboxClient;
     use super::*;
+    use crate::mxc_common::sandbox_process::StreamCloser;
 
     #[test]
     fn relayed_adapter_closes_real_stdin_before_waiting_for_eof() {
@@ -128,13 +130,11 @@ mod tests {
             require_stdin_eof: true,
             ..Default::default()
         };
-        let client = aci_edge_sandboxes::AciEdgeSandbox::new(fixture.clone());
+        let client = fixture.clone();
+        let mut request = super::super::abi::ExecRequest::command_line("read-input");
+        request.stdin = true;
         let execution = client
-            .exec(
-                &super::super::test_support::Fixture::id(),
-                &aci_edge_sandboxes::ExecRequest::command_line("read-input")
-                    .with_stdin(aci_edge_sandboxes::StdinMode::Piped),
-            )
+            .exec(&super::super::test_support::Fixture::id(), &request)
             .unwrap();
         let handle = into_exec_handle(execution, ExecStdio::Relayed).unwrap();
         assert!(handle.stdin.0.is_null());

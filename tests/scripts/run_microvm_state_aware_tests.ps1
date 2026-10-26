@@ -121,3 +121,4 @@ try {
 }
 
 Write-Host "MicroVM state-aware executor E2E passed: $sandboxId" -ForegroundColor Green
+Write-Host "VM_EXECUTED executor lifecycle provision/start/exec/stop/deprovision"

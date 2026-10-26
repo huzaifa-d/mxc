@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+mod abi;
+mod execution;
 mod policy;
 mod process;
 pub mod runner;
@@ -11,7 +13,7 @@ mod test_support;
 
 pub(crate) fn is_available() -> bool {
     // Asset discovery must not open a host or admit persistent lifecycle state.
-    aci_edge_sandboxes::agent::BundledAgent::discover().is_ok() && hypervisor_available()
+    runtime::bundle_available() && hypervisor_available()
 }
 
 fn hypervisor_available() -> bool {

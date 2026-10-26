@@ -180,14 +180,16 @@ temporary storage without creating directories.
 ### Experimental NVX create-and-run
 
 The `microvm` feature enables only Windows x64 and requires runtime experimental
-authorization. MXC uses the official signed `aci_edge_sandboxes` bundled agent at
-immutable Git revision `0430ce79d125203c20f0aa69243480513a774296`; it does not
-enable the standalone OpenVMM feature. This development crate has
-`publish = false`.
+authorization. MXC stages the official signed `aci-edge-sandboxes.zip` release
+bundle (`v0.1.0-dev.0430ce79d125` from NVX revision
+`0430ce79d125203c20f0aa69243480513a774296`) during the crate build and loads the
+verified `bin/aci_edge_agent.dll` C ABI v1 in-process without unpublished Rust
+dependencies; it does not enable standalone OpenVMM execution.
 
-The `mxc_sdk::v1::experimental` entry points support captured and streaming
-create-and-run requests, and `experimental::container` supports container
-lifecycle operations. Creation requires an explicit registry image:
+The `mxc_sdk::v1::experimental` entry points use the V1 request and result
+types. Creation requires an explicit registry image. The contract also
+defines memory settings and provision requests independently of backend
+availability:
 
 ```rust,no_run
 use mxc_sdk::v1::{Containment, ContainerRequest, ProvisionRequest};
@@ -205,6 +207,17 @@ sized_request.containment = Containment::MicroVm {
 let default_provision = ProvisionRequest::microvm("python:3.12-alpine", None);
 let provision = ProvisionRequest::microvm("python:3.12-alpine", Some(512));
 ```
+
+NVX captures at most 64 MiB (67,108,864 bytes) of stdout and stderr combined,
+including when the process timeout is zero. Output up to that limit is returned
+unchanged. Exceeding it cancels and releases the execution, tears down the
+container, and returns `BackendError` instead of truncated output. Cleanup
+failures are reported alongside the capture-limit error.
+
+See the [NVX backend guide](../../docs/backends/nvx/nvx.md) for host
+requirements, the supported-operation and policy matrix, working-directory and
+environment limits, and the maintainer bundle-upgrade procedure. Windows ARM64
+and Linux MicroVM execution are not available in this phase.
 
 The development `1.1.0-alpha` JSON creation paths require `microvm.image`;
 both also accept optional `microvm.provision.memoryMib`. `None` leaves memory

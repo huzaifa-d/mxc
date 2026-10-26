@@ -76,6 +76,27 @@ jobs:
              --no-default-features
              --features "${{ matrix.features }}"
 
+      - name: Test NVX host-only executor matrix
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --locked --release --target ${{ matrix.target }}
+             -p mxc-sdk --no-default-features --features microvm
+             --test nvx_e2e windows_x64::host_only_executor_request_matrix
+             -- --ignored --exact
+
+      - name: Test MicroVM validation infrastructure
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        working-directory: ${{ github.workspace }}
+        run: node --test scripts/tests/microvm-validation.test.js
+
+      - name: Stage SDK MicroVM tests for scheduled validation
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          & ./scripts/ci/stage-nvx-validation-tests.ps1 `
+            -BinaryDirectory 'src/target/${{ matrix.target }}/release' `
+            -Features '${{ matrix.features }}'
+
       - name: Build debug executor for isolated telemetry smoke tests
         run: cargo build --locked -p wxc --features test-support
 
@@ -118,6 +139,9 @@ jobs:
             src/target/${{ matrix.target }}/release/wslcsdk.dll
             src/target/${{ matrix.target }}/release/wxc-ui-probe.exe
             src/target/${{ matrix.target }}/release/wxc-test-driver.exe
-            src/target/${{ matrix.target }}/release/aci-edge-sandboxes/**
+            src/target/${{ matrix.target }}/release/nvx-e2e-tests.exe
+            src/target/${{ matrix.target }}/release/nvx-phase3-e2e-tests.exe
+            src/target/${{ matrix.target }}/release/nvx-validation/
+            src/target/${{ matrix.target }}/release/aci-edge-sandboxes/
           if-no-files-found: error
           retention-days: 1

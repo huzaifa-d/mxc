@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 
-use aci_edge_sandboxes::{AciEdgeSandbox, ExecOutcome, SandboxId};
+use super::runtime::{Execution, SandboxId};
 
 use crate::mxc_common::audit::{AuditEvent, AuditEventName};
 use crate::mxc_common::logger::Logger;
@@ -13,6 +13,11 @@ use crate::mxc_common::models::{ExecutionRequest, FailurePhase, ScriptResponse};
 use crate::mxc_common::mxc_error::{MxcError, MxcErrorCode};
 use crate::mxc_common::sandbox_process::{NativeStdio, SandboxProcess, StreamCloser};
 use crate::mxc_common::script_runner::ScriptRunner;
+
+#[cfg(test)]
+use super::abi::{Capabilities, ExecRequest};
+use super::abi::{ExecOutcome, ProvisionInput};
+use super::runtime::SandboxClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedOutcome {
@@ -44,19 +49,8 @@ impl NvxRunner {
         validate_one_shot_lifecycle(request)?;
         super::policy::validate_request(request)?;
         let state_root = new_state_root()?;
-        let prepared = (|| {
-            let client = super::runtime::create_client(state_root.path())?;
-            client.probe().map_err(super::runtime::map_nvx_error)?;
-            let capabilities = client.capabilities();
-            let (provision, spec) = super::policy::provision_request(request, None, &capabilities)?;
-            let exec = super::policy::exec_request(request, false, &capabilities)?;
-            let provisioned = client
-                .provision_with(&provision, &spec)
-                .map_err(super::runtime::map_nvx_error)?;
-            Ok((client, provisioned.sandbox_id, exec))
-        })();
-        let (client, sandbox_id, exec) = match prepared {
-            Ok(prepared) => prepared,
+        let mut client = match super::runtime::create_client(state_root.path()) {
+            Ok(client) => client,
             Err(error) => {
                 let cleanup = state_root
                     .close()
@@ -69,75 +63,7 @@ impl NvxRunner {
                 return finish_run(Err(error), cleanup, logger);
             }
         };
-        let identity = sandbox_id.to_string();
-        logger.log_audit_event(
-            &AuditEvent::new(AuditEventName::SandboxIdentity)
-                .str("identity", &identity)
-                .str("backend", "microvm")
-                .str("runtime", "signed-bundled-agent"),
-        );
-        let primary = (|| {
-            client
-                .start(&sandbox_id)
-                .map_err(super::runtime::map_nvx_error)?;
-            client
-                .exec(&sandbox_id, &exec)
-                .map_err(super::runtime::map_nvx_error)?
-                .wait_with_output()
-                .map_err(super::runtime::map_nvx_error)
-        })();
-
-        let stop_error = client
-            .stop(&sandbox_id)
-            .err()
-            .map(super::runtime::map_nvx_error);
-        let stop_error = match stop_error {
-            Some(error) if primary.is_err() && error.code == MxcErrorCode::AlreadyStopped => None,
-            other => other,
-        };
-        let deprovision_error = client
-            .deprovision(&sandbox_id)
-            .err()
-            .map(super::runtime::map_nvx_error);
-        let retain_state = deprovision_error.is_some();
-        let mut cleanup_errors: Vec<MxcError> = [stop_error, deprovision_error]
-            .into_iter()
-            .flatten()
-            .collect();
-        drop(client);
-        if retain_state {
-            let retained = state_root.keep();
-            cleanup_errors.push(MxcError::backend_error(format!(
-                "NVX state retained for recovery after deprovision failure: {}",
-                retained.display()
-            )));
-        } else if let Err(error) = state_root.close() {
-            cleanup_errors.push(MxcError::backend_error(format!(
-                "cannot remove NVX state directory: {error}"
-            )));
-        }
-        logger.log_audit_event(
-            &AuditEvent::new(AuditEventName::SandboxTornDown)
-                .str("identity", &identity)
-                .str("backend", "microvm")
-                .str(
-                    "status",
-                    if cleanup_errors.is_empty() {
-                        "ok"
-                    } else {
-                        "failed"
-                    },
-                )
-                .bool("state_retained", retain_state),
-        );
-        let output = finish_run(primary, cleanup_errors, logger)?;
-
-        Ok(CapturedRun {
-            outcome: map_outcome(output.outcome)?,
-            warnings: Vec::new(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        run_with_client(&mut client, state_root, request, logger)
     }
 
     pub fn spawn_streaming(
@@ -151,9 +77,7 @@ impl NvxRunner {
     }
 }
 
-fn adapt_streaming_execution(
-    execution: aci_edge_sandboxes::Execution,
-) -> Result<Box<dyn SandboxProcess>, MxcError> {
+fn adapt_streaming_execution(execution: Execution) -> Result<Box<dyn SandboxProcess>, MxcError> {
     let handle = super::process::into_exec_handle(
         execution,
         crate::mxc_common::state_aware_backend::ExecStdio::Piped,
@@ -163,27 +87,48 @@ fn adapt_streaming_execution(
     ))
 }
 
-fn spawn_streaming_with(
+fn spawn_streaming_with<C: SandboxClient + Send + 'static>(
     request: &ExecutionRequest,
-    create_client: impl FnOnce(&std::path::Path) -> Result<AciEdgeSandbox, MxcError>,
-    adapt: impl FnOnce(aci_edge_sandboxes::Execution) -> Result<Box<dyn SandboxProcess>, MxcError>,
+    create_client: impl FnOnce(&std::path::Path) -> Result<C, MxcError>,
+    adapt: impl FnOnce(Execution) -> Result<Box<dyn SandboxProcess>, MxcError>,
 ) -> Result<Box<dyn SandboxProcess>, MxcError> {
     validate_one_shot_lifecycle(request)?;
     super::policy::validate_request(request)?;
     let state_root = new_state_root()?;
-    let client = create_client(state_root.path())?;
-    client.probe().map_err(super::runtime::map_nvx_error)?;
-    let (provision, spec) =
-        super::policy::provision_request(request, None, &client.capabilities())?;
-    let exec = super::policy::exec_request(request, true, &client.capabilities())?;
-    client
-        .validate_exec(&exec)
-        .map_err(super::runtime::map_nvx_error)?;
-    let provisioned = match client.provision_with(&provision, &spec) {
+    let mut client = create_client(state_root.path())?;
+    let prepared: Result<_, MxcError> = (|| {
+        let capabilities = client.capabilities()?;
+        let (provision, spec) = super::policy::provision_request(request, None, &capabilities)?;
+        let exec = super::policy::exec_request(request, true, &capabilities)?;
+        let input = ProvisionInput {
+            request: provision,
+            spec,
+        };
+        client.validate_provision(&input)?;
+        client.validate_exec(&exec)?;
+        client.probe()?;
+        Ok((input, exec))
+    })();
+    let (input, exec) = match prepared {
+        Ok(prepared) => prepared,
+        Err(mut error) => {
+            if let Err(cleanup) = client.close() {
+                error
+                    .message
+                    .push_str(&format!("; cleanup failure: {cleanup}"));
+            }
+            return Err(error);
+        }
+    };
+    let sandbox_id = match client.provision(&input) {
         Ok(provisioned) => provisioned,
         Err(error) => {
-            let mut error = super::runtime::map_nvx_error(error);
-            drop(client);
+            let mut error = error;
+            if let Err(cleanup) = client.close() {
+                error
+                    .message
+                    .push_str(&format!("; cleanup failure: {cleanup}"));
+            }
             error.message.push_str(&format!(
                 "; provision failed without a sandbox ID; state retained for recovery at {}",
                 state_root.keep().display()
@@ -191,14 +136,9 @@ fn spawn_streaming_with(
             return Err(error);
         }
     };
-    let sandbox_id = provisioned.sandbox_id;
     let primary = (|| {
-        client
-            .start(&sandbox_id)
-            .map_err(super::runtime::map_nvx_error)?;
-        let execution = client
-            .exec(&sandbox_id, &exec)
-            .map_err(super::runtime::map_nvx_error)?;
+        client.start(&sandbox_id)?;
+        let execution = client.exec(&sandbox_id, &exec)?;
         adapt(execution)
     })();
     let inner = match primary {
@@ -260,24 +200,26 @@ struct NvxOneShotProcess {
 }
 
 fn cleanup_sandbox(
-    client: AciEdgeSandbox,
+    mut client: impl SandboxClient,
     sandbox_id: SandboxId,
     state_root: tempfile::TempDir,
 ) -> std::io::Result<()> {
-    let stop = client
-        .stop(&sandbox_id)
-        .map(|_| ())
-        .map_err(super::runtime::map_nvx_error);
+    let stop = client.stop(&sandbox_id).map(|_| ());
     let stop = match stop {
         Err(error) if error.code == MxcErrorCode::AlreadyStopped => Ok(()),
         other => other,
     };
-    let deprovision = client
-        .deprovision(&sandbox_id)
-        .map(|_| ())
-        .map_err(super::runtime::map_nvx_error);
-    drop(client);
-    finish_cleanup(stop, deprovision, state_root)
+    let deprovision = client.deprovision(&sandbox_id).map(|_| ());
+    let close = client.close();
+    let cleaned = finish_cleanup(stop, deprovision, state_root);
+    match (cleaned, close) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(std::io::Error::other(error.to_string())),
+        (Err(error), Err(close)) => Err(std::io::Error::other(format!(
+            "{error}; host close failed: {close}"
+        ))),
+    }
 }
 
 fn finish_cleanup(
@@ -576,6 +518,100 @@ fn new_state_root() -> Result<tempfile::TempDir, MxcError> {
         })
 }
 
+fn run_with_client(
+    client: &mut impl SandboxClient,
+    state_root: tempfile::TempDir,
+    request: &ExecutionRequest,
+    logger: &mut Logger,
+) -> Result<CapturedRun, MxcError> {
+    let prepared = (|| {
+        let capabilities = client.capabilities()?;
+        let (provision, spec) = super::policy::provision_request(request, None, &capabilities)?;
+        let exec = super::policy::exec_request(request, false, &capabilities)?;
+        let input = ProvisionInput {
+            request: provision,
+            spec,
+        };
+        client.validate_provision(&input)?;
+        client.validate_exec(&exec)?;
+        client.probe()?;
+        let sandbox_id = client.provision(&input)?;
+        Ok((sandbox_id, exec))
+    })();
+    let (sandbox_id, exec) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut cleanup = Vec::new();
+            if let Err(close_error) = client.close() {
+                cleanup.push(close_error);
+            }
+            if let Err(remove_error) = state_root.close() {
+                cleanup.push(MxcError::backend_error(format!(
+                    "cannot remove NVX state: {remove_error}"
+                )));
+            }
+            return finish_run(Err(error), cleanup, logger);
+        }
+    };
+
+    let identity = sandbox_id.to_string();
+    logger.log_audit_event(
+        &AuditEvent::new(AuditEventName::SandboxIdentity)
+            .str("identity", &identity)
+            .str("backend", "microvm")
+            .str("runtime", "signed-bundled-agent"),
+    );
+    let primary = (|| {
+        client.start(&sandbox_id)?;
+        client.exec_and_wait(&sandbox_id, &exec)
+    })();
+
+    let stop_error = match client.stop(&sandbox_id).err() {
+        Some(error) if primary.is_err() && error.code == MxcErrorCode::AlreadyStopped => None,
+        other => other,
+    };
+    let deprovision_error = client.deprovision(&sandbox_id).err();
+    let retain_state = deprovision_error.is_some();
+    let close_error = client.close().err();
+    let mut cleanup_errors: Vec<MxcError> = [stop_error, deprovision_error, close_error]
+        .into_iter()
+        .flatten()
+        .collect();
+    if retain_state {
+        let retained = state_root.keep();
+        cleanup_errors.push(MxcError::backend_error(format!(
+            "NVX state retained for recovery after deprovision failure: {}",
+            retained.display()
+        )));
+    } else if let Err(error) = state_root.close() {
+        cleanup_errors.push(MxcError::backend_error(format!(
+            "cannot remove NVX state directory: {error}"
+        )));
+    }
+    logger.log_audit_event(
+        &AuditEvent::new(AuditEventName::SandboxTornDown)
+            .str("identity", &identity)
+            .str("backend", "microvm")
+            .str(
+                "status",
+                if cleanup_errors.is_empty() {
+                    "ok"
+                } else {
+                    "failed"
+                },
+            )
+            .bool("state_retained", retain_state),
+    );
+    let output = finish_run(primary, cleanup_errors, logger)?;
+
+    Ok(CapturedRun {
+        outcome: map_outcome(output.outcome)?,
+        warnings: Vec::new(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
 fn finish_run<T>(
     primary: Result<T, MxcError>,
     cleanup_errors: Vec<MxcError>,
@@ -665,6 +701,9 @@ fn captured_to_script_response(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::Fixture;
+    use std::cell::RefCell;
+
+    use super::super::runtime::ExecOutput;
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -689,6 +728,28 @@ mod tests {
         }
     }
 
+    fn test_capabilities() -> Capabilities {
+        let mut capabilities = Capabilities::default();
+        capabilities.exec.command_line = true;
+        capabilities.exec.cwd = true;
+        capabilities.exec.env = true;
+        capabilities.spec.image_reference = true;
+        capabilities.filesystem.readonly_paths = true;
+        capabilities.filesystem.readwrite_paths = true;
+        capabilities.filesystem.denied_paths = true;
+        capabilities.network.egress_deny = true;
+        capabilities.network.ingress_deny = true;
+        capabilities.network.host_loopback_deny = true;
+        capabilities
+    }
+
+    fn test_request() -> ExecutionRequest {
+        ExecutionRequest {
+            microvm_image: Some("python:3.12-alpine".to_owned()),
+            ..Default::default()
+        }
+    }
+
     fn injected_launch(
         request: &ExecutionRequest,
         fixture: &Fixture,
@@ -704,15 +765,11 @@ mod tests {
             request,
             |root| {
                 *observed_root.lock().unwrap() = Some(root.to_owned());
-                factory_fixture
-                    .event("create_client")
-                    .map_err(super::super::runtime::map_nvx_error)?;
-                Ok(AciEdgeSandbox::new(factory_fixture))
+                factory_fixture.event("create_client")?;
+                Ok(factory_fixture)
             },
             move |mut execution| {
-                adapter_fixture
-                    .event("adapter")
-                    .map_err(super::super::runtime::map_nvx_error)?;
+                adapter_fixture.event("adapter")?;
                 if break_adapter {
                     // Exercise the real native adapter's rejected-stream cleanup path.
                     drop(execution.take_stdout());
@@ -788,9 +845,9 @@ mod tests {
                     MxcErrorCode::PolicyValidation
                 }
             );
-            let mut events = vec!["create_client", "probe"];
+            let mut events = vec!["create_client"];
             if refusal == "validate_exec" {
-                events.push("validate_exec");
+                events.extend(["validate_provision", "validate_exec"]);
             }
             assert_eq!(*fixture.events.lock().unwrap(), events, "{refusal}");
             assert!(
@@ -806,7 +863,7 @@ mod tests {
         request.microvm_memory_mib = Some(0);
         let error = spawn_streaming_with(
             &request,
-            |_| panic!("zero memory must not create a client"),
+            |_| -> Result<Fixture, MxcError> { panic!("zero memory must not create a client") },
             |_| panic!("zero memory must not execute or adapt"),
         )
         .err()
@@ -852,9 +909,9 @@ mod tests {
                     );
                     let mut expected = vec![
                         "create_client",
-                        "probe",
-                        "validate_exec",
                         "validate_provision",
+                        "validate_exec",
+                        "probe",
                         "provision",
                         "start",
                     ];
@@ -895,9 +952,9 @@ mod tests {
             *fixture.events.lock().unwrap(),
             [
                 "create_client",
-                "probe",
-                "validate_exec",
                 "validate_provision",
+                "validate_exec",
+                "probe",
                 "provision"
             ]
         );
@@ -919,7 +976,7 @@ mod tests {
         assert!(!root.exists());
         assert_eq!(
             *fixture.image.lock().unwrap(),
-            Some(aci_edge_sandboxes::ImageSource::Reference(
+            Some(super::super::abi::ImageSource::Reference(
                 "python:3.12-alpine".to_owned()
             ))
         );
@@ -928,9 +985,9 @@ mod tests {
             *fixture.events.lock().unwrap(),
             [
                 "create_client",
-                "probe",
-                "validate_exec",
                 "validate_provision",
+                "validate_exec",
+                "probe",
                 "provision",
                 "start",
                 "validate_exec",
@@ -952,9 +1009,9 @@ mod tests {
                         let fixture = Fixture {
                             fail: (terminal == "wait_error").then_some("wait"),
                             outcome: Some(if terminal == "timeout" {
-                                aci_edge_sandboxes::ExecOutcome::TimedOut
+                                ExecOutcome::TimedOut
                             } else {
-                                aci_edge_sandboxes::ExecOutcome::Exited(7)
+                                ExecOutcome::Exited(7)
                             }),
                             stop_fails,
                             deprovision_fails,
@@ -1068,9 +1125,9 @@ mod tests {
                     let fixture = Fixture {
                         fail: (terminal == "wait_error").then_some("wait"),
                         outcome: Some(if terminal == "timeout" {
-                            aci_edge_sandboxes::ExecOutcome::TimedOut
+                            ExecOutcome::TimedOut
                         } else {
-                            aci_edge_sandboxes::ExecOutcome::Exited(7)
+                            ExecOutcome::Exited(7)
                         }),
                         stop_fails: cleanup_fails,
                         deprovision_fails: cleanup_fails,
@@ -1667,8 +1724,7 @@ mod tests {
 
     #[test]
     fn process_mapping_preserves_command_timeout_cwd_and_environment_presence() {
-        use std::time::Duration;
-        let mut capabilities = aci_edge_sandboxes::Capabilities::new("agent");
+        let mut capabilities = Capabilities::default();
         capabilities.exec.command_line = true;
         capabilities.exec.cwd = true;
         capabilities.exec.env = true;
@@ -1682,11 +1738,8 @@ mod tests {
             ..Default::default()
         };
         let mapped = super::super::policy::exec_request(&request, false, &capabilities).unwrap();
-        assert_eq!(
-            mapped.process.command,
-            aci_edge_sandboxes::Command::CommandLine(request.script_code)
-        );
-        assert_eq!(mapped.process.timeout, Some(Duration::from_millis(250)));
+        assert_eq!(mapped.process.command_line, request.script_code);
+        assert_eq!(mapped.process.timeout, Some(250));
         assert_eq!(mapped.process.cwd.as_deref(), Some("/tmp"));
         assert_eq!(mapped.process.env, Some(Vec::new()));
         assert_eq!(mapped.process.inherit_default_env, Some(true));
@@ -1702,5 +1755,433 @@ mod tests {
         assert_eq!(defaults.process.env, None);
         assert_eq!(defaults.process.timeout, None);
         assert_eq!(defaults.process.cwd, None);
+    }
+
+    struct MockClient {
+        calls: RefCell<Vec<&'static str>>,
+        validated_request: RefCell<Option<ExecRequest>>,
+        executed_request: RefCell<Option<ExecRequest>>,
+        validated_provision: RefCell<Option<ProvisionInput>>,
+        provisioned_input: RefCell<Option<ProvisionInput>>,
+        capabilities_res: Result<Capabilities, MxcError>,
+        validate_provision_res: Result<(), MxcError>,
+        validate_res: Result<(), MxcError>,
+        probe_res: Result<(), MxcError>,
+        provision_res: Result<SandboxId, MxcError>,
+        start_res: Result<(), MxcError>,
+        exec_res: Result<ExecOutput, MxcError>,
+        stop_res: Result<(), MxcError>,
+        deprovision_res: Result<(), MxcError>,
+        close_res: Result<(), MxcError>,
+    }
+
+    impl MockClient {
+        fn ok() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                validated_request: RefCell::new(None),
+                executed_request: RefCell::new(None),
+                validated_provision: RefCell::new(None),
+                provisioned_input: RefCell::new(None),
+                capabilities_res: Ok(test_capabilities()),
+                validate_provision_res: Ok(()),
+                validate_res: Ok(()),
+                probe_res: Ok(()),
+                provision_res: SandboxId::from_token("0123456789abcdef0123456789abcdef"),
+                start_res: Ok(()),
+                exec_res: Ok(ExecOutput {
+                    outcome: ExecOutcome::Exited(0),
+                    stdout: b"ok".to_vec(),
+                    stderr: Vec::new(),
+                }),
+                stop_res: Ok(()),
+                deprovision_res: Ok(()),
+                close_res: Ok(()),
+            }
+        }
+    }
+
+    impl SandboxClient for MockClient {
+        fn capabilities(&self) -> Result<Capabilities, MxcError> {
+            self.calls.borrow_mut().push("capabilities");
+            self.capabilities_res.clone()
+        }
+
+        fn validate_provision(&self, input: &ProvisionInput) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("validate_provision");
+            *self.validated_provision.borrow_mut() = Some(input.clone());
+            self.validate_provision_res.clone()
+        }
+
+        fn validate_exec(&self, request: &ExecRequest) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("validate");
+            *self.validated_request.borrow_mut() = Some(request.clone());
+            self.validate_res.clone()
+        }
+
+        fn probe(&self) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("probe");
+            self.probe_res.clone()
+        }
+
+        fn provision(&self, input: &ProvisionInput) -> Result<SandboxId, MxcError> {
+            self.calls.borrow_mut().push("provision");
+            *self.provisioned_input.borrow_mut() = Some(input.clone());
+            self.provision_res.clone()
+        }
+
+        fn start(&self, _sandbox_id: &SandboxId) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("start");
+            self.start_res.clone()
+        }
+
+        fn exec_and_wait(
+            &self,
+            _sandbox_id: &SandboxId,
+            request: &ExecRequest,
+        ) -> Result<ExecOutput, MxcError> {
+            self.calls.borrow_mut().push("exec");
+            *self.executed_request.borrow_mut() = Some(request.clone());
+            self.exec_res.clone()
+        }
+
+        fn stop(&self, _sandbox_id: &SandboxId) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("stop");
+            self.stop_res.clone()
+        }
+
+        fn deprovision(&self, _sandbox_id: &SandboxId) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("deprovision");
+            self.deprovision_res.clone()
+        }
+
+        fn close(&mut self) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("close");
+            self.close_res.clone()
+        }
+    }
+
+    #[test]
+    fn lifecycle_cleanup_surfaces_host_close_and_retains_state_on_deprovision_failure() {
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        let request = ExecutionRequest {
+            script_code: "echo ok".to_owned(),
+            ..test_request()
+        };
+
+        // 1. Probe failure still closes host and surfaces close failure.
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().to_path_buf();
+        let mut client = MockClient::ok();
+        client.probe_res = Err(MxcError::backend_unavailable("probe failed"));
+        client.close_res = Err(MxcError::backend_error("host_close failed"));
+        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        assert_eq!(err.code, MxcErrorCode::BackendUnavailable);
+        assert!(err.message.contains("probe failed"));
+        assert!(err.message.contains("host_close failed"));
+        assert_eq!(
+            *client.calls.borrow(),
+            [
+                "capabilities",
+                "validate_provision",
+                "validate",
+                "probe",
+                "close"
+            ]
+        );
+        assert!(!state_path.exists());
+
+        // 2. Start failure suppresses AlreadyStopped on stop, deprovisions, closes host, removes state.
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().to_path_buf();
+        let mut client = MockClient::ok();
+        client.start_res = Err(MxcError::backend_error("start failed"));
+        client.stop_res = Err(MxcError::new(
+            MxcErrorCode::AlreadyStopped,
+            "already stopped",
+        ));
+        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        assert_eq!(err.message, "start failed");
+        assert_eq!(
+            *client.calls.borrow(),
+            [
+                "capabilities",
+                "validate_provision",
+                "validate",
+                "probe",
+                "provision",
+                "start",
+                "stop",
+                "deprovision",
+                "close"
+            ]
+        );
+        assert!(!state_path.exists());
+
+        // 3. Host close failure after workload success fails the run.
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().to_path_buf();
+        let mut client = MockClient::ok();
+        client.close_res = Err(MxcError::backend_error("host_close failed"));
+        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        assert!(err
+            .message
+            .contains("NVX cleanup failed after workload completion"));
+        assert!(err.message.contains("host_close failed"));
+        assert!(!state_path.exists());
+
+        // 4. Deprovision failure retains state directory and fails the run.
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().to_path_buf();
+        let mut client = MockClient::ok();
+        client.deprovision_res = Err(MxcError::backend_error("deprovision failed"));
+        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        assert!(err.message.contains("deprovision failed"));
+        assert!(err
+            .message
+            .contains("NVX state retained for recovery after deprovision failure"));
+        assert!(state_path.exists());
+        std::fs::remove_dir_all(&state_path).unwrap();
+    }
+
+    #[test]
+    fn native_validation_failure_closes_host_without_probing_or_provisioning() {
+        for cleanup_fails in [false, true] {
+            let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+            let state_root = tempfile::tempdir().unwrap();
+            let state_path = state_root.path().to_path_buf();
+            let mut client = MockClient::ok();
+            client.validate_res = Err(MxcError::policy_validation("native validation rejected"));
+            if cleanup_fails {
+                client.close_res = Err(MxcError::backend_error("close failed"));
+            }
+            let error =
+                run_with_client(&mut client, state_root, &test_request(), &mut logger).unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::PolicyValidation);
+            if cleanup_fails {
+                assert!(error
+                    .message
+                    .starts_with("native validation rejected; cleanup failure: "));
+                assert!(error.message.contains("close failed"));
+            } else {
+                assert_eq!(error.message, "native validation rejected");
+            }
+            assert_eq!(
+                *client.calls.borrow(),
+                ["capabilities", "validate_provision", "validate", "close"]
+            );
+            assert!(!state_path.exists());
+        }
+    }
+
+    #[test]
+    fn validates_and_executes_the_same_mapped_request_in_order() {
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        for environment in [None, Some(Vec::new()), Some(vec!["KEY=value".to_owned()])] {
+            let request = ExecutionRequest {
+                script_code: "printf '%s' \"$KEY\"".to_owned(),
+                script_timeout: 250,
+                working_directory: "/tmp".to_owned(),
+                env: environment,
+                inherit_default_env: true,
+                ..test_request()
+            };
+            let state_root = tempfile::tempdir().unwrap();
+            let state_path = state_root.path().to_path_buf();
+            let mut client = MockClient::ok();
+            let result = run_with_client(&mut client, state_root, &request, &mut logger).unwrap();
+            assert_eq!(result.outcome, CapturedOutcome::Exited(0));
+            assert_eq!(
+                *client.validated_request.borrow(),
+                Some(
+                    super::super::policy::exec_request(&request, false, &test_capabilities())
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                *client.executed_request.borrow(),
+                *client.validated_request.borrow()
+            );
+            assert_eq!(
+                *client.calls.borrow(),
+                [
+                    "capabilities",
+                    "validate_provision",
+                    "validate",
+                    "probe",
+                    "provision",
+                    "start",
+                    "exec",
+                    "stop",
+                    "deprovision",
+                    "close"
+                ]
+            );
+            assert!(!state_path.exists());
+        }
+    }
+
+    #[test]
+    fn capture_failure_runs_full_teardown_and_preserves_primary_and_cleanup_errors() {
+        let primary = "NVX signed bundled agent: combined stdout/stderr capture limit of 67108864 bytes exceeded";
+        for cleanup_fails in [false, true] {
+            let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+            let state_root = tempfile::tempdir().unwrap();
+            let state_path = state_root.path().to_path_buf();
+            let mut client = MockClient::ok();
+            client.exec_res = Err(MxcError::backend_error(primary));
+            if cleanup_fails {
+                client.stop_res = Err(MxcError::backend_error("stop failed"));
+                client.close_res = Err(MxcError::backend_error("close failed"));
+            }
+            let error =
+                run_with_client(&mut client, state_root, &test_request(), &mut logger).unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::BackendError);
+            if cleanup_fails {
+                assert!(error.message.starts_with(primary));
+                assert!(error.message.contains("; cleanup failure: "));
+                assert!(error.message.contains("stop failed"));
+                assert!(error.message.contains("close failed"));
+            } else {
+                assert_eq!(error.message, primary);
+            }
+            assert_eq!(
+                *client.calls.borrow(),
+                [
+                    "capabilities",
+                    "validate_provision",
+                    "validate",
+                    "probe",
+                    "provision",
+                    "start",
+                    "exec",
+                    "stop",
+                    "deprovision",
+                    "close"
+                ]
+            );
+            assert!(!state_path.exists());
+        }
+    }
+
+    #[test]
+    fn selected_image_and_policy_are_validated_and_provisioned_unchanged() {
+        let request = crate::policy::prepare_creation_request(
+            &crate::v1::ContainerRequest {
+                containment: crate::v1::Containment::MicroVm {
+                    image: "python:3.12-alpine".to_owned(),
+                    memory_mib: None,
+                },
+                filesystem: Some(crate::v1::FilesystemPolicy {
+                    readonly_paths: vec![r"C:\ro".to_owned()],
+                    readwrite_paths: vec![r"C:\rw".to_owned()],
+                    denied_paths: vec![r"C:\rw\secret".to_owned()],
+                    ..Default::default()
+                }),
+                network: Some(crate::v1::NetworkPolicy::default()),
+                ..crate::v1::ContainerRequest::new("printf ok")
+            },
+            None,
+        )
+        .unwrap()
+        .inner;
+        let mut client = MockClient::ok();
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        run_with_client(
+            &mut client,
+            tempfile::tempdir().unwrap(),
+            &request,
+            &mut logger,
+        )
+        .unwrap();
+        let input = client.provisioned_input.borrow();
+        assert_eq!(*input, *client.validated_provision.borrow());
+        assert_eq!(
+            serde_json::to_value(input.as_ref().unwrap()).unwrap(),
+            serde_json::json!({
+                "request": {
+                    "filesystem": {
+                        "readonlyPaths": [r"C:\ro"],
+                        "readwritePaths": [r"C:\rw"],
+                        "deniedPaths": [r"C:\rw\secret"]
+                    },
+                    "network": {
+                        "egress": {"default": "deny"},
+                        "ingress": {"default": "deny", "hostLoopback": "deny"}
+                    }
+                },
+                "spec": {"image": {"reference": "python:3.12-alpine"}}
+            })
+        );
+    }
+
+    #[test]
+    fn capability_and_provision_validation_failures_close_without_side_effects() {
+        for failure in [
+            "query",
+            "unsupported-image",
+            "unsupported-filesystem",
+            "validation",
+        ] {
+            let mut client = MockClient::ok();
+            let mut request = test_request();
+            let (expected_calls, expected_code, expected_message) = match failure {
+                "query" => {
+                    client.capabilities_res =
+                        Err(MxcError::backend_error("capability query failed"));
+                    (
+                        vec!["capabilities", "close"],
+                        MxcErrorCode::BackendError,
+                        "capability query failed",
+                    )
+                }
+                "unsupported-image" => {
+                    client
+                        .capabilities_res
+                        .as_mut()
+                        .unwrap()
+                        .spec
+                        .image_reference = false;
+                    (
+                        vec!["capabilities", "close"],
+                        MxcErrorCode::PolicyValidation,
+                        "the configured NVX runtime does not support microvm.image",
+                    )
+                }
+                "unsupported-filesystem" => {
+                    request.policy.denied_paths.push(r"C:\secret".to_owned());
+                    client
+                        .capabilities_res
+                        .as_mut()
+                        .unwrap()
+                        .filesystem
+                        .denied_paths = false;
+                    (
+                        vec!["capabilities", "close"],
+                        MxcErrorCode::PolicyValidation,
+                        "the configured NVX runtime does not support filesystem.deniedPaths",
+                    )
+                }
+                _ => {
+                    client.validate_provision_res =
+                        Err(MxcError::policy_validation("provision rejected"));
+                    (
+                        vec!["capabilities", "validate_provision", "close"],
+                        MxcErrorCode::PolicyValidation,
+                        "provision rejected",
+                    )
+                }
+            };
+            let state_root = tempfile::tempdir().unwrap();
+            let path = state_root.path().to_owned();
+            let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+            let error =
+                run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.message, expected_message);
+            assert_eq!(*client.calls.borrow(), expected_calls);
+            assert!(client.provisioned_input.borrow().is_none());
+            assert!(!path.exists());
+        }
     }
 }

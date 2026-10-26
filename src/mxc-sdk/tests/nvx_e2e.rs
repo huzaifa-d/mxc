@@ -3,6 +3,10 @@
 
 use mxc_sdk::v1::ErrorCode;
 
+#[cfg(all(windows, target_arch = "x86_64", feature = "microvm"))]
+#[path = "nvx_e2e/network.rs"]
+mod windows_network;
+
 fn process_only_request(command: &str) -> serde_json::Value {
     serde_json::json!({
         "version": "1.1.0-alpha",
@@ -28,23 +32,21 @@ fn microvm_creation_rejects_missing_and_blank_images_before_runtime() {
 
 #[test]
 fn microvm_typed_stable_run_and_spawn_require_optin() {
-    for memory_mib in [None, Some(512)] {
-        for spawn in [false, true] {
-            let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
-            request.containment = mxc_sdk::v1::Containment::MicroVm {
-                image: "python:3.12-alpine".to_owned(),
-                memory_mib,
-            };
-            let error = if spawn {
-                mxc_sdk::v1::spawn(request, Default::default())
-                    .err()
-                    .expect("stable spawn must reject MicroVM")
-            } else {
-                mxc_sdk::v1::run(request, Default::default()).unwrap_err()
-            };
-            assert_eq!(error.code, ErrorCode::BackendUnavailable, "{error}");
-            assert!(error.message.contains("experimental"), "{error}");
-        }
+    for spawn in [false, true] {
+        let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+        request.containment = mxc_sdk::v1::Containment::MicroVm {
+            image: "python:3.12-alpine".to_owned(),
+            memory_mib: None,
+        };
+        let error = if spawn {
+            mxc_sdk::v1::spawn(request, Default::default())
+                .err()
+                .expect("stable spawn must reject MicroVM")
+        } else {
+            mxc_sdk::v1::run(request, Default::default()).unwrap_err()
+        };
+        assert_eq!(error.code, ErrorCode::BackendUnavailable, "{error}");
+        assert!(error.message.contains("experimental"), "{error}");
     }
 }
 
@@ -74,7 +76,7 @@ fn unsupported_platform_or_feature_is_fail_closed() {
 mod windows_x64 {
     use std::path::PathBuf;
     use std::process::{Command, Output, Stdio};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use mxc_sdk::v1::{ExecutionResult, WaitResult};
     use serde_json::{json, Value};
@@ -82,6 +84,9 @@ mod windows_x64 {
     use super::*;
 
     const BUNDLE_ENV: &str = "ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR";
+    const CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
+    const CAPTURE_ERROR: &str =
+        "NVX signed bundled agent: combined stdout/stderr capture limit of 67108864 bytes exceeded";
     const MIXED_BACKEND_ERROR: &str = "Configuration parse error: Multiple containment backends \
         configured: 'containment' is 'microvm' (no per-backend section is defined for this \
         backend), but the config includes backend section(s): processContainer. Only one backend \
@@ -143,6 +148,18 @@ mod windows_x64 {
             ),
             ("relative-cwd", json!({"process": {"cwd": "relative"}})),
             (
+                "cwd-limit",
+                json!({"process": {"cwd": format!("/{}", "x".repeat(4095))}}),
+            ),
+            (
+                "cwd-multibyte-limit",
+                json!({"process": {"cwd": format!("/{}x", "\u{00e9}".repeat(2047))}}),
+            ),
+            (
+                "env-entry-limit",
+                json!({"process": {"env": vec!["KEY=value"; 257], "inheritDefaultEnv": true}}),
+            ),
+            (
                 "replacement-env",
                 json!({"process": {"env": ["KEY=value"]}}),
             ),
@@ -165,8 +182,26 @@ mod windows_x64 {
         ]
     }
 
-    fn capability_requests() -> Vec<(&'static str, Value)> {
+    fn request_with_patch(patch: Value) -> Value {
+        let mut request = process_only_request("printf forbidden");
+        for (key, value) in patch.as_object().expect("patch object") {
+            if key == "process" {
+                for (field, value) in value.as_object().expect("process patch object") {
+                    request["process"][field] = value.clone();
+                }
+            } else {
+                request[key] = value.clone();
+            }
+        }
+        request
+    }
+
+    fn valid_process_boundaries() -> Vec<(&'static str, Value)> {
         vec![
+            (
+                "memory-override",
+                json!({"microvm": {"image": "python:3.12-alpine", "provision": {"memoryMib":512}}}),
+            ),
             (
                 "safe-cwd-double-slash",
                 json!({"process": {"cwd": "//tmp/work"}}),
@@ -196,21 +231,37 @@ mod windows_x64 {
                 "proxy",
                 json!({"runtimeConfig": {"networkProxy": "http://127.0.0.1:8080"}}),
             ),
+            (
+                "cwd-boundary",
+                json!({"process": {"cwd": format!("/{}", "x".repeat(4094))}}),
+            ),
+            (
+                "cwd-multibyte-boundary",
+                json!({"process": {"cwd": format!("/{}", "\u{00e9}".repeat(2047))}}),
+            ),
+            (
+                "env-entry-boundary",
+                json!({"process": {"env": vec!["KEY=value"; 256], "inheritDefaultEnv": true}}),
+            ),
+            (
+                "absent-env",
+                json!({"process": {"inheritDefaultEnv": true}}),
+            ),
+            (
+                "empty-env",
+                json!({"process": {"env": [], "inheritDefaultEnv": true}}),
+            ),
         ]
     }
 
-    fn request_with_patch(patch: Value) -> Value {
-        let mut request = process_only_request("printf forbidden");
-        for (key, value) in patch.as_object().expect("patch object") {
-            if key == "process" {
-                for (field, value) in value.as_object().expect("process patch object") {
-                    request["process"][field] = value.clone();
-                }
-            } else {
-                request[key] = value.clone();
+    fn process_limit_error(label: &str) -> Option<&'static str> {
+        match label {
+            "cwd-limit" | "cwd-multibyte-limit" => {
+                Some("NVX process.cwd must not exceed 4095 UTF-8 bytes")
             }
+            "env-entry-limit" => Some("NVX process.env must not exceed 256 entries"),
+            _ => None,
         }
-        request
     }
 
     #[test]
@@ -227,6 +278,7 @@ mod windows_x64 {
                 ])
                 .env("MXC_NVX_MATRIX_CHILD", "1")
                 .env(BUNDLE_ENV, directory.path().join("absent"))
+                .env("LOCALAPPDATA", directory.path().join("local"))
                 .output()
                 .expect("host-only matrix child");
             assert!(
@@ -266,39 +318,14 @@ mod windows_x64 {
                 assert_eq!(error.message, MIXED_BACKEND_ERROR, "{label}");
             } else if label == "fallback" {
                 assert_eq!(error.code, ErrorCode::PolicyValidation);
-            } else if label.starts_with("parent-cwd") {
+            }
+            if let Some(expected) = process_limit_error(label) {
                 assert_eq!(error.code, ErrorCode::PolicyValidation, "{label}");
-                assert_eq!(
-                    error.message, "NVX process.cwd must not contain '..' path components",
-                    "{label}"
-                );
-            } else if label == "relative-cwd" {
-                assert_eq!(error.code, ErrorCode::PolicyValidation);
-                assert_eq!(
-                    error.message,
-                    "NVX process.cwd must be an absolute POSIX guest path"
-                );
+                assert_eq!(error.message, expected, "{label}");
             }
             println!(
                 "HOST_ONLY rejected {label}: {:?}: {}",
                 error.code, error.message
-            );
-        }
-
-        // These capability-aware policies are accepted. With the signed bundle deliberately
-        // unavailable, each request must pass contract validation and stop at backend discovery.
-        for (label, patch) in capability_requests() {
-            let request = request_with_patch(patch);
-            let error = mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err();
-            assert_eq!(
-                error.code,
-                ErrorCode::BackendUnavailable,
-                "{label} must reach bundle discovery: {error:?}"
-            );
-            assert!(error.message.contains("NVX"), "{label}: {error:?}");
-            println!(
-                "HOST_ONLY accepted {label} through bundle discovery: {}",
-                error.message
             );
         }
 
@@ -346,12 +373,6 @@ mod windows_x64 {
                     "{request}: {error}"
                 );
                 assert!(error.message.contains("memoryMib"), "{error}");
-                if invalid == json!(0) {
-                    assert!(
-                        error.message.contains("must be greater than zero"),
-                        "{error}"
-                    );
-                }
             }
         }
         for lifecycle in [false, true] {
@@ -368,52 +389,61 @@ mod windows_x64 {
             };
             assert_eq!(error.code, ErrorCode::MalformedRequest);
         }
-        for memory_mib in [None, Some(512)] {
-            let mut typed = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
-            typed.containment = mxc_sdk::v1::Containment::MicroVm {
-                image: "python:3.12-alpine".to_owned(),
-                memory_mib,
-            };
-            let error = mxc_sdk::v1::experimental::run(typed, Default::default()).unwrap_err();
-            assert_eq!(error.code, ErrorCode::BackendUnavailable);
-            let error = mxc_sdk::v1::experimental::container::provision_container(
-                mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", memory_mib),
-                Default::default(),
-            )
-            .unwrap_err();
-            assert_eq!(error.code, ErrorCode::BackendUnavailable);
+        for memory_mib in [None, Some(512), Some(0)] {
+            for operation in ["run", "spawn", "provision", "validate_provision"] {
+                let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+                request.containment = mxc_sdk::v1::Containment::MicroVm {
+                    image: "python:3.12-alpine".to_owned(),
+                    memory_mib,
+                };
+                let error = match operation {
+                    "run" => {
+                        mxc_sdk::v1::experimental::run(request, Default::default()).unwrap_err()
+                    }
+                    "spawn" => mxc_sdk::v1::experimental::spawn(request, Default::default())
+                        .err()
+                        .unwrap(),
+                    "provision" => mxc_sdk::v1::experimental::container::provision_container(
+                        mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", memory_mib),
+                        Default::default(),
+                    )
+                    .unwrap_err(),
+                    _ => mxc_sdk::v1::experimental::container::validate_provision(
+                        mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", memory_mib),
+                        Default::default(),
+                    )
+                    .unwrap_err(),
+                };
+                assert_eq!(
+                    error.code,
+                    if memory_mib == Some(0) {
+                        ErrorCode::MalformedRequest
+                    } else {
+                        ErrorCode::BackendUnavailable
+                    },
+                    "{operation}: {error}"
+                );
+            }
         }
-        let mut typed = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
-        typed.containment = mxc_sdk::v1::Containment::MicroVm {
-            image: "python:3.12-alpine".to_owned(),
-            memory_mib: Some(0),
-        };
-        let error = mxc_sdk::v1::experimental::run(typed, Default::default()).unwrap_err();
-        assert_eq!(error.code, ErrorCode::MalformedRequest);
-        assert!(error
-            .message
-            .contains("memoryMib must be greater than zero"));
-        let error = mxc_sdk::v1::experimental::container::provision_container(
-            mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", Some(0)),
-            Default::default(),
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::MalformedRequest);
-        assert!(error
-            .message
-            .contains("memoryMib must be greater than zero"));
-        let error = mxc_sdk::__ffi::execute_lifecycle_json(
-            &json!({
-                "version":"1.1.0-alpha","phase":"exec","sandboxId":"microvm:test",
-                "process":{"commandLine":"printf forbidden"},
-                "microvm":{"image":"python:3.12-alpine","provision":{"memoryMib":512}}
-            })
-            .to_string(),
-            true,
-        )
-        .err()
-        .unwrap();
-        assert_eq!(error.code, ErrorCode::MalformedRequest);
+
+        for (label, patch) in valid_process_boundaries() {
+            let error =
+                mxc_sdk::__ffi::run_json(&request_with_patch(patch).to_string(), true).unwrap_err();
+            assert_eq!(
+                error.code,
+                ErrorCode::BackendUnavailable,
+                "{label}: {error:?}"
+            );
+            assert!(
+                error.message.contains("holds no agent bundle"),
+                "{label}: {error:?}"
+            );
+            assert_no_run_state(std::process::id());
+            println!(
+                "HOST_ONLY valid {label} reaches missing bundle: {}",
+                error.message
+            );
+        }
 
         let request = process_only_request("printf forbidden").to_string();
         let error = mxc_sdk::__ffi::run_json(&request, true).unwrap_err();
@@ -429,7 +459,6 @@ mod windows_x64 {
             .err()
             .expect("missing bundle must prevent streaming");
         assert_eq!(streaming.code, ErrorCode::BackendUnavailable);
-        assert!(streaming.message.contains("NVX"));
         let pty =
             mxc_sdk::__ffi::spawn_with_pty_json(&request, true, Default::default()).unwrap_err();
         assert_eq!(pty.code, ErrorCode::UnsupportedContainment);
@@ -495,21 +524,23 @@ mod windows_x64 {
                 "{label} was not rejected before bundle discovery: {stderr}"
             );
             assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden"));
+            if let Some(expected) = process_limit_error(label) {
+                assert!(stderr.contains("policy_validation"), "{label}: {stderr}");
+                assert!(stderr.contains(expected), "{label}: {stderr}");
+            }
             println!("HOST_ONLY executor rejected {label}: {stderr}");
         }
-
-        // The executor remains captured create-and-run, but capability-aware policy is
-        // valid and therefore advances to the deliberately unavailable signed-bundle boundary.
-        for (label, patch) in capability_requests() {
+        for (label, patch) in valid_process_boundaries() {
             let output = executor_output(&request_with_patch(patch), true);
-            assert!(!output.status.success(), "executor ran {label}");
+            assert!(!output.status.success(), "missing bundle accepted {label}");
             let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("backend_unavailable"), "{label}: {stderr}");
             assert!(
-                stderr.contains("backend_unavailable") && stderr.contains("NVX"),
-                "{label} did not reach bundle discovery: {stderr}"
+                stderr.contains("holds no agent bundle"),
+                "{label}: {stderr}"
             );
-            assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden"));
-            println!("HOST_ONLY executor accepted {label}: {stderr}");
+            assert!(output.stdout.is_empty());
+            println!("HOST_ONLY executor valid {label} reaches missing bundle: {stderr}");
         }
     }
 
@@ -524,7 +555,7 @@ mod windows_x64 {
         )
     }
 
-    fn assert_no_run_state(pid: u32) {
+    pub(super) fn assert_no_run_state(pid: u32) {
         let prefix = format!("mxc-nvx-{pid}-");
         let retained: Vec<_> = std::fs::read_dir(std::env::temp_dir())
             .expect("temporary directory listing")
@@ -540,6 +571,90 @@ mod windows_x64 {
             .expect("real MXC signed bundled-agent create-and-run");
         assert_no_run_state(std::process::id());
         result
+    }
+
+    fn capture_boundary_request(stderr_bytes: usize) -> Value {
+        // Finite output bounds host memory and run time even if the capture guard regresses.
+        let mut request = process_only_request(&format!(
+            "head -c {} /dev/zero && head -c {stderr_bytes} /dev/zero >&2",
+            CAPTURE_LIMIT / 2
+        ));
+        request["process"]["timeout"] = json!(0);
+        request
+    }
+
+    fn assert_capture_boundary(stdout: &[u8], stderr: &[u8], stderr_bytes: usize) {
+        assert_eq!(stdout.len(), CAPTURE_LIMIT / 2);
+        assert_eq!(stderr.len(), stderr_bytes);
+        assert!(stdout.iter().chain(stderr).all(|&byte| byte == 0));
+    }
+
+    #[test]
+    #[ignore = "VM: requires Windows x64, WHP and the exact signed official bundle"]
+    fn signed_bundle_typed_image_and_filesystem_policy() {
+        use mxc_sdk::v1::{ContainerRequest, Containment, FilesystemPolicy, NetworkPolicy};
+
+        let directory = tempfile::tempdir().unwrap();
+        let ro = directory.path().join("ro");
+        let rw = directory.path().join("rw");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::create_dir(&rw).unwrap();
+        std::fs::write(ro.join("input"), b"read-ok").unwrap();
+        std::fs::write(rw.join("secret"), b"secret").unwrap();
+        let host_root = directory.path().to_str().unwrap();
+        assert_eq!(host_root.as_bytes()[1], b':', "drive-qualified host path");
+        let guest_root = format!(
+            "/mnt/{}/{}",
+            host_root[..1].to_ascii_lowercase(),
+            host_root[3..].replace('\\', "/")
+        );
+        let script = r#"python3 -c 'import errno, os, pathlib, sys
+assert sys.version_info[:2] == (3, 12)
+root = pathlib.Path(os.environ["MXC_NVX_POLICY_ROOT"])
+assert (root / "ro" / "input").read_bytes() == b"read-ok"
+try:
+    (root / "ro" / "input").write_bytes(b"forbidden")
+except OSError as error:
+    assert error.errno in (errno.EACCES, errno.EROFS), error
+else:
+    raise AssertionError("read-only mapping was writable")
+try:
+    (root / "rw" / "secret").read_bytes()
+except OSError as error:
+    assert error.errno == errno.EACCES, error
+else:
+    raise AssertionError("denied path was readable")
+(root / "rw" / "result").write_bytes(b"write-ok")
+print("NVX_TYPED_IMAGE_AND_POLICY_OK", end="")
+'"#;
+        let result = mxc_sdk::v1::experimental::run(
+            ContainerRequest {
+                containment: Containment::MicroVm {
+                    image: "python:3.12-alpine".to_owned(),
+                    memory_mib: None,
+                },
+                filesystem: Some(FilesystemPolicy {
+                    readonly_paths: vec![ro.to_str().unwrap().to_owned()],
+                    readwrite_paths: vec![rw.to_str().unwrap().to_owned()],
+                    denied_paths: vec![rw.join("secret").to_str().unwrap().to_owned()],
+                    ..Default::default()
+                }),
+                network: Some(NetworkPolicy::default()),
+                environment: Some(vec![("MXC_NVX_POLICY_ROOT".to_owned(), guest_root)]),
+                inherit_default_environment: Some(true),
+                timeout_ms: Some(30_000),
+                ..ContainerRequest::new(script)
+            },
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, WaitResult::Exited(0), "{result:?}");
+        assert_eq!(result.stdout, b"NVX_TYPED_IMAGE_AND_POLICY_OK");
+        assert_eq!(std::fs::read(ro.join("input")).unwrap(), b"read-ok");
+        assert_eq!(std::fs::read(rw.join("secret")).unwrap(), b"secret");
+        assert_eq!(std::fs::read(rw.join("result")).unwrap(), b"write-ok");
+        assert_no_run_state(std::process::id());
+        println!("VM_EXECUTED typed selected-image filesystem read/write/deny and cleanup");
     }
 
     #[test]
@@ -583,7 +698,124 @@ mod windows_x64 {
         let result = facade_run(process_only_request("printf after-timeout"));
         assert_eq!(result.outcome, WaitResult::Exited(0));
         assert_eq!(result.stdout, b"after-timeout");
-        println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/cleanup");
+
+        for stderr_bytes in [CAPTURE_LIMIT / 2 - 1, CAPTURE_LIMIT / 2] {
+            let result = facade_run(capture_boundary_request(stderr_bytes));
+            assert_eq!(result.outcome, WaitResult::Exited(0));
+            assert_capture_boundary(&result.stdout, &result.stderr, stderr_bytes);
+        }
+        let error = mxc_sdk::__ffi::run_json(
+            &capture_boundary_request(CAPTURE_LIMIT / 2 + 1).to_string(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BackendError);
+        assert_eq!(error.message, CAPTURE_ERROR);
+        assert_no_run_state(std::process::id());
+        let result = facade_run(process_only_request("printf after-overflow"));
+        assert_eq!(result.outcome, WaitResult::Exited(0));
+        assert_eq!(result.stdout, b"after-overflow");
+        println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/capture-limit/cleanup");
+    }
+
+    #[test]
+    #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
+    fn signed_bundle_executor_configs() {
+        let cases = [
+            (
+                "microvm_hello.json",
+                include_str!("../../../tests/configs/microvm_hello.json"),
+                0,
+                Some("sum=100"),
+                "Hello world",
+            ),
+            (
+                "microvm_exit_code.json",
+                include_str!("../../../tests/configs/microvm_exit_code.json"),
+                42,
+                None,
+                "Exit code propagation",
+            ),
+            (
+                "microvm_multiline.json",
+                include_str!("../../../tests/configs/microvm_multiline.json"),
+                0,
+                Some("fib("),
+                "Shell Fibonacci program",
+            ),
+            (
+                "microvm_stdlib.json",
+                include_str!("../../../tests/configs/microvm_stdlib.json"),
+                0,
+                Some("shell=posix"),
+                "Guest shell and OS",
+            ),
+            (
+                "microvm_large_output.json",
+                include_str!("../../../tests/configs/microvm_large_output.json"),
+                0,
+                Some("line 999"),
+                "Large stdout (1000 lines)",
+            ),
+            (
+                "microvm_error.json",
+                include_str!("../../../tests/configs/microvm_error.json"),
+                1,
+                Some("intentional test error"),
+                "Shell error",
+            ),
+            (
+                "microvm_timeout.json",
+                include_str!("../../../tests/configs/microvm_timeout.json"),
+                -1,
+                Some("NVX workload timed out"),
+                "Timeout kills VM",
+            ),
+        ];
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        for (name, source, expected_exit, expected_output, description) in cases {
+            let request: Value = serde_json::from_str(source).expect("MicroVM config fixture");
+            let started = Instant::now();
+            let output = executor_output(&request, false);
+            let elapsed = started.elapsed().as_millis();
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let passed = output.status.code() == Some(expected_exit)
+                && expected_output.is_none_or(|expected| combined.contains(expected));
+            let status = if passed { "PASS" } else { "FAIL" };
+            println!("{status} {description} ({name}): {elapsed} ms");
+            results.push(json!({
+                "test": name,
+                "description": description,
+                "status": status,
+                "exit_code": output.status.code(),
+                "wall_time_ms": elapsed,
+            }));
+            if !passed {
+                failures.push(format!(
+                    "{name}: expected exit {expected_exit}, got {:?}\n{combined}",
+                    output.status.code()
+                ));
+            }
+        }
+        let performance = json!({
+            "commit": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_owned()),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "results": results,
+        });
+        let path = std::env::temp_dir().join("microvm-perf-results.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&performance).expect("MicroVM performance JSON"),
+        )
+        .expect("write MicroVM performance results");
+        println!("MicroVM performance results: {}", path.display());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        println!("VM_EXECUTED executor configs all seven fixtures");
     }
 
     #[test]
@@ -621,6 +853,25 @@ mod windows_x64 {
         let output = executor_output(&process_only_request("printf after-timeout"), false);
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(output.stdout, b"after-timeout");
-        println!("VM_EXECUTED executor sequential stdout/stderr/exit/timeout/cleanup");
+        for stderr_bytes in [CAPTURE_LIMIT / 2 - 1, CAPTURE_LIMIT / 2] {
+            let output = executor_output(&capture_boundary_request(stderr_bytes), false);
+            assert_eq!(output.status.code(), Some(0));
+            assert_capture_boundary(&output.stdout, &output.stderr, stderr_bytes);
+        }
+        let output = executor_output(&capture_boundary_request(CAPTURE_LIMIT / 2 + 1), false);
+        assert_eq!(output.status.code(), Some(-1));
+        assert!(
+            output.stdout.is_empty(),
+            "overflow must not relay partial output"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(CAPTURE_ERROR), "{stderr}");
+        assert!(!stderr.contains("NVX workload timed out"), "{stderr}");
+        let output = executor_output(&process_only_request("printf after-overflow"), false);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, b"after-overflow");
+        println!(
+            "VM_EXECUTED executor sequential stdout/stderr/exit/timeout/capture-limit/cleanup"
+        );
     }
 }

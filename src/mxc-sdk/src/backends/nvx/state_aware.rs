@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use aci_edge_sandboxes::{AciEdgeSandbox, SandboxId};
+use super::abi::ProvisionInput;
+use super::runtime::{SandboxClient, SandboxId};
 use serde_json::Value;
 
 use crate::mxc_common::models::{ExecutionRequest, MicroVmProvisionConfig};
@@ -12,14 +13,14 @@ use crate::mxc_common::state_aware_backend::{
 };
 
 pub struct NvxStateAwareRunner {
-    client: AciEdgeSandbox,
+    client: Box<dyn SandboxClient + Send>,
 }
 
 impl NvxStateAwareRunner {
     pub fn new() -> Result<Self, MxcError> {
         let state_root = super::runtime::lifecycle_state_root()?;
         Ok(Self {
-            client: super::runtime::create_client(&state_root)?,
+            client: Box::new(super::runtime::create_client(&state_root)?),
         })
     }
 }
@@ -46,15 +47,18 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         let (provision, spec) = super::policy::provision_request(
             request,
             config.as_ref(),
-            &self.client.capabilities(),
+            &self.client.capabilities()?,
         )?;
-        let result = self
-            .client
-            .provision_with(&provision, &spec)
-            .map_err(super::runtime::map_nvx_error)?;
+        let input = ProvisionInput {
+            request: provision,
+            spec,
+        };
+        self.client.validate_provision(&input)?;
+        self.client.probe()?;
+        let (id, metadata) = self.client.provision_metadata(&input)?;
         Ok(ProvisionResult {
-            sandbox_id: mxc_id(&result.sandbox_id),
-            metadata: result.metadata.map(Value::Object),
+            sandbox_id: mxc_id(&id),
+            metadata,
         })
     }
 
@@ -64,9 +68,7 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         _request: &ExecutionRequest,
         _config: Option<Self::StartConfig>,
     ) -> Result<StartResult<Self::StartMetadata>, MxcError> {
-        self.client
-            .start(&native_id(sandbox_id)?)
-            .map_err(super::runtime::map_nvx_error)?;
+        self.client.start(&native_id(sandbox_id)?)?;
         Ok(StartResult { metadata: None })
     }
 
@@ -78,11 +80,8 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         stdio: ExecStdio,
     ) -> Result<ExecHandle, MxcError> {
         let piped = stdio == ExecStdio::Piped;
-        let request = super::policy::exec_request(request, piped, &self.client.capabilities())?;
-        let execution = self
-            .client
-            .exec(&native_id(sandbox_id)?, &request)
-            .map_err(super::runtime::map_nvx_error)?;
+        let request = super::policy::exec_request(request, piped, &self.client.capabilities()?)?;
+        let execution = self.client.exec(&native_id(sandbox_id)?, &request)?;
         super::process::into_exec_handle(execution, stdio)
     }
 
@@ -92,9 +91,7 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         _request: &ExecutionRequest,
         _config: Option<Self::StopConfig>,
     ) -> Result<StopResult<Self::StopMetadata>, MxcError> {
-        self.client
-            .stop(&native_id(sandbox_id)?)
-            .map_err(super::runtime::map_nvx_error)?;
+        self.client.stop(&native_id(sandbox_id)?)?;
         Ok(StopResult { metadata: None })
     }
 
@@ -104,9 +101,7 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         _request: &ExecutionRequest,
         _config: Option<Self::DeprovisionConfig>,
     ) -> Result<DeprovisionResult<Self::DeprovisionMetadata>, MxcError> {
-        self.client
-            .deprovision(&native_id(sandbox_id)?)
-            .map_err(super::runtime::map_nvx_error)?;
+        self.client.deprovision(&native_id(sandbox_id)?)?;
         Ok(DeprovisionResult { metadata: None })
     }
 
@@ -116,10 +111,11 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         config: Option<&Self::ProvisionConfig>,
     ) -> Result<(), MxcError> {
         let (provision, spec) =
-            super::policy::provision_request(request, config, &self.client.capabilities())?;
-        self.client
-            .validate_provision_with(&provision, &spec)
-            .map_err(super::runtime::map_nvx_error)
+            super::policy::provision_request(request, config, &self.client.capabilities()?)?;
+        self.client.validate_provision(&ProvisionInput {
+            request: provision,
+            spec,
+        })
     }
 
     fn validate_start(
@@ -138,10 +134,8 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         _config: Option<&Self::ExecConfig>,
     ) -> Result<(), MxcError> {
         native_id(sandbox_id)?;
-        let request = super::policy::exec_request(request, false, &self.client.capabilities())?;
-        self.client
-            .validate_exec(&request)
-            .map_err(super::runtime::map_nvx_error)
+        let request = super::policy::exec_request(request, false, &self.client.capabilities()?)?;
+        self.client.validate_exec(&request)
     }
 
     fn validate_stop(
@@ -167,7 +161,9 @@ fn native_id(value: &str) -> Result<SandboxId, MxcError> {
     let token = value
         .strip_prefix("microvm:")
         .ok_or_else(|| MxcError::malformed_id("MicroVM sandbox ID must start with 'microvm:'"))?;
-    SandboxId::from_token(token).map_err(super::runtime::map_nvx_error)
+    SandboxId::from_token(token).map_err(|_| {
+        MxcError::malformed_id("MicroVM sandbox ID requires 32 lowercase hexadecimal digits")
+    })
 }
 
 fn mxc_id(value: &SandboxId) -> String {
@@ -176,6 +172,7 @@ fn mxc_id(value: &SandboxId) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::abi::ExecOutcome as NvxExecOutcome;
     use super::super::test_support::Fixture;
     use super::*;
     use crate::mxc_common::state_aware_backend::ExecOutcome;
@@ -203,19 +200,16 @@ mod tests {
 
     #[test]
     fn relayed_dispatch_reports_nvx_timeout_not_a_protocol_violation() {
-        for outcome in [
-            aci_edge_sandboxes::ExecOutcome::Exited(7),
-            aci_edge_sandboxes::ExecOutcome::TimedOut,
-        ] {
+        for outcome in [NvxExecOutcome::Exited(7), NvxExecOutcome::TimedOut] {
             let fixture = Fixture {
                 outcome: Some(outcome),
                 ..Default::default()
             };
             let mut backend = NvxStateAwareRunner {
-                client: AciEdgeSandbox::new(fixture.clone()),
+                client: Box::new(fixture.clone()),
             };
             let result = dispatch_state_aware_typed(&mut backend, bound_exec(), false);
-            if outcome == aci_edge_sandboxes::ExecOutcome::TimedOut {
+            if outcome == NvxExecOutcome::TimedOut {
                 let error = result.unwrap_err();
                 assert_eq!(
                     error.code,
@@ -233,7 +227,7 @@ mod tests {
             }
             assert_eq!(*fixture.stdin_piped.lock().unwrap(), Some(false));
             let mut events = vec!["validate_exec", "validate_exec", "exec", "wait"];
-            if outcome == aci_edge_sandboxes::ExecOutcome::TimedOut {
+            if outcome == NvxExecOutcome::TimedOut {
                 events.push("cancel");
             }
             assert_eq!(*fixture.events.lock().unwrap(), events);
@@ -242,16 +236,13 @@ mod tests {
 
     #[test]
     fn piped_dispatch_retains_exit_timeout_and_real_stream_contracts() {
-        for outcome in [
-            aci_edge_sandboxes::ExecOutcome::Exited(7),
-            aci_edge_sandboxes::ExecOutcome::TimedOut,
-        ] {
+        for outcome in [NvxExecOutcome::Exited(7), NvxExecOutcome::TimedOut] {
             let fixture = Fixture {
                 outcome: Some(outcome),
                 ..Default::default()
             };
             let mut backend = NvxStateAwareRunner {
-                client: AciEdgeSandbox::new(fixture.clone()),
+                client: Box::new(fixture.clone()),
             };
             let handle = dispatch_state_aware_exec(&mut backend, bound_exec()).unwrap();
             assert!(!handle.stdin.0.is_null());
@@ -262,7 +253,7 @@ mod tests {
             let actual = (handle.waiter)().unwrap();
             assert_eq!(
                 actual,
-                if outcome == aci_edge_sandboxes::ExecOutcome::TimedOut {
+                if outcome == NvxExecOutcome::TimedOut {
                     ExecOutcome::TimedOut
                 } else {
                     ExecOutcome::Exited(7)

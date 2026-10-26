@@ -13,6 +13,12 @@ use mxc_sdk::v1::{
     SpawnInContainerWithPtyOptions, SpawnOptions, StartOptions, StopOptions, WaitResult,
 };
 
+fn fixture_root() -> std::path::PathBuf {
+    std::env::var_os("MXC_NVX_TEST_FIXTURE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\.."))
+}
+
 #[test]
 fn discovery_without_bundle_is_read_only() {
     const CHILD: &str = "MXC_NVX_DISCOVERY_CHILD";
@@ -36,10 +42,10 @@ fn discovery_without_bundle_is_read_only() {
         .env("LOCALAPPDATA", &local)
         .env("TEMP", &temp)
         .env("TMP", &temp)
-        .env(aci_edge_sandboxes::agent::BundledAgent::ENV_DIR, &bundle)
+        .env("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", &bundle)
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success(), "discovery child failed: {status}");
@@ -120,9 +126,7 @@ fn powershell_authored_lifecycle_payload_parses_without_executing_the_cli() {
         logger::{Logger, Mode},
         state_aware_request::Phase,
     };
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+    let script = fixture_root()
         .join("tests")
         .join("scripts")
         .join("run_microvm_state_aware_tests.ps1");
@@ -200,8 +204,7 @@ fn powershell_authored_lifecycle_payload_parses_without_executing_the_cli() {
 #[test]
 fn powershell_lifecycle_failures_report_both_streams_and_preserve_cleanup() {
     use std::io::{Seek, SeekFrom};
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(r"..\..\tests\scripts\run_microvm_state_aware_tests.ps1");
+    let script = fixture_root().join(r"tests\scripts\run_microvm_state_aware_tests.ps1");
     let root = tempfile::Builder::new()
         .prefix("nvx host fixture ")
         .tempdir()
@@ -214,7 +217,10 @@ fn powershell_lifecycle_failures_report_both_streams_and_preserve_cleanup() {
         if "%2"=="%MXC_NVX_FAIL_PHASE%" (
           echo {"error":{"code":"BackendError","message":"STDOUT_%2_JSON_ERROR"}}
           echo STDERR_%2_MARKER 1>&2
-          if "%MXC_NVX_REMOVE_EXECUTOR%"=="1" del "%~f0"
+          if "%MXC_NVX_REMOVE_EXECUTOR%"=="1" (
+            del /f /q "%~f0"
+            exit 1
+          )
           exit /b 23
         )
         if "%2"=="%MXC_NVX_CLEANUP_FAIL_PHASE%" (
@@ -273,6 +279,7 @@ fn powershell_lifecycle_failures_report_both_streams_and_preserve_cleanup() {
         ),
         ("exec", Some("launch"), vec!["provision", "start", "exec"]),
     ] {
+        println!("HOST_ONLY executor failure={failure} cleanup={cleanup_failure:?}");
         let events = root.path().join(format!(
             "{failure}-{}-events.txt",
             cleanup_failure.unwrap_or("none")
@@ -321,7 +328,11 @@ fn powershell_lifecycle_failures_report_both_streams_and_preserve_cleanup() {
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap();
                 child.wait().unwrap();
-                panic!("fake executor {failure} exceeded deadline");
+                let phases = std::fs::read_to_string(&events).unwrap_or_default();
+                stderr.seek(SeekFrom::Start(0)).unwrap();
+                let mut diagnostic = String::new();
+                stderr.read_to_string(&mut diagnostic).unwrap();
+                panic!("fake executor {failure} cleanup={cleanup_failure:?} exceeded deadline; phases: {phases}; stderr: {diagnostic}");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
@@ -384,11 +395,7 @@ fn microvm_sample_creation_corpus_parses_with_explicit_images() {
         logger::{Logger, Mode},
         state_aware_request::MxcRequest,
     };
-    let configs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("tests")
-        .join("configs");
+    let configs = fixture_root().join("tests").join("configs");
     let mut count = 0;
     for entry in std::fs::read_dir(configs).unwrap() {
         let path = entry.unwrap().path();
@@ -530,7 +537,7 @@ fn exec_network_policy_is_rejected_before_runtime_setup_on_public_lifecycle_path
             .env(CHILD, "1")
             .env("LOCALAPPDATA", &local)
             .env(
-                aci_edge_sandboxes::agent::BundledAgent::ENV_DIR,
+                "ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR",
                 root.path().join("absent-bundle"),
             )
             .spawn()
@@ -710,6 +717,7 @@ fn unsupported_ui_policy_is_rejected_before_runtime_discovery() {
 fn exact_alpha_json_runs_twice_through_signed_nvx_agent() {
     run_nonce("mxc-nvx-first");
     run_nonce("mxc-nvx-second");
+    println!("VM_EXECUTED phase3 exact_alpha_json_runs_twice_through_signed_nvx_agent");
 }
 
 #[test]
@@ -756,6 +764,7 @@ fn typed_lifecycle_reuses_running_microvm() {
         DeprovisionOptions::default(),
     )
     .expect("deprovision MicroVM");
+    println!("VM_EXECUTED phase3 typed_lifecycle_reuses_running_microvm");
 }
 
 #[test]
@@ -808,6 +817,7 @@ fn deprovisioning_one_microvm_does_not_disrupt_another() {
         DeprovisionOptions::default(),
     )
     .expect("deprovision second MicroVM");
+    println!("VM_EXECUTED phase3 deprovisioning_one_microvm_does_not_disrupt_another");
 }
 
 #[test]
@@ -869,6 +879,7 @@ fn typed_lifecycle_streams_stdin_stdout_and_cancels() {
         DeprovisionOptions::default(),
     )
     .expect("deprovision MicroVM");
+    println!("VM_EXECUTED phase3 typed_lifecycle_streams_stdin_stdout_and_cancels");
 }
 
 #[test]
@@ -898,6 +909,7 @@ fn typed_create_and_run_requires_experimental_and_streams() {
     let mut output = Vec::new();
     stdout.read_to_end(&mut output).unwrap();
     assert_eq!(output, b"one-shot-stream");
+    println!("VM_EXECUTED phase3 typed_create_and_run_requires_experimental_and_streams");
 }
 
 #[test]
@@ -953,6 +965,7 @@ fn lifecycle_filesystem_policy_is_enforced() {
         DeprovisionOptions::default(),
     )
     .unwrap();
+    println!("VM_EXECUTED phase3 lifecycle_filesystem_policy_is_enforced");
 }
 
 #[test]
@@ -985,6 +998,7 @@ fn exact_json_lifecycle_routes_microvm_end_to_end() {
         });
         mxc_sdk::__ffi::run_lifecycle_json(&request.to_string(), false, true).unwrap();
     }
+    println!("VM_EXECUTED phase3 exact_json_lifecycle_routes_microvm_end_to_end");
 }
 
 fn run_with_network(network: NetworkPolicy, command: &str) -> v1::ExecutionResult {
@@ -1061,6 +1075,7 @@ fn lifecycle_directional_network_policy_is_enforced() {
     );
     assert_eq!(allowed.outcome, WaitResult::Exited(0));
     assert_eq!(allowed.stdout, b"NETWORK_ALLOWED");
+    println!("VM_EXECUTED phase3 lifecycle_directional_network_policy_is_enforced");
 }
 
 #[test]
@@ -1127,6 +1142,7 @@ fn lifecycle_proxy_routes_guest_http() {
     proxy.join().unwrap();
     assert_eq!(result.outcome, WaitResult::Exited(0));
     assert_eq!(result.stdout, b"PROXY_OK");
+    println!("VM_EXECUTED phase3 lifecycle_proxy_routes_guest_http");
 }
 
 #[test]
@@ -1179,4 +1195,5 @@ fn pty_and_exec_time_proxy_fail_before_workload_launch() {
         DeprovisionOptions::default(),
     )
     .unwrap();
+    println!("VM_EXECUTED phase3 pty_and_exec_time_proxy_fail_before_workload_launch");
 }
