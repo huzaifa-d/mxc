@@ -32,7 +32,7 @@ the individual local test scripts are documented in
 | `.github/workflows/Validation.Tests.Matrix.Job.yml` | `workflow_call`-only. Resolves the plan and runs the per-family test jobs. |
 | `.github/workflows/Package.IsolationSession.TestBundle.Job.yml` | `workflow_call`-only. Builds the IsolationSession test bundle natively on x64 and arm64 and uploads it as `isolation-session-test-bundle-<target>`. |
 | `scripts/ci/build-isolation-session-test-bundle.ps1` | Builds and assembles the IsolationSession test bundle, and checks that each payload discovers its tests. |
-| `scripts/ci/stage-nvx-validation-tests.ps1` | Stages the compiled Windows x64 SDK MicroVM tests in the existing Windows artifact and checks required test discovery. |
+| `scripts/ci/stage-nvx-validation-tests.ps1` | Stages both compiled Windows x64 SDK MicroVM suites and their script/config fixtures in the existing Windows artifact and checks required test discovery. |
 | `scripts/ci/validation-test-matrix.json` | The matrix: OS versions, backends, triggers, job staggering. |
 | `scripts/ci/resolve-validation-test-matrix.mjs` | Matrix validator + plan expander. Emits the GitHub Actions matrices. |
 | `scripts/ci/prepare-windows-host.ps1` | Per-backend Windows host preparation / prerequisite assertions, plus the `winget` repair and the workload-tooling install. Runs in Windows PowerShell, because it installs the `pwsh` the steps after it use. |
@@ -252,8 +252,10 @@ every entry.
 - `microvm` — asserts the SDK test executable and signed NVX runtime files are
   in the artifact, adds a Defender exclusion for the binary directory, and
   requires the Windows Hypervisor Platform feature *and* a running hypervisor.
-  The dispatcher runs the prebuilt SDK tests without Cargo and fails on missing
-  VM completion markers, empty suites, skipped tests, or filtered tests.
+  The dispatcher runs the prebuilt captured and lifecycle/streaming SDK tests
+  and the staged executor lifecycle harness without Cargo. Every VM scenario
+  and the harness must emit its completion marker; missing markers, empty
+  suites, skipped tests, and filtered tests fail validation.
 - `wslc` — asserts `wslcsdk.dll` shipped, requires the WSL and
   VirtualMachinePlatform optional features to be baked into the image, then
   installs/updates the WSL runtime (including the pre-release ring) up to the
@@ -403,7 +405,8 @@ step tees that into `$RUNNER_TEMP/mxc-ci.log`.
 The IsolationSession test bundle downloads under `artifacts/bin`, outside
 `$RUNNER_TEMP`, so it is not uploaded again with the logs.
 
-MicroVM validation writes `microvm-nvx.log` and `microvm-perf-results.json`
+MicroVM validation writes `microvm-nvx.log`, `microvm-nvx-phase3.log`,
+`microvm-lifecycle-executor.log`, and `microvm-perf-results.json`
 under the redirected temporary directory, so the normal Windows log upload
 collects both. The signed NVX bundle stays under `artifacts/bin` and is not
 uploaded again. The former standalone `microvm-e2e.yml` workflow is retired;

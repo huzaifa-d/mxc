@@ -278,6 +278,12 @@ pub(super) struct Capabilities {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ExecCapabilities {
     pub command_line: bool,
+    #[serde(default)]
+    pub stdin: bool,
+    #[serde(default)]
+    pub cancel: bool,
+    #[serde(default)]
+    pub concurrent: bool,
     pub cwd: bool,
     pub env: bool,
     pub max_timeout_ms: Option<u64>,
@@ -309,6 +315,8 @@ pub(super) struct FilesystemCapabilities {
 #[serde(rename_all = "camelCase")]
 pub(super) struct SpecCapabilities {
     pub image_reference: bool,
+    #[serde(default)]
+    pub memory: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,12 +324,28 @@ pub(super) struct SpecCapabilities {
 pub(super) struct SandboxSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
 }
 
 impl SandboxSpec {
     pub fn is_empty(&self) -> bool {
-        self.image.is_none()
+        self.image.is_none() && self.resources.is_none()
     }
+
+    pub fn with_memory_mib(mut self, memory_mib: u32) -> Self {
+        self.resources = Some(Resources {
+            memory_mib: Some(memory_mib),
+        });
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Resources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,11 +403,15 @@ pub(super) struct ExecInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ExecRequest {
     pub process: ProcessSpec,
+    // Stdin is an execution-envelope control, not a native process policy field.
+    #[serde(skip)]
+    pub stdin: bool,
 }
 
 impl ExecRequest {
     pub fn command_line(command_line: impl Into<String>) -> Self {
         Self {
+            stdin: false,
             process: ProcessSpec {
                 command_line: command_line.into(),
                 cwd: None,
@@ -560,11 +588,43 @@ fn decode_json<T: DeserializeOwned>(bytes: Option<Vec<u8>>, what: &str) -> Resul
     })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+fn verified_file_digest(path: &Path, file: &mut File, expected: &str) -> Result<String, MxcError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            MxcError::backend_unavailable(format!(
+                "NVX signed bundled agent: cannot read runtime file {}: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual = digest
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .collect::<String>();
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(MxcError::backend_unavailable(format!(
+            "NVX signed bundled agent: runtime file {} does not match the approved SHA-256",
+            path.display()
+        )));
+    }
+    Ok(actual)
+}
+
+pub(super) fn verify_file_digest(path: &Path, expected: &str) -> Result<(), MxcError> {
+    let mut file = open_for_load(path).map_err(|error| {
+        MxcError::backend_unavailable(format!(
+            "NVX signed bundled agent: cannot verify runtime file {}: {error}",
+            path.display()
+        ))
+    })?;
+    verified_file_digest(path, &mut file, expected).map(|_| ())
 }
 
 /// Opens `path` for read with `FILE_SHARE_READ` (`1`) only, preventing any concurrent writer,
@@ -644,20 +704,7 @@ impl AgentLibrary {
         mut lock_file: File,
         expected_sha256: &str,
     ) -> Result<Self, MxcError> {
-        let mut bytes = Vec::new();
-        lock_file.read_to_end(&mut bytes).map_err(|error| {
-            MxcError::backend_unavailable(format!(
-                "NVX signed bundled agent: cannot read the agent library at {}: {error}",
-                path.display()
-            ))
-        })?;
-        let actual_sha256 = sha256_hex(&bytes);
-        if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-            return Err(MxcError::backend_unavailable(format!(
-                "NVX signed bundled agent: the agent library at {} does not match the approved SHA-256",
-                path.display()
-            )));
-        }
+        let actual_sha256 = verified_file_digest(path, &mut lock_file, expected_sha256)?;
 
         let library = unsafe { LoadedLibrary::new(path) }.map_err(|error| {
             MxcError::backend_unavailable(format!(
@@ -928,6 +975,39 @@ impl AgentLibrary {
         })
     }
 
+    pub fn exec_close_input(&self, exec: u64) -> Result<(), MxcError> {
+        self.call_empty("exec_close_input", |out, length| unsafe {
+            (self.exports.exec_close_input)(exec, out, length)
+        })
+    }
+
+    pub fn exec_write(&self, exec: u64, data: &[u8]) -> Result<usize, MxcError> {
+        let mut written = 0;
+        let mut buffer = ptr::null_mut();
+        let mut length = 0;
+        let status = unsafe {
+            (self.exports.exec_write)(
+                exec,
+                data.as_ptr(),
+                data.len(),
+                100,
+                &mut written,
+                &mut buffer,
+                &mut length,
+            )
+        };
+        let bytes = self.take_buffer(buffer, length)?;
+        match status {
+            STATUS_OK if written <= data.len() => Ok(written),
+            STATUS_TIMEOUT => Ok(0),
+            STATUS_ERROR => Err(error_from_body(bytes.as_deref())),
+            STATUS_OK => Err(MxcError::backend_error(
+                "NVX signed bundled agent: stdin write exceeded its supplied buffer",
+            )),
+            other => Err(status_error(other)),
+        }
+    }
+
     pub fn exec_release(&self, exec: u64) -> Result<(), MxcError> {
         let status = unsafe { (self.exports.exec_release)(exec) };
         match status {
@@ -1032,6 +1112,7 @@ pub(super) mod tests {
                 image: Some(ImageSource::Reference(
                     "mcr.microsoft.com/azurelinux/base/core:3.0".to_owned(),
                 )),
+                ..Default::default()
             },
         };
         assert_eq!(

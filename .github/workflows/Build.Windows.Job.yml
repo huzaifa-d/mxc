@@ -140,6 +140,8 @@ jobs:
             src/target/${{ matrix.target }}/release/wxc-ui-probe.exe
             src/target/${{ matrix.target }}/release/wxc-test-driver.exe
             src/target/${{ matrix.target }}/release/nvx-e2e-tests.exe
+            src/target/${{ matrix.target }}/release/nvx-phase3-e2e-tests.exe
+            src/target/${{ matrix.target }}/release/nvx-validation/
             src/target/${{ matrix.target }}/release/aci-edge-sandboxes/
           if-no-files-found: error
           retention-days: 1

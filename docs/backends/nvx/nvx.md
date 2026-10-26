@@ -65,21 +65,21 @@ policy before creating a VM rather than ignoring it.
 | Surface | Support |
 |---|---|
 | Host platforms | Windows x64 with WHP. Windows ARM64 and Linux execution are unavailable. |
-| Execution | Create-and-run development JSON requests with captured stdout, stderr, exit status, and timeout. |
-| Typed V1 SDK APIs | `v1::experimental::run` supports captured execution. Ordinary V1 operations do not authorize MicroVM. Node and .NET do not expose typed MicroVM selection. |
-| Streaming, PTY, and container lifecycle operations | Unsupported. The development contract and experimental Rust entry points define these requests, but execution fails explicitly before backend setup. |
+| Execution | Create-and-run development JSON requests and container lifecycle operations, with captured or streaming stdout/stderr, exit status, and timeout. |
+| Typed V1 SDK APIs | `v1::experimental::run`, `spawn`, and `experimental::container` support MicroVM execution. Ordinary V1 operations do not authorize MicroVM. Node and .NET do not expose typed MicroVM selection. |
+| Streaming and container lifecycle operations | Piped stdin/stdout/stderr, cancellation, provision, start, exec, stop, and deprovision are supported. PTY remains unsupported and is rejected before launch. |
 | Workload image | Required caller-selected registry reference in `microvm.image`. |
-| Guest memory override | `microvm.provision.memoryMib` and Rust `memory_mib` are defined by the contract and typed requests, but explicit overrides return `PolicyValidation` before bundle discovery. Omit them to use the runtime default. |
+| Guest memory override | Optional positive `microvm.provision.memoryMib` or Rust `memory_mib` is mapped to the native provision specification when the runtime advertises memory support. Omission retains the runtime default. |
 | Working directory | Optional absolute POSIX guest path; see the limits below. |
 | Environment | Guest default, optionally extended with additive entries; see below. |
 | Process timeout | `0` means no workload timeout; nonzero values may not exceed 3,600,000 ms. |
-| Captured output | At most 64 MiB (67,108,864 bytes) combined stdout and stderr. |
+| Captured create-and-run output | At most 64 MiB (67,108,864 bytes) combined stdout and stderr. |
 | Filesystem policy | Read-only, read-write, and denied paths are mapped to the agent and require the corresponding runtime capabilities. |
 | Network policy | Directional defaults and CIDR/protocol/port rules require the corresponding runtime capabilities. Unsupported ingress or host-loopback allow postures fail closed. |
 | Runtime proxy | `runtimeConfig.networkProxy` requires the runtime's proxy capability. Proxy environment variables remain rejected. |
 | UI policy | A supplied `ui` section is rejected. |
 | Fallback policy | A supplied `fallback` section is rejected. |
-| Lifecycle options | `destroyOnExit` must be `true` and `preservePolicy` must be `false`. |
+| Lifecycle options | Create-and-run requires `destroyOnExit=true` and `preservePolicy=false`. Manual lifecycle operations leave teardown to the caller. Image, memory, filesystem, and network settings are fixed at provision time. |
 
 Backend-specific sections must match the selected backend. For example,
 `processContainer.filesystem.enumeratePaths` and
@@ -113,23 +113,49 @@ the container, and returns `BackendError` rather than truncated output. The
 limit also applies when the workload timeout is zero. Cleanup failures are
 reported alongside the original failure.
 
-A workload timeout preserves captured partial output and tears down the
-container. Each create-and-run request gets fresh workload state; this phase
-does not offer persistent containers or manual lifecycle operations.
+A create-and-run timeout preserves partial output and tears down the container.
+Streaming returns bytes through bounded pipes rather than accumulating captured
+output. Cancellation and deadlines interrupt blocked input and output; the native
+execution handle is released only after its I/O workers finish. Teardown failures
+remain errors even when the workload completed successfully.
+
+Each create-and-run request gets fresh workload state. Container lifecycle
+operations preserve guest state between executions until the caller stops and
+deprovisions the container. Their state lives under
+`%LOCALAPPDATA%\Microsoft\MXC\nvx`; MXC creates an owner-only directory and rejects
+an existing root with a permissive ACL or a reparse point rather than repairing
+it. Backend discovery checks the approved runtime manifest, DLL, image helper,
+hypervisor executable, kernel, and guest image without opening a native host or
+creating lifecycle state. A manifest marker alone does not make the backend
+available.
+
+If native cancellation fails, MXC ends local stream I/O and reports the failure;
+it does not report a timeout or claim that the workload stopped. Create-and-run
+still attempts VM teardown; lifecycle callers can stop and deprovision their
+container if its workload may still be running. Native host-resource
+release failures are reported after lifecycle operations and when waiting for
+streaming execution, alongside any original error. If provisioning succeeded
+before a release failure, the error includes the new sandbox ID so it can be
+stopped and deprovisioned.
 
 ## Validation
 
 Host-only policy and bundle-integrity checks run in normal Windows x64 PR
 builds. Actual VM execution runs in the unified nightly validation matrix on
 Windows 25H2 x64. It consumes the same Windows build artifact, including the
-compiled `nvx_e2e` tests and the complete signed bundle; the validation host
-does not rebuild them.
+compiled `nvx_e2e` and `nvx_phase3_e2e` tests, their script/config fixtures, and
+the complete signed bundle; the validation host does not rebuild them.
 
 The SDK suite covers both the executor and captured JSON execution, typed
 image selection, filesystem enforcement, directional network and proxy
 enforcement against controlled reachable host endpoints, binary
 stdout/stderr, exit codes, environment and working-directory settings,
 timeouts, capture limits, cleanup, and the seven MicroVM config fixtures.
+Lifecycle scenarios additionally exercise persistent state, independent
+containers, guest-visible memory at two distinct requested sizes, stdin EOF,
+streaming, cancellation, and policy
+enforcement. The staged PowerShell harness runs the executor's complete
+provision/start/exec/stop/deprovision sequence.
 Missing prerequisites, skipped scenarios, and empty test runs fail validation.
 See the [CI validation runbook](../../development/build-and-test/ci-validation-infrastructure.md).
 
@@ -137,8 +163,9 @@ To run the suite locally on a prepared Windows x64 host, from `src`:
 
 ```powershell
 cargo build --locked -p wxc --features microvm --target x86_64-pc-windows-msvc
-cargo test --locked -p mxc-sdk --features microvm --test nvx_bundle_integrity --test nvx_e2e --target x86_64-pc-windows-msvc
-cargo test --locked -p mxc-sdk --features microvm --test nvx_e2e --target x86_64-pc-windows-msvc -- --include-ignored --nocapture --test-threads=1
+cargo test --locked -p mxc-sdk --features microvm --test nvx_bundle_integrity --test nvx_e2e --test nvx_phase3_e2e --target x86_64-pc-windows-msvc
+cargo test --locked -p mxc-sdk --features microvm --test nvx_e2e --test nvx_phase3_e2e --target x86_64-pc-windows-msvc -- --include-ignored --nocapture --test-threads=1
+..\tests\scripts\run_microvm_state_aware_tests.ps1 -WxcExePath .\target\x86_64-pc-windows-msvc\debug\wxc-exec.exe
 ```
 
 ## Maintainers: updating the bundled runtime

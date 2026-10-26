@@ -580,6 +580,8 @@ function Initialize-MicroVmHost {
     Assert-RequiredFile @(
         'wxc-exec.exe',
         'nvx-e2e-tests.exe',
+        'nvx-phase3-e2e-tests.exe',
+        'nvx-validation\tests\scripts\run_microvm_state_aware_tests.ps1',
         'aci-edge-sandboxes\bundle-manifest.json',
         'aci-edge-sandboxes\SOURCE-MANIFEST.json',
         'aci-edge-sandboxes\SHA256SUMS',

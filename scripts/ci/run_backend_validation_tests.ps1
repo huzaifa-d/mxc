@@ -403,6 +403,46 @@ function Invoke-MicroVmTests {
             throw "MicroVM SDK validation did not execute the $scenario VM scenario."
         }
     }
+
+    $phase3 = Join-Path $binaryDirectoryPath 'nvx-phase3-e2e-tests.exe'
+    Assert-File -Path $phase3
+    $env:MXC_NVX_TEST_FIXTURE_ROOT = Join-Path $binaryDirectoryPath 'nvx-validation'
+    $harness = Join-Path $env:MXC_NVX_TEST_FIXTURE_ROOT 'tests\scripts\run_microvm_state_aware_tests.ps1'
+    Assert-File -Path $harness
+    $run = Invoke-LoggedNative -FilePath $phase3 -LogName 'microvm-nvx-phase3.log' -ArgumentList @(
+        '--include-ignored', '--nocapture', '--test-threads=1'
+    )
+    $failure = Get-LibtestFailure -Run $run
+    if ($failure) { throw "MicroVM lifecycle/streaming tests $failure." }
+    $output = Get-Content -LiteralPath $run.Log -Raw
+    if ($output -match '\bSKIP(?:PED)?:' -or
+        $output -notmatch '(?m)^test result: ok\. \d+ passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;') {
+        throw 'MicroVM lifecycle/streaming validation skipped or filtered tests.'
+    }
+    foreach ($scenario in @(
+        'exact_alpha_json_runs_twice_through_signed_nvx_agent',
+        'typed_lifecycle_reuses_running_microvm',
+        'deprovisioning_one_microvm_does_not_disrupt_another',
+        'typed_lifecycle_streams_stdin_stdout_and_cancels',
+        'typed_create_and_run_requires_experimental_and_streams',
+        'lifecycle_filesystem_policy_is_enforced',
+        'exact_json_lifecycle_routes_microvm_end_to_end',
+        'lifecycle_directional_network_policy_is_enforced',
+        'lifecycle_proxy_routes_guest_http',
+        'pty_and_exec_time_proxy_fail_before_workload_launch'
+    )) {
+        if (-not $output.Contains("VM_EXECUTED phase3 $scenario")) {
+            throw "MicroVM lifecycle/streaming validation did not execute $scenario."
+        }
+    }
+    $run = Invoke-LoggedNative -FilePath 'powershell.exe' -LogName 'microvm-lifecycle-executor.log' -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $harness, '-WxcExePath', $wxc
+    )
+    $output = Get-Content -LiteralPath $run.Log -Raw
+    if ($run.ExitCode -ne 0 -or -not $output.Contains('VM_EXECUTED executor lifecycle provision/start/exec/stop/deprovision')) {
+        throw "MicroVM executor lifecycle harness failed or executed no lifecycle (exit $($run.ExitCode))."
+    }
 }
 
 Redirect-TempToRunnerTemp

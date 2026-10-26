@@ -15,6 +15,7 @@ use super::abi::{
     ExecOutcome, ExecRequest, HostInfo, ImageSource, ProvisionInput, RuntimeSource, SandboxSpec,
     SetupConfig,
 };
+pub(super) use super::execution::Execution;
 
 pub(super) const ARTIFACTS_DIR_ENV: &str = "ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR";
 pub(super) const BESIDE_EXE_DIR: &str = "aci-edge-sandboxes";
@@ -26,6 +27,8 @@ pub(super) const APPROVED_DLL_SHA256: &str =
     "a203e58b97a642bd4a68824c0387965541895b25582e18db6f55e28947f5f135";
 pub(super) const APPROVED_OPENVMM_SHA256: &str =
     "697f8221e62a1ea4efb3846fefde6f595c89f4f81c0153a2609bf6fb4c81ea9e";
+const APPROVED_IMAGE_TOOL_SHA256: &str =
+    "633b679a8f8f2586626b7475b1e5e3faa3d2ea7119082ffc5873191194feb6fe";
 pub(super) const APPROVED_KERNEL_SHA256: &str =
     "b36ab45b22d1c14438047b24c3724f54cc71dd03601d0f3cbdca11438f40e768";
 pub(super) const APPROVED_INITRD_SHA256: &str =
@@ -83,6 +86,17 @@ pub(super) trait SandboxClient {
     fn probe(&self) -> Result<(), MxcError>;
     fn provision(&self, input: &ProvisionInput) -> Result<SandboxId, MxcError>;
     fn start(&self, sandbox_id: &SandboxId) -> Result<(), MxcError>;
+    fn exec(&self, _sandbox_id: &SandboxId, _request: &ExecRequest) -> Result<Execution, MxcError> {
+        Err(MxcError::backend_error(
+            "NVX client does not implement streaming",
+        ))
+    }
+    fn provision_metadata(
+        &self,
+        input: &ProvisionInput,
+    ) -> Result<(SandboxId, Option<serde_json::Value>), MxcError> {
+        self.provision(input).map(|id| (id, None))
+    }
     fn exec_and_wait(
         &self,
         sandbox_id: &SandboxId,
@@ -121,8 +135,7 @@ impl Drop for NvxClient {
 
 pub(super) fn create_client(state_root: &Path) -> Result<NvxClient, MxcError> {
     let bundle_dir = discover_bundle_dir()?;
-    let dll_path = bundle_dir.join("bin").join("aci_edge_agent.dll");
-    let library = AgentLibrary::load_verified(&dll_path, APPROVED_DLL_SHA256)?;
+    let library = load_bundle_library(&bundle_dir)?;
     let setup = SetupConfig {
         schema_version: 1,
         state_root: state_root.to_path_buf(),
@@ -182,11 +195,98 @@ fn verify_runtime_digests(info: &HostInfo) -> Result<(), MxcError> {
     Ok(())
 }
 
+pub(super) fn lifecycle_state_root() -> Result<PathBuf, MxcError> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        MxcError::backend_unavailable(
+            "cannot resolve LOCALAPPDATA for the persistent NVX lifecycle state",
+        )
+    })?;
+    let state_root = PathBuf::from(local_app_data)
+        .join("Microsoft")
+        .join("MXC")
+        .join("nvx");
+    admit_persistent_state_root(&state_root)?;
+    Ok(state_root)
+}
+
+fn admit_persistent_state_root(state_root: &Path) -> Result<(), MxcError> {
+    let parent = state_root.parent().ok_or_else(|| {
+        MxcError::backend_unavailable("persistent NVX lifecycle state path has no parent")
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        MxcError::backend_unavailable(format!(
+            "cannot create the persistent NVX lifecycle state parent '{}': {error}",
+            parent.display()
+        ))
+    })?;
+
+    match crate::mxc_common::filesystem_dacl::create_owner_only_directory(state_root, true)
+        .map_err(|error| {
+            MxcError::backend_unavailable(format!(
+                "cannot create persistent NVX lifecycle state root '{}': {error}",
+                state_root.display()
+            ))
+        })? {
+        crate::mxc_common::filesystem_dacl::CreateDirectoryDisposition::Created => {
+            if let Err(error) = validate_private_state_root(state_root, "new ") {
+                let _ = std::fs::remove_dir(state_root);
+                return Err(error);
+            }
+        }
+        crate::mxc_common::filesystem_dacl::CreateDirectoryDisposition::AlreadyExists => {
+            validate_private_state_root(state_root, "")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_state_root(state_root: &Path, prefix: &str) -> Result<(), MxcError> {
+    let metadata = std::fs::symlink_metadata(state_root).map_err(|error| {
+        MxcError::backend_unavailable(format!(
+            "cannot inspect {prefix}persistent NVX lifecycle state root '{}': {error}",
+            state_root.display()
+        ))
+    })?;
+    if !metadata.is_dir() || is_reparse_point(&metadata) {
+        return Err(MxcError::backend_unavailable(format!(
+            "refusing {prefix}persistent NVX lifecycle state root '{}': expected a directory without a reparse point",
+            state_root.display()
+        )));
+    }
+    let secure = crate::mxc_common::filesystem_dacl::validate_owner_only_directory(state_root)
+        .map_err(|error| {
+            MxcError::backend_unavailable(format!(
+                "cannot validate {prefix}persistent NVX lifecycle state root '{}': {error}",
+                state_root.display()
+            ))
+        })?;
+    if !secure {
+        return Err(MxcError::backend_unavailable(format!(
+            "refusing {prefix}persistent NVX lifecycle state root '{}': owner or ACL is not private",
+            state_root.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+        != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 pub(super) fn sandbox_spec(image: &str) -> Result<SandboxSpec, MxcError> {
     crate::mxc_contract::dev::ImageReference::validate(image)
         .map_err(MxcError::malformed_request)?;
     Ok(SandboxSpec {
         image: Some(ImageSource::Reference(image.to_owned())),
+        ..Default::default()
     })
 }
 
@@ -198,6 +298,34 @@ fn discover_bundle_dir() -> Result<PathBuf, MxcError> {
             discovered.display()
         ))
     })
+}
+
+pub(super) fn bundle_available() -> bool {
+    discover_bundle_dir()
+        .and_then(|directory| load_bundle_library(&directory))
+        .is_ok()
+}
+
+fn load_bundle_library(directory: &Path) -> Result<&'static AgentLibrary, MxcError> {
+    if !directory.join("bundle-manifest.json").is_file() {
+        return Err(MxcError::backend_unavailable(format!(
+            "NVX signed bundled agent: missing bundle-manifest.json in {}",
+            directory.display()
+        )));
+    }
+    for (path, expected) in [
+        (SOURCE_MANIFEST, APPROVED_MANIFEST_SHA256),
+        (r"bin\direct-images.exe", APPROVED_IMAGE_TOOL_SHA256),
+        (r"bin\openvmm.exe", APPROVED_OPENVMM_SHA256),
+        (r"guest\vmlinux", APPROVED_KERNEL_SHA256),
+        (r"guest\initramfs-edge.cpio.gz", APPROVED_INITRD_SHA256),
+    ] {
+        super::abi::verify_file_digest(&directory.join(path), expected)?;
+    }
+    AgentLibrary::load_verified(
+        &directory.join(r"bin\aci_edge_agent.dll"),
+        APPROVED_DLL_SHA256,
+    )
 }
 
 fn discover_bundle_with(
@@ -434,6 +562,31 @@ impl SandboxClient for NvxClient {
             .map(|_| ())
     }
 
+    fn exec(&self, sandbox_id: &SandboxId, request: &ExecRequest) -> Result<Execution, MxcError> {
+        self.validate_exec(request)?;
+        let handle = self.library.exec(
+            self.host,
+            sandbox_id.token(),
+            &ExecInput {
+                request: request.clone(),
+                stdin: request.stdin,
+            },
+        )?;
+        super::execution::launch(self.library, handle, request)
+    }
+
+    fn provision_metadata(
+        &self,
+        input: &ProvisionInput,
+    ) -> Result<(SandboxId, Option<serde_json::Value>), MxcError> {
+        self.validate_provision(input)?;
+        let reply = self.library.provision(self.host, input)?;
+        Ok((
+            SandboxId::from_token(&reply.token)?,
+            reply.metadata.map(serde_json::Value::Object),
+        ))
+    }
+
     fn exec_and_wait(
         &self,
         sandbox_id: &SandboxId,
@@ -472,7 +625,8 @@ mod tests {
 
     use super::super::abi::{
         ErrorBody, ExecEvent, Exports, WireErrorCode, EVENT_EXIT, EVENT_STDERR, EVENT_STDOUT,
-        STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_INVALID_HANDLE, STATUS_OK, STATUS_TIMEOUT,
+        STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_INVALID_HANDLE, STATUS_OK, STATUS_PANIC,
+        STATUS_TIMEOUT,
     };
     use super::*;
 
@@ -520,6 +674,57 @@ mod tests {
     }
 
     #[test]
+    fn review_discovery_requires_approved_runtime_without_opening_host() {
+        let source = discover_bundle_dir().unwrap();
+        load_bundle_library(&source).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            "bundle-manifest.json",
+            SOURCE_MANIFEST,
+            r"bin\aci_edge_agent.dll",
+            r"bin\direct-images.exe",
+            r"bin\openvmm.exe",
+            r"guest\vmlinux",
+            r"guest\initramfs-edge.cpio.gz",
+        ];
+        for file in files {
+            let path = root.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::copy(source.join(file), path).unwrap();
+        }
+        for file in files {
+            let path = root.path().join(file);
+            fs::remove_file(&path).unwrap();
+            let error = load_bundle_library(root.path()).unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+            assert!(
+                error.message.contains(
+                    std::path::Path::new(file)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                ),
+                "{file}: {error}"
+            );
+            if file != "bundle-manifest.json" {
+                fs::write(&path, b"tampered runtime bytes").unwrap();
+                let error = load_bundle_library(root.path()).unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+                assert!(
+                    error.message.contains("approved SHA-256"),
+                    "{file}: {error}"
+                );
+            }
+            fs::copy(source.join(file), path).unwrap();
+        }
+        assert!(
+            !root.path().join("aci").exists(),
+            "read-only discovery opened native state"
+        );
+    }
+
+    #[test]
     fn sandbox_id_requires_32_lowercase_hex_digits() {
         let valid = SandboxId::from_token("0123456789abcdef0123456789abcdef").unwrap();
         assert_eq!(
@@ -546,6 +751,9 @@ mod tests {
         let result = (|| {
             let capabilities = client.capabilities()?;
             assert!(capabilities.spec.image_reference);
+            assert!(capabilities.spec.memory);
+            assert!(capabilities.exec.stdin);
+            assert!(capabilities.exec.cancel);
             assert!(capabilities.filesystem.readonly_paths);
             assert!(capabilities.filesystem.readwrite_paths);
             assert!(capabilities.filesystem.denied_paths);
@@ -553,6 +761,7 @@ mod tests {
             assert!(capabilities.network.network_proxy);
             let mut request = crate::mxc_common::models::ExecutionRequest {
                 microvm_image: Some("python:3.12-alpine".to_owned()),
+                microvm_memory_mib: Some(512),
                 script_code: "printf ok".to_owned(),
                 ..Default::default()
             };
@@ -560,14 +769,19 @@ mod tests {
             request.policy.network_egress = Some(Default::default());
             request.policy.network_ingress = Some(Default::default());
             let (provision, spec) =
-                super::super::policy::provision_request(&request, &capabilities)?;
+                super::super::policy::provision_request(&request, None, &capabilities)?;
             let mut input = ProvisionInput {
                 request: provision,
                 spec,
             };
             client.validate_provision(&input)?;
+            assert_eq!(
+                serde_json::to_value(&input).unwrap()["spec"]["resources"]["memoryMib"],
+                512
+            );
             client.validate_exec(&super::super::policy::exec_request(
                 &request,
+                false,
                 &capabilities,
             )?)?;
             input.request.runtime_config = Some(super::super::abi::RuntimeConfig {
@@ -584,6 +798,18 @@ mod tests {
         let close = client.close();
         result.unwrap();
         close.unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Windows x64, WHP and the signed agent bundle; does not provision a VM"]
+    fn signed_agent_probe_verifies_host_without_provisioning() {
+        let state = tempfile::tempdir().unwrap();
+        let mut client = create_client(state.path()).unwrap();
+        let probe = client.probe();
+        let closed = client.close();
+        probe.expect("signed NVX agent must confirm the host virtualization prerequisites");
+        closed.unwrap();
+        println!("HOST_VERIFIED signed NVX agent probe; no VM provisioned");
     }
 
     enum FakeStep {
@@ -604,6 +830,14 @@ mod tests {
         timeouts: Vec<i64>,
         validation_input: Option<serde_json::Value>,
         validation_error: Option<ErrorBody>,
+        input: Vec<u8>,
+        echo_input: bool,
+        blocked_input: bool,
+        input_closed: bool,
+        write_status: i32,
+        wait_for_input_failure: bool,
+        next_entered: bool,
+        write_failed: bool,
     }
 
     static FAKE_EXECS: OnceLock<Mutex<std::collections::BTreeMap<u64, FakeExecState>>> =
@@ -627,9 +861,305 @@ mod tests {
                     timeouts: Vec::new(),
                     validation_input: None,
                     validation_error: None,
+                    input: Vec::new(),
+                    echo_input: false,
+                    blocked_input: false,
+                    input_closed: false,
+                    write_status: STATUS_OK,
+                    wait_for_input_failure: false,
+                    next_entered: false,
+                    write_failed: false,
                 },
             );
         handle
+    }
+
+    fn outcome_step(outcome: ExecOutcome) -> FakeStep {
+        FakeStep::Event {
+            kind: EVENT_EXIT,
+            bytes: Some(serde_json::to_vec(&ExecEnd::Outcome(outcome)).unwrap()),
+            reported_len: None,
+        }
+    }
+
+    fn test_id() -> SandboxId {
+        SandboxId::from_token("0123456789abcdef0123456789abcdef").unwrap()
+    }
+
+    #[test]
+    fn native_streaming_roundtrips_binary_stdin_and_releases_after_eof() {
+        use std::io::{Read, Write};
+        let handle = register_fake_exec(Vec::new());
+        FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&handle)
+            .unwrap()
+            .echo_input = true;
+        let client = NvxClient::from_library(fake_library(), handle);
+        let mut request = ExecRequest::command_line("cat");
+        request.stdin = true;
+        let mut execution = client.exec(&test_id(), &request).unwrap();
+        let mut input = execution.take_stdin().unwrap();
+        let mut output = execution.take_stdout().unwrap();
+        let mut errors = execution.take_stderr().unwrap();
+        let output = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let errors = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            errors.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let payload = (0..2 * 1024 * 1024)
+            .map(|n| (n % 256) as u8)
+            .collect::<Vec<_>>();
+        input.write_all(&payload).unwrap();
+        drop(input);
+        assert_eq!(execution.wait().unwrap(), ExecOutcome::Exited(7));
+        assert_eq!(output.join().unwrap(), payload);
+        assert_eq!(errors.join().unwrap(), [0xff, 0x00, 0xfe]);
+        assert_eq!(fake_calls(handle), ["validate", "close_input", "release"]);
+    }
+
+    #[test]
+    fn native_streaming_deadline_interrupts_backpressured_output_and_releases_once() {
+        let handle = register_fake_exec(vec![
+            FakeStep::Event {
+                kind: EVENT_STDOUT,
+                bytes: Some(vec![b'x'; 1024 * 1024]),
+                reported_len: None,
+            },
+            outcome_step(ExecOutcome::Exited(0)),
+        ]);
+        let client = NvxClient::from_library(fake_library(), handle);
+        let execution = client
+            .exec(
+                &test_id(),
+                &ExecRequest::command_line("output").with_timeout_ms(25),
+            )
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(execution.wait().unwrap(), ExecOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn native_streaming_cancel_unblocks_input_credit_before_release() {
+        use std::io::Write;
+        let handle = register_fake_exec(Vec::new());
+        FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&handle)
+            .unwrap()
+            .blocked_input = true;
+        let client = NvxClient::from_library(fake_library(), handle);
+        let mut request = ExecRequest::command_line("sleep");
+        request.stdin = true;
+        let mut execution = client.exec(&test_id(), &request).unwrap();
+        let mut input = execution.take_stdin().unwrap();
+        input.write_all(b"input waiting for native credit").unwrap();
+        execution.canceller().cancel().unwrap();
+        assert_eq!(execution.wait().unwrap(), ExecOutcome::Cancelled);
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn native_streaming_protocol_failure_cancels_and_preserves_release_failure() {
+        let handle = register_fake_exec(vec![FakeStep::Status(STATUS_INVALID_ARGUMENT)]);
+        FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&handle)
+            .unwrap()
+            .release_status = STATUS_INVALID_HANDLE;
+        let client = NvxClient::from_library(fake_library(), handle);
+        let execution = client
+            .exec(&test_id(), &ExecRequest::command_line("invalid"))
+            .unwrap();
+        let error = execution.wait().unwrap_err();
+        assert!(error.message.contains("rejected an argument"), "{error}");
+        assert!(error.message.contains("cleanup failure"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn review_cancel_refusal_interrupts_blocked_output_and_completes() {
+        use std::io::Read;
+        for kind in [EVENT_STDOUT, EVENT_STDERR] {
+            let handle = register_fake_exec(vec![FakeStep::Event {
+                kind,
+                bytes: Some(vec![b'x'; 1024 * 1024]),
+                reported_len: None,
+            }]);
+            FAKE_EXECS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_mut(&handle)
+                .unwrap()
+                .cancel_status = STATUS_PANIC;
+            let client = NvxClient::from_library(fake_library(), handle);
+            let mut execution = client
+                .exec(
+                    &test_id(),
+                    &ExecRequest::command_line("output").with_timeout_ms(25),
+                )
+                .unwrap();
+            let mut output = if kind == EVENT_STDOUT {
+                execution.take_stdout().unwrap()
+            } else {
+                execution.take_stderr().unwrap()
+            };
+            let canceller = execution.canceller();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || tx.send(execution.wait()).unwrap());
+            let completed = rx.recv_timeout(Duration::from_secs(2));
+            let was_finite = completed.is_ok();
+            // Rescue the old blocked-writer path before asserting so the regression leaves no worker.
+            if !was_finite {
+                FAKE_EXECS
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&handle)
+                    .unwrap()
+                    .steps
+                    .push_back(outcome_step(ExecOutcome::Exited(0)));
+            }
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).unwrap();
+            let result =
+                completed.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            waiter.join().unwrap();
+            assert!(
+                was_finite,
+                "rejected cancellation left output or owned teardown blocked"
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::BackendError);
+            assert!(error.message.contains("agent library panicked"), "{error}");
+            let calls = fake_calls(handle);
+            assert_eq!(
+                canceller.cancel().unwrap_err(),
+                error,
+                "release must not turn a refused cancellation into success"
+            );
+            assert_eq!(
+                fake_calls(handle),
+                calls,
+                "a retained canceller used a released native handle"
+            );
+            assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+        }
+    }
+
+    #[test]
+    fn review_protocol_error_preserves_refused_cancellation() {
+        let handle = register_fake_exec(vec![FakeStep::Status(STATUS_INVALID_ARGUMENT)]);
+        FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&handle)
+            .unwrap()
+            .cancel_status = STATUS_PANIC;
+        let client = NvxClient::from_library(fake_library(), handle);
+        let error = client
+            .exec(&test_id(), &ExecRequest::command_line("invalid"))
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert!(error.message.contains("rejected an argument"), "{error}");
+        assert!(error.message.contains("cleanup failure"), "{error}");
+        assert!(error.message.contains("agent library panicked"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn review_protocol_stdin_and_cancel_errors_are_combined() {
+        use std::io::Write;
+        let handle = register_fake_exec(vec![FakeStep::Status(STATUS_INVALID_ARGUMENT)]);
+        {
+            let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+            let state = map.get_mut(&handle).unwrap();
+            state.cancel_status = STATUS_PANIC;
+            state.write_status = STATUS_ERROR;
+            state.wait_for_input_failure = true;
+        }
+        let client = NvxClient::from_library(fake_library(), handle);
+        let mut request = ExecRequest::command_line("input");
+        request.stdin = true;
+        let mut execution = client.exec(&test_id(), &request).unwrap();
+        let mut stdin = execution.take_stdin().unwrap();
+        stdin.write_all(b"rejected input").unwrap();
+        let error = execution.wait().unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert!(error.message.contains("rejected an argument"), "{error}");
+        assert!(error.message.contains("injected stdin failure"), "{error}");
+        assert!(error.message.contains("agent library panicked"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn review_stdin_failure_and_refused_cancel_complete_without_an_exit_event() {
+        use std::io::Write;
+        let handle = register_fake_exec(Vec::new());
+        {
+            let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+            let state = map.get_mut(&handle).unwrap();
+            state.write_status = STATUS_ERROR;
+            state.cancel_status = STATUS_PANIC;
+        }
+        let client = NvxClient::from_library(fake_library(), handle);
+        let mut request = ExecRequest::command_line("input");
+        request.stdin = true;
+        let mut execution = client.exec(&test_id(), &request).unwrap();
+        execution
+            .take_stdin()
+            .unwrap()
+            .write_all(b"failed input")
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || tx.send(execution.wait()).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        let finite = result.is_ok();
+        if !finite {
+            FAKE_EXECS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_mut(&handle)
+                .unwrap()
+                .steps
+                .push_back(outcome_step(ExecOutcome::Exited(0)));
+        }
+        let result = result.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+        assert!(
+            finite,
+            "stdin failure depended on an unconfirmed native exit"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert!(error.message.contains("injected stdin failure"), "{error}");
+        assert!(error.message.contains("agent library panicked"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
     }
 
     fn fake_calls(handle: u64) -> Vec<&'static str> {
@@ -716,6 +1246,9 @@ mod tests {
             .get_mut(&handle)
         {
             state.calls.push("cancel");
+            if state.cancel_status == STATUS_OK && state.steps.is_empty() {
+                state.steps.push_back(outcome_step(ExecOutcome::Cancelled));
+            }
             return state.cancel_status;
         }
         STATUS_OK
@@ -786,6 +1319,18 @@ mod tests {
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let Some(state) = map.get_mut(&handle) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            state.next_entered = true;
+            if !state.wait_for_input_failure || state.write_failed {
+                break;
+            }
+            drop(map);
+            std::thread::yield_now();
+            map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        }
         let Some(state) = map.get_mut(&handle) else {
             return STATUS_INVALID_HANDLE;
         };
@@ -827,15 +1372,79 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_exec_write(
-        _handle: u64,
-        _ptr: *const u8,
-        _len: usize,
+        handle: u64,
+        input: *const u8,
+        len: usize,
         _timeout: i64,
-        _written: *mut usize,
-        _out: *mut *mut u8,
-        _out_len: *mut usize,
+        written: *mut usize,
+        out: *mut *mut u8,
+        out_len: *mut usize,
     ) -> i32 {
-        STATUS_INVALID_HANDLE
+        let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        loop {
+            let Some(state) = map.get_mut(&handle) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            if !state.wait_for_input_failure || state.next_entered {
+                break;
+            }
+            drop(map);
+            std::thread::yield_now();
+            map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        }
+        let Some(state) = map.get_mut(&handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if state.blocked_input {
+            return STATUS_TIMEOUT;
+        }
+        if state.write_status != STATUS_OK {
+            state.write_failed = true;
+            if state.write_status == STATUS_ERROR {
+                alloc_buf(
+                    &serde_json::to_vec(&ErrorBody {
+                        code: WireErrorCode::BackendError,
+                        message: "injected stdin failure".to_owned(),
+                    })
+                    .unwrap(),
+                    out,
+                    out_len,
+                );
+            }
+            return state.write_status;
+        }
+        let accepted = len.min(32 * 1024);
+        state
+            .input
+            .extend_from_slice(unsafe { std::slice::from_raw_parts(input, accepted) });
+        unsafe { *written = accepted };
+        STATUS_OK
+    }
+
+    unsafe extern "C" fn fake_close_input(handle: u64, _: *mut *mut u8, _: *mut usize) -> i32 {
+        let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        let Some(state) = map.get_mut(&handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        state.calls.push("close_input");
+        if state.input_closed {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        state.input_closed = true;
+        if state.echo_input {
+            state.steps.push_back(FakeStep::Event {
+                kind: EVENT_STDOUT,
+                bytes: Some(state.input.clone()),
+                reported_len: None,
+            });
+            state.steps.push_back(FakeStep::Event {
+                kind: EVENT_STDERR,
+                bytes: Some(vec![0xff, 0x00, 0xfe]),
+                reported_len: None,
+            });
+            state.steps.push_back(outcome_step(ExecOutcome::Exited(7)));
+        }
+        STATUS_OK
     }
 
     fn fake_library() -> &'static AgentLibrary {
@@ -858,7 +1467,7 @@ mod tests {
                 exec: fake_exec,
                 exec_next: fake_exec_next,
                 exec_write: fake_exec_write,
-                exec_close_input: fake_query_invalid,
+                exec_close_input: fake_close_input,
                 exec_cancel: fake_query_cancel,
                 exec_release: fake_release,
                 image_register: fake_call_invalid,
@@ -1211,5 +1820,96 @@ mod tests {
         };
         let bad_host = lib.host_open(&bad_setup).unwrap_err();
         assert_eq!(bad_host.code, MxcErrorCode::BackendUnavailable);
+    }
+}
+
+#[cfg(test)]
+mod persistent_state_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn persistent_state_admission_creates_private_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("nvx");
+
+        admit_persistent_state_root(&root).unwrap();
+
+        assert!(crate::mxc_common::filesystem_dacl::validate_owner_only_directory(&root).unwrap());
+    }
+
+    #[test]
+    fn persistent_state_admission_rejects_permissive_existing_root_without_repair() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("nvx");
+        std::fs::create_dir(&root).unwrap();
+        assert!(
+            !crate::mxc_common::filesystem_dacl::validate_owner_only_directory(&root).unwrap(),
+            "test root unexpectedly inherited the exact private MXC DACL"
+        );
+
+        let error = admit_persistent_state_root(&root).unwrap_err();
+
+        assert!(error.message.contains("owner or ACL is not private"));
+        assert!(
+            !crate::mxc_common::filesystem_dacl::validate_owner_only_directory(&root).unwrap(),
+            "admission must not repair an existing permissive root"
+        );
+    }
+
+    #[test]
+    fn persistent_state_admission_rejects_junction() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        let root = parent.path().join("nvx");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                root.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mklink /J failed ({status}); junction creation needs no elevation"
+        );
+
+        let error = admit_persistent_state_root(&root).unwrap_err();
+
+        assert!(error.message.contains("without a reparse point"));
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn persistent_state_admission_is_race_safe_for_concurrent_initialization() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = Arc::new(parent.path().join("nvx"));
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut joins = Vec::with_capacity(workers);
+
+        for _ in 0..workers {
+            let root = Arc::clone(&root);
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                admit_persistent_state_root(root.as_path())
+            }));
+        }
+
+        for join in joins {
+            join.join()
+                .expect("worker thread panicked")
+                .expect("concurrent admission call failed");
+        }
+
+        assert!(
+            crate::mxc_common::filesystem_dacl::validate_owner_only_directory(root.as_path())
+                .expect("validate final root ACL")
+        );
     }
 }

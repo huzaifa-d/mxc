@@ -62,33 +62,6 @@ fn microvm_experimental_typed_run_rejects_blank_image_before_runtime() {
     assert!(error.message.contains("microvm.image"), "{error}");
 }
 
-#[test]
-fn declared_microvm_streaming_and_lifecycle_fail_closed() {
-    let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
-    request.containment = mxc_sdk::v1::Containment::MicroVm {
-        image: "python:3.12-alpine".to_owned(),
-        memory_mib: None,
-    };
-    let error = mxc_sdk::v1::experimental::spawn(request, Default::default())
-        .err()
-        .expect("MicroVM streaming is not implemented");
-    assert_eq!(error.code, ErrorCode::UnsupportedContainment, "{error}");
-    assert!(error.message.contains("streaming"), "{error}");
-
-    for validate in [false, true] {
-        let request = mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", None);
-        let error = if validate {
-            mxc_sdk::v1::experimental::container::validate_provision(request, Default::default())
-                .unwrap_err()
-        } else {
-            mxc_sdk::v1::experimental::container::provision_container(request, Default::default())
-                .unwrap_err()
-        };
-        assert_eq!(error.code, ErrorCode::UnsupportedPhase, "{error}");
-        assert!(error.message.contains("lifecycle"), "{error}");
-    }
-}
-
 #[cfg(not(all(windows, target_arch = "x86_64", feature = "microvm")))]
 #[test]
 fn unsupported_platform_or_feature_is_fail_closed() {
@@ -132,13 +105,6 @@ mod windows_x64 {
         vec![
             ("ui", json!({"ui": {"disable": true}})),
             (
-                "memory-override",
-                json!({"microvm": {
-                    "image": "python:3.12-alpine",
-                    "provision": {"memoryMib": 512}
-                }}),
-            ),
-            (
                 "capture",
                 json!({"processContainer": {"captureDenials": {}}}),
             ),
@@ -164,6 +130,22 @@ mod windows_x64 {
             ("preserve", json!({"lifecycle": {"preservePolicy": true}})),
             ("timeout-limit", json!({"process": {"timeout": 3_600_001}})),
             ("parent-cwd", json!({"process": {"cwd": "/tmp/../escape"}})),
+            (
+                "parent-cwd-unc-share",
+                json!({"process": {"cwd": "//tmp/../escape"}}),
+            ),
+            (
+                "parent-cwd-unc-end",
+                json!({"process": {"cwd": "//tmp/.."}}),
+            ),
+            (
+                "parent-cwd-unc-server",
+                json!({"process": {"cwd": "//../tmp"}}),
+            ),
+            (
+                "parent-cwd-triple-slash",
+                json!({"process": {"cwd": "///tmp/../escape"}}),
+            ),
             ("relative-cwd", json!({"process": {"cwd": "relative"}})),
             (
                 "cwd-limit",
@@ -217,6 +199,39 @@ mod windows_x64 {
     fn valid_process_boundaries() -> Vec<(&'static str, Value)> {
         vec![
             (
+                "memory-override",
+                json!({"microvm": {"image": "python:3.12-alpine", "provision": {"memoryMib":512}}}),
+            ),
+            (
+                "safe-cwd-double-slash",
+                json!({"process": {"cwd": "//tmp/work"}}),
+            ),
+            (
+                "readonly",
+                json!({"filesystem": {"readonlyPaths": ["C:\\work"]}}),
+            ),
+            (
+                "readwrite",
+                json!({"filesystem": {"readwritePaths": ["C:\\work"]}}),
+            ),
+            (
+                "denied",
+                json!({"filesystem": {"deniedPaths": ["C:\\work"]}}),
+            ),
+            ("network-empty", json!({"network": {}})),
+            (
+                "network-deny",
+                json!({"network": {"egress": {"default": "deny"}}}),
+            ),
+            (
+                "network-allow",
+                json!({"network": {"egress": {"default": "allow"}}}),
+            ),
+            (
+                "proxy",
+                json!({"runtimeConfig": {"networkProxy": "http://127.0.0.1:8080"}}),
+            ),
+            (
                 "cwd-boundary",
                 json!({"process": {"cwd": format!("/{}", "x".repeat(4094))}}),
             ),
@@ -241,7 +256,6 @@ mod windows_x64 {
 
     fn process_limit_error(label: &str) -> Option<&'static str> {
         match label {
-            "memory-override" => Some("NVX guest memory overrides are not available in this build"),
             "cwd-limit" | "cwd-multibyte-limit" => {
                 Some("NVX process.cwd must not exceed 4095 UTF-8 bytes")
             }
@@ -264,6 +278,7 @@ mod windows_x64 {
                 ])
                 .env("MXC_NVX_MATRIX_CHILD", "1")
                 .env(BUNDLE_ENV, directory.path().join("absent"))
+                .env("LOCALAPPDATA", directory.path().join("local"))
                 .output()
                 .expect("host-only matrix child");
             assert!(
@@ -314,17 +329,102 @@ mod windows_x64 {
             );
         }
 
-        let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
-        request.containment = mxc_sdk::v1::Containment::MicroVm {
-            image: "python:3.12-alpine".to_owned(),
-            memory_mib: Some(512),
-        };
-        let error = mxc_sdk::v1::experimental::run(request, Default::default()).unwrap_err();
-        assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
-        assert_eq!(
-            error.message,
-            "NVX guest memory overrides are not available in this build"
-        );
+        for provision in [None, Some(json!({})), Some(json!({"memoryMib":512}))] {
+            for lifecycle in [false, true] {
+                let mut request = process_only_request("printf forbidden");
+                if let Some(provision) = &provision {
+                    request["microvm"]["provision"] = provision.clone();
+                }
+                if lifecycle {
+                    request.as_object_mut().unwrap().remove("process");
+                    request["phase"] = json!("provision");
+                }
+                let error = if lifecycle {
+                    mxc_sdk::__ffi::run_lifecycle_json(&request.to_string(), false, true)
+                        .unwrap_err()
+                } else {
+                    mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err()
+                };
+                assert_eq!(
+                    error.code,
+                    ErrorCode::BackendUnavailable,
+                    "{request}: {error}"
+                );
+                assert!(error.message.contains("NVX"));
+            }
+        }
+        for invalid in [json!(0), json!(null), json!(-1), json!("512"), json!(true)] {
+            for lifecycle in [false, true] {
+                let mut request = process_only_request("printf forbidden");
+                request["microvm"]["provision"] = json!({"memoryMib":invalid});
+                if lifecycle {
+                    request.as_object_mut().unwrap().remove("process");
+                    request["phase"] = json!("provision");
+                }
+                let error = if lifecycle {
+                    mxc_sdk::__ffi::run_lifecycle_json(&request.to_string(), false, true)
+                        .unwrap_err()
+                } else {
+                    mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err()
+                };
+                assert_eq!(
+                    error.code,
+                    ErrorCode::MalformedRequest,
+                    "{request}: {error}"
+                );
+                assert!(error.message.contains("memoryMib"), "{error}");
+            }
+        }
+        for lifecycle in [false, true] {
+            let mut request = process_only_request("printf forbidden");
+            request["microvm"]["provision"] = json!(null);
+            if lifecycle {
+                request.as_object_mut().unwrap().remove("process");
+                request["phase"] = json!("provision");
+            }
+            let error = if lifecycle {
+                mxc_sdk::__ffi::run_lifecycle_json(&request.to_string(), false, true).unwrap_err()
+            } else {
+                mxc_sdk::__ffi::run_json(&request.to_string(), true).unwrap_err()
+            };
+            assert_eq!(error.code, ErrorCode::MalformedRequest);
+        }
+        for memory_mib in [None, Some(512), Some(0)] {
+            for operation in ["run", "spawn", "provision", "validate_provision"] {
+                let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+                request.containment = mxc_sdk::v1::Containment::MicroVm {
+                    image: "python:3.12-alpine".to_owned(),
+                    memory_mib,
+                };
+                let error = match operation {
+                    "run" => {
+                        mxc_sdk::v1::experimental::run(request, Default::default()).unwrap_err()
+                    }
+                    "spawn" => mxc_sdk::v1::experimental::spawn(request, Default::default())
+                        .err()
+                        .unwrap(),
+                    "provision" => mxc_sdk::v1::experimental::container::provision_container(
+                        mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", memory_mib),
+                        Default::default(),
+                    )
+                    .unwrap_err(),
+                    _ => mxc_sdk::v1::experimental::container::validate_provision(
+                        mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", memory_mib),
+                        Default::default(),
+                    )
+                    .unwrap_err(),
+                };
+                assert_eq!(
+                    error.code,
+                    if memory_mib == Some(0) {
+                        ErrorCode::MalformedRequest
+                    } else {
+                        ErrorCode::BackendUnavailable
+                    },
+                    "{operation}: {error}"
+                );
+            }
+        }
 
         for (label, patch) in valid_process_boundaries() {
             let error =
@@ -357,13 +457,14 @@ mod windows_x64 {
 
         let streaming = mxc_sdk::__ffi::spawn_container_json(&request, true)
             .err()
-            .expect("P1 must reject streaming");
-        assert_eq!(streaming.code, ErrorCode::UnsupportedContainment);
+            .expect("missing bundle must prevent streaming");
+        assert_eq!(streaming.code, ErrorCode::BackendUnavailable);
         let pty =
             mxc_sdk::__ffi::spawn_with_pty_json(&request, true, Default::default()).unwrap_err();
         assert_eq!(pty.code, ErrorCode::UnsupportedContainment);
         let lifecycle = json!({
-            "version": "1.1.0-alpha", "phase": "provision", "containment": "microvm"
+            "version": "1.1.0-alpha", "phase": "provision", "containment": "microvm",
+            "microvm": {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"}
         });
         assert!(mxc_sdk::__ffi::run_lifecycle_json(&lifecycle.to_string(), false, true).is_err());
     }
