@@ -241,9 +241,7 @@ mod windows_x64 {
 
     fn process_limit_error(label: &str) -> Option<&'static str> {
         match label {
-            "memory-override" => {
-                Some("NVX guest memory overrides are not available in this build")
-            }
+            "memory-override" => Some("NVX guest memory overrides are not available in this build"),
             "cwd-limit" | "cwd-multibyte-limit" => {
                 Some("NVX process.cwd must not exceed 4095 UTF-8 bytes")
             }
