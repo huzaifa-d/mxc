@@ -219,6 +219,14 @@ pub(super) struct DeprovisionResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SandboxDiagnostics {
+    pub vmm_log: PathBuf,
+    pub console_log: PathBuf,
+    pub outcome_report: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ExecInput {
     pub request: ExecRequest,
     #[serde(default)]
@@ -569,13 +577,24 @@ impl AgentLibrary {
         }
     }
 
-    fn take_buffer(&self, buffer: *mut u8, length: usize) -> Result<Option<Vec<u8>>, MxcError> {
+    fn take_buffer(
+        &self,
+        buffer: *mut u8,
+        length: usize,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<u8>>, MxcError> {
         if buffer.is_null() {
             if length == 0 {
                 return Ok(None);
             }
             return Err(MxcError::backend_error(
                 "NVX signed bundled agent: the agent library returned a null buffer with a non-zero length",
+            ));
+        }
+        if limit.is_some_and(|limit| length > limit) {
+            unsafe { (self.exports.buffer_free)(buffer, length) };
+            return Err(MxcError::backend_error(
+                "NVX signed bundled agent: diagnostics response exceeds the 65536-byte limit",
             ));
         }
         let bytes = if length == 0 {
@@ -592,10 +611,18 @@ impl AgentLibrary {
         &self,
         invoke: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
     ) -> Result<Option<Vec<u8>>, MxcError> {
+        self.call_with_limit(invoke, None)
+    }
+
+    fn call_with_limit(
+        &self,
+        invoke: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<u8>>, MxcError> {
         let mut buffer = ptr::null_mut();
         let mut length = 0;
         let status = invoke(&mut buffer, &mut length);
-        let bytes = self.take_buffer(buffer, length)?;
+        let bytes = self.take_buffer(buffer, length, limit)?;
         match status {
             STATUS_OK => Ok(bytes),
             STATUS_ERROR => Err(error_from_body(bytes.as_deref())),
@@ -695,6 +722,18 @@ impl AgentLibrary {
         decode_json(
             self.with_input(self.exports.deprovision, host, token.as_bytes())?,
             "deprovision result",
+        )
+    }
+
+    pub fn diagnostics(&self, host: u64, token: &str) -> Result<SandboxDiagnostics, MxcError> {
+        decode_json(
+            self.call_with_limit(
+                |out, length| unsafe {
+                    (self.exports.diagnostics)(host, token.as_ptr(), token.len(), out, length)
+                },
+                Some(64 * 1024),
+            )?,
+            "diagnostics",
         )
     }
 

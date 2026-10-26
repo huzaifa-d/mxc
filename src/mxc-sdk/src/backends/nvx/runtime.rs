@@ -4,16 +4,18 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::mxc_common::logger::Logger;
 use crate::mxc_common::mxc_error::MxcError;
+use crate::mxc_common::script_runner::RunCancellation;
 
 use super::abi::{
     map_error_body, AgentLibrary, BundleSource, Event, ExecEnd, ExecInput, ExecOutcome,
     ExecRequest, HostInfo, ImageSource, ProvisionInput, ProvisionRequest, RuntimeSource,
-    SandboxSpec, SetupConfig,
+    SandboxDiagnostics, SandboxSpec, SetupConfig,
 };
 
 pub(super) const ARTIFACTS_DIR_ENV: &str = "ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR";
@@ -34,6 +36,8 @@ pub(super) const APPROVED_INITRD_SHA256: &str =
 const DEFAULT_IMAGE_REFERENCE: &str = "mcr.microsoft.com/azurelinux/base/core:3.0";
 const HOST_TIMEOUT_SLACK_MS: u64 = 30_000;
 const CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const STARTUP_LOG_LIMIT: usize = 8 * 1024;
+const CANCELLATION_POLL_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SandboxId {
@@ -82,14 +86,55 @@ pub(super) trait SandboxClient {
     fn probe(&self) -> Result<(), MxcError>;
     fn provision(&self) -> Result<SandboxId, MxcError>;
     fn start(&self, sandbox_id: &SandboxId) -> Result<(), MxcError>;
+    fn diagnostics(&self, sandbox_id: &SandboxId) -> Result<SandboxDiagnostics, MxcError>;
     fn exec_and_wait(
         &self,
         sandbox_id: &SandboxId,
         request: &ExecRequest,
+        cancellation: Option<&RunCancellation>,
+        logger: &mut Logger,
     ) -> Result<ExecOutput, MxcError>;
     fn stop(&self, sandbox_id: &SandboxId) -> Result<(), MxcError>;
     fn deprovision(&self, sandbox_id: &SandboxId) -> Result<(), MxcError>;
     fn close(&mut self) -> Result<(), MxcError>;
+}
+
+pub(super) fn startup_diagnostics(diagnostics: &SandboxDiagnostics) -> String {
+    let mut excerpt = String::new();
+    for (name, path) in [
+        ("vmm_log", &diagnostics.vmm_log),
+        ("console_log", &diagnostics.console_log),
+        ("outcome_report", &diagnostics.outcome_report),
+    ] {
+        excerpt.push_str(&format!("; {name}: "));
+        match read_startup_log(path) {
+            Ok((bytes, truncated)) => {
+                if truncated {
+                    excerpt.push_str("[truncated] ");
+                }
+                if bytes.is_empty() {
+                    excerpt.push_str("[empty]");
+                } else {
+                    excerpt.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+            Err(error) => excerpt.push_str(&format!("unavailable ({}): {error}", path.display())),
+        }
+    }
+    excerpt
+}
+
+fn read_startup_log(path: &Path) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(STARTUP_LOG_LIMIT as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(STARTUP_LOG_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let truncated = start != 0 || bytes.len() > STARTUP_LOG_LIMIT;
+    bytes.truncate(STARTUP_LOG_LIMIT);
+    Ok((bytes, truncated))
 }
 
 #[derive(Debug)]
@@ -316,7 +361,12 @@ impl NvxClient {
         sandbox_id: &SandboxId,
         request: &ExecRequest,
         capture_limit: usize,
+        cancellation: Option<&RunCancellation>,
+        logger: &mut Logger,
     ) -> Result<ExecOutput, MxcError> {
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
         let exec_handle = self.library.exec(
             self.host,
             sandbox_id.token(),
@@ -326,6 +376,7 @@ impl NvxClient {
             },
         )?;
         let mut guard = ExecGuard::new(self.library, exec_handle);
+        logger.log_diagnostic_line("NVX execution started");
         let deadline = request
             .process
             .timeout
@@ -339,11 +390,29 @@ impl NvxClient {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         loop {
+            if let Some(cancellation) = cancellation {
+                if let Err(mut error) = cancellation.check() {
+                    if let Err(cleanup_error) = guard.cancel_and_release() {
+                        append_cleanup_error(&mut error, cleanup_error);
+                    }
+                    return Err(error);
+                }
+            }
+            let remaining = remaining_timeout_ms(deadline);
+            let wait_ms = if cancellation.is_some() {
+                Some(
+                    remaining
+                        .unwrap_or(CANCELLATION_POLL_MS)
+                        .min(CANCELLATION_POLL_MS),
+                )
+            } else {
+                remaining
+            };
             let step =
                 self.library
                     .exec_next(
                         exec_handle,
-                        remaining_timeout_ms(deadline),
+                        wait_ms,
                         |event| {
                             let captured = stdout.len() + stderr.len();
                             let (buffer, bytes) = match event {
@@ -387,6 +456,10 @@ impl NvxClient {
                     return Err(error);
                 }
                 Ok(None) => {
+                    // A short cancellation poll is not a workload timeout.
+                    if cancellation.is_some() && remaining_timeout_ms(deadline) != Some(0) {
+                        continue;
+                    }
                     guard.cancel_and_release()?;
                     return Ok(ExecOutput {
                         outcome: ExecOutcome::TimedOut,
@@ -431,12 +504,24 @@ impl SandboxClient for NvxClient {
             .map(|_| ())
     }
 
+    fn diagnostics(&self, sandbox_id: &SandboxId) -> Result<SandboxDiagnostics, MxcError> {
+        self.library.diagnostics(self.host, sandbox_id.token())
+    }
+
     fn exec_and_wait(
         &self,
         sandbox_id: &SandboxId,
         request: &ExecRequest,
+        cancellation: Option<&RunCancellation>,
+        logger: &mut Logger,
     ) -> Result<ExecOutput, MxcError> {
-        self.exec_and_wait_with_capture_limit(sandbox_id, request, CAPTURE_LIMIT_BYTES)
+        self.exec_and_wait_with_capture_limit(
+            sandbox_id,
+            request,
+            CAPTURE_LIMIT_BYTES,
+            cancellation,
+            logger,
+        )
     }
 
     fn stop(&self, sandbox_id: &SandboxId) -> Result<(), MxcError> {
@@ -465,6 +550,7 @@ mod tests {
     use std::ptr;
     use std::sync::{Mutex, OnceLock, PoisonError};
 
+    use crate::mxc_common::logger::Mode;
     use crate::mxc_common::mxc_error::MxcErrorCode;
 
     use super::super::abi::{
@@ -537,6 +623,7 @@ mod tests {
     }
 
     enum FakeStep {
+        Cancel(RunCancellation),
         Event {
             kind: u32,
             bytes: Option<Vec<u8>>,
@@ -554,6 +641,10 @@ mod tests {
         timeouts: Vec<i64>,
         validation_input: Option<serde_json::Value>,
         validation_error: Option<ErrorBody>,
+        diagnostics_reply: Option<Vec<u8>>,
+        cancel_on_exec: Option<RunCancellation>,
+        cancel_on_exit: Option<RunCancellation>,
+        exec_started: bool,
     }
 
     static FAKE_EXECS: OnceLock<Mutex<std::collections::BTreeMap<u64, FakeExecState>>> =
@@ -577,6 +668,10 @@ mod tests {
                     timeouts: Vec::new(),
                     validation_input: None,
                     validation_error: None,
+                    diagnostics_reply: None,
+                    cancel_on_exec: None,
+                    cancel_on_exit: None,
+                    exec_started: false,
                 },
             );
         handle
@@ -602,10 +697,39 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_buffer_free(ptr: *mut u8, len: usize) {
+        FREED_BUFFERS.with(|count| count.set(count.get() + 1));
         if !ptr.is_null() {
             unsafe {
                 drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
             }
+        }
+    }
+
+    thread_local! {
+        static FREED_BUFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn fake_diagnostics(
+        host: u64,
+        _input: *const u8,
+        _input_len: usize,
+        out: *mut *mut u8,
+        len: *mut usize,
+    ) -> i32 {
+        let map = FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match map
+            .get(&host)
+            .and_then(|state| state.diagnostics_reply.as_ref())
+        {
+            Some(bytes) => {
+                alloc_buf(bytes, out, len);
+                STATUS_OK
+            }
+            None => STATUS_INVALID_HANDLE,
         }
     }
 
@@ -727,6 +851,17 @@ mod tests {
         _out: *mut *mut u8,
         _len: *mut usize,
     ) -> i32 {
+        let mut map = FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(state) = map.get_mut(&host) {
+            state.exec_started = true;
+            if let Some(cancellation) = &state.cancel_on_exec {
+                cancellation.request();
+            }
+        }
         unsafe { *exec_out = host };
         STATUS_OK
     }
@@ -741,11 +876,20 @@ mod tests {
         };
         state.timeouts.push(timeout);
         match state.steps.pop_front() {
+            Some(FakeStep::Cancel(cancellation)) => {
+                cancellation.request();
+                STATUS_TIMEOUT
+            }
             Some(FakeStep::Event {
                 kind,
                 bytes: Some(bytes),
                 reported_len,
             }) => {
+                if kind == EVENT_EXIT {
+                    if let Some(cancellation) = &state.cancel_on_exit {
+                        cancellation.request();
+                    }
+                }
                 state.last_buf = bytes;
                 let length = reported_len.unwrap_or(state.last_buf.len());
                 unsafe {
@@ -803,7 +947,7 @@ mod tests {
                 start: fake_call_invalid,
                 stop: fake_call_invalid,
                 deprovision: fake_call_invalid,
-                diagnostics: fake_call_invalid,
+                diagnostics: fake_diagnostics,
                 guest_logs: fake_call_invalid,
                 exec: fake_exec,
                 exec_next: fake_exec_next,
@@ -818,6 +962,90 @@ mod tests {
                 buffer_free: fake_buffer_free,
             })
         })
+    }
+
+    #[test]
+    fn diagnostics_response_is_bounded_decoded_and_freed_even_when_rejected() {
+        for bytes in [
+            br#"{"vmmLog":"vmm","consoleLog":"console","outcomeReport":"outcome"}"#.to_vec(),
+            b"malformed".to_vec(),
+            vec![b'x'; 64 * 1024 + 1],
+        ] {
+            let handle = register_fake_exec(Vec::new());
+            FAKE_EXECS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_mut(&handle)
+                .unwrap()
+                .diagnostics_reply = Some(bytes.clone());
+            let before = FREED_BUFFERS.with(std::cell::Cell::get);
+            let result = fake_library().diagnostics(handle, "0123456789abcdef0123456789abcdef");
+            assert_eq!(FREED_BUFFERS.with(std::cell::Cell::get), before + 1);
+            if bytes.len() > 64 * 1024 {
+                assert!(result.unwrap_err().message.contains("65536-byte limit"));
+            } else if bytes == b"malformed" {
+                assert_eq!(result.unwrap_err().code, MxcErrorCode::BackendError);
+            } else {
+                assert_eq!(result.unwrap().vmm_log, PathBuf::from("vmm"));
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_wakes_silent_native_wait_without_becoming_timeout_and_releases_once() {
+        for timeout in [0, 1000] {
+            for cleanup_fails in [false, true] {
+                let cancellation = RunCancellation::default();
+                let handle = register_fake_exec(vec![
+                    FakeStep::Event {
+                        kind: EVENT_STDOUT,
+                        bytes: Some(b"binary\0\xff".to_vec()),
+                        reported_len: None,
+                    },
+                    FakeStep::Status(STATUS_TIMEOUT),
+                    FakeStep::Cancel(cancellation.clone()),
+                ]);
+                if cleanup_fails {
+                    let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+                    let state = map.get_mut(&handle).unwrap();
+                    state.cancel_status = STATUS_INVALID_ARGUMENT;
+                    state.release_status = STATUS_INVALID_HANDLE;
+                }
+                let mut client = NvxClient::from_library(fake_library(), handle);
+                let error = client
+                    .exec_and_wait(
+                        &SandboxId::from_token("0123456789abcdef0123456789abcdef").unwrap(),
+                        &ExecRequest::command_line("silent").with_timeout_ms(timeout),
+                        Some(&cancellation),
+                        &mut Logger::new(Mode::Buffer),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::BackendError);
+                assert!(error.message.starts_with("execution cancelled"));
+                assert!(!error.message.contains("timed out"));
+                assert_eq!(fake_calls(handle), ["cancel", "release"]);
+                assert!(cancellation.was_cancelled());
+                let waits = FAKE_EXECS
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get(&handle)
+                    .unwrap()
+                    .timeouts
+                    .clone();
+                assert_eq!(waits, [100, 100, 100]);
+                if cleanup_fails {
+                    assert!(error.message.contains("cleanup failure"));
+                    assert!(error.message.contains("release failure"));
+                } else {
+                    assert_eq!(error.message, "execution cancelled");
+                }
+                assert_eq!(client.close().is_err(), cleanup_fails);
+            }
+        }
     }
 
     #[test]
@@ -839,6 +1067,64 @@ mod tests {
         let close_err = lib.host_close(999).unwrap_err();
         assert_eq!(close_err.code, MxcErrorCode::BackendError);
         assert!(close_err.message.contains("unknown handle"));
+    }
+
+    #[test]
+    fn cancellation_races_preserve_handle_lifetime_and_completed_outcome() {
+        for phase in ["before", "during-exec", "terminal"] {
+            let cancellation = RunCancellation::default();
+            let handle = register_fake_exec(vec![FakeStep::Event {
+                kind: EVENT_EXIT,
+                bytes: Some(br#"{"outcome":{"exited":42}}"#.to_vec()),
+                reported_len: None,
+            }]);
+            {
+                let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+                let state = map.get_mut(&handle).unwrap();
+                match phase {
+                    "before" => {
+                        cancellation.request();
+                    }
+                    "during-exec" => state.cancel_on_exec = Some(cancellation.clone()),
+                    _ => state.cancel_on_exit = Some(cancellation.clone()),
+                }
+            }
+            let mut client = NvxClient::from_library(fake_library(), handle);
+            let result = client.exec_and_wait(
+                &SandboxId::from_token("0123456789abcdef0123456789abcdef").unwrap(),
+                &ExecRequest::command_line("test"),
+                Some(&cancellation),
+                &mut Logger::new(Mode::Buffer),
+            );
+            match phase {
+                "before" => {
+                    assert_eq!(result.unwrap_err().message, "execution cancelled");
+                    assert!(fake_calls(handle).is_empty());
+                    assert!(
+                        !FAKE_EXECS
+                            .get()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .get(&handle)
+                            .unwrap()
+                            .exec_started
+                    );
+                    assert!(cancellation.was_cancelled());
+                }
+                "during-exec" => {
+                    assert_eq!(result.unwrap_err().message, "execution cancelled");
+                    assert_eq!(fake_calls(handle), ["cancel", "release"]);
+                    assert!(cancellation.was_cancelled());
+                }
+                _ => {
+                    assert_eq!(result.unwrap().outcome, ExecOutcome::Exited(42));
+                    assert_eq!(fake_calls(handle), ["release"]);
+                    assert!(!cancellation.was_cancelled());
+                }
+            }
+            client.close().unwrap();
+        }
     }
 
     #[test]
@@ -865,7 +1151,9 @@ mod tests {
             },
         ]);
         let mut client = NvxClient::from_library(fake_library(), handle);
-        let output = client.exec_and_wait(&sandbox_id, &req).unwrap();
+        let output = client
+            .exec_and_wait(&sandbox_id, &req, None, &mut Logger::new(Mode::Buffer))
+            .unwrap();
         assert_eq!(output.outcome, ExecOutcome::Exited(42));
         assert_eq!(output.stdout, b"out\0\xff");
         assert_eq!(output.stderr, b"err\0\x80");
@@ -882,7 +1170,9 @@ mod tests {
             FakeStep::Status(STATUS_TIMEOUT),
         ]);
         let mut client = NvxClient::from_library(fake_library(), handle);
-        let output = client.exec_and_wait(&sandbox_id, &req).unwrap();
+        let output = client
+            .exec_and_wait(&sandbox_id, &req, None, &mut Logger::new(Mode::Buffer))
+            .unwrap();
         assert_eq!(output.outcome, ExecOutcome::TimedOut);
         assert_eq!(output.stdout, b"partial-out");
         assert_eq!(fake_calls(handle), ["cancel", "release"]);
@@ -895,7 +1185,9 @@ mod tests {
             reported_len: None,
         }]);
         let mut client = NvxClient::from_library(fake_library(), handle);
-        let err = client.exec_and_wait(&sandbox_id, &req).unwrap_err();
+        let err = client
+            .exec_and_wait(&sandbox_id, &req, None, &mut Logger::new(Mode::Buffer))
+            .unwrap_err();
         assert_eq!(err.code, MxcErrorCode::BackendError);
         assert!(err.message.contains("unknown execution event 99"));
         assert_eq!(fake_calls(handle), ["cancel", "release"]);
@@ -908,7 +1200,9 @@ mod tests {
             reported_len: Some(8),
         }]);
         let mut client = NvxClient::from_library(fake_library(), handle);
-        let err = client.exec_and_wait(&sandbox_id, &req).unwrap_err();
+        let err = client
+            .exec_and_wait(&sandbox_id, &req, None, &mut Logger::new(Mode::Buffer))
+            .unwrap_err();
         assert_eq!(err.code, MxcErrorCode::BackendError);
         assert!(err.message.contains("data is missing"));
         assert_eq!(fake_calls(handle), ["cancel", "release"]);
@@ -917,7 +1211,9 @@ mod tests {
         // 5. Native STATUS_INVALID_ARGUMENT -> cancels, releases, fails closed.
         let handle = register_fake_exec(vec![FakeStep::Status(STATUS_INVALID_ARGUMENT)]);
         let mut client = NvxClient::from_library(fake_library(), handle);
-        let err = client.exec_and_wait(&sandbox_id, &req).unwrap_err();
+        let err = client
+            .exec_and_wait(&sandbox_id, &req, None, &mut Logger::new(Mode::Buffer))
+            .unwrap_err();
         assert_eq!(err.code, MxcErrorCode::BackendError);
         assert!(err.message.contains("rejected an argument"));
         assert_eq!(fake_calls(handle), ["cancel", "release"]);
@@ -1055,7 +1351,13 @@ mod tests {
             ]);
             let mut client = NvxClient::from_library(fake_library(), handle);
             let output = client
-                .exec_and_wait_with_capture_limit(&sandbox_id, &request, 8)
+                .exec_and_wait_with_capture_limit(
+                    &sandbox_id,
+                    &request,
+                    8,
+                    None,
+                    &mut Logger::new(Mode::Buffer),
+                )
                 .unwrap();
             assert_eq!(output.outcome, ExecOutcome::Exited(42));
             assert_eq!(output.stdout, b"\xff\0\xfex");
@@ -1101,7 +1403,13 @@ mod tests {
                 }
                 let mut client = NvxClient::from_library(fake_library(), handle);
                 let error = client
-                    .exec_and_wait_with_capture_limit(&sandbox_id, &request, 8)
+                    .exec_and_wait_with_capture_limit(
+                        &sandbox_id,
+                        &request,
+                        8,
+                        None,
+                        &mut Logger::new(Mode::Buffer),
+                    )
                     .unwrap_err();
                 assert_eq!(error.code, MxcErrorCode::BackendError);
                 let primary = "NVX signed bundled agent: combined stdout/stderr capture limit of 8 bytes exceeded";

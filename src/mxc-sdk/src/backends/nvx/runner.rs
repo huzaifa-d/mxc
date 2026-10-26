@@ -9,7 +9,7 @@ use crate::mxc_common::audit::{AuditEvent, AuditEventName};
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, FailurePhase, ScriptResponse};
 use crate::mxc_common::mxc_error::{MxcError, MxcErrorCode};
-use crate::mxc_common::script_runner::ScriptRunner;
+use crate::mxc_common::script_runner::{RunCancellation, ScriptRunner};
 
 use super::abi::{ExecOutcome, ExecRequest};
 use super::runtime::SandboxClient;
@@ -28,12 +28,31 @@ pub struct CapturedRun {
     pub stderr: Vec<u8>,
 }
 
+impl CapturedRun {
+    pub(crate) fn response(&self) -> ScriptResponse {
+        match self.outcome {
+            CapturedOutcome::Exited(exit_code) => ScriptResponse {
+                exit_code,
+                ..Default::default()
+            },
+            CapturedOutcome::TimedOut => ScriptResponse {
+                exit_code: -1,
+                error_message: "NVX workload timed out".to_owned(),
+                failure_phase: FailurePhase::Timeout,
+                ..Default::default()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Default)]
-pub struct NvxRunner;
+pub struct NvxRunner {
+    cancellation: RunCancellation,
+}
 
 impl NvxRunner {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     pub fn run_captured(
@@ -41,7 +60,19 @@ impl NvxRunner {
         request: &ExecutionRequest,
         logger: &mut Logger,
     ) -> Result<CapturedRun, MxcError> {
+        self.cancellation.begin();
+        let result = self.run_captured_inner(request, logger);
+        self.cancellation.complete();
+        result
+    }
+
+    fn run_captured_inner(
+        &mut self,
+        request: &ExecutionRequest,
+        logger: &mut Logger,
+    ) -> Result<CapturedRun, MxcError> {
         super::policy::validate_request(request)?;
+        self.cancellation.check()?;
         let state_root = tempfile::Builder::new()
             .prefix(&format!("mxc-nvx-{}-", std::process::id()))
             .tempdir()
@@ -64,7 +95,13 @@ impl NvxRunner {
                 return finish_run(Err(error), cleanup, logger);
             }
         };
-        run_with_client(&mut client, state_root, request, logger)
+        run_with_client(
+            &mut client,
+            state_root,
+            request,
+            logger,
+            Some(&self.cancellation),
+        )
     }
 }
 
@@ -73,11 +110,14 @@ fn run_with_client(
     state_root: tempfile::TempDir,
     request: &ExecutionRequest,
     logger: &mut Logger,
+    cancellation: Option<&RunCancellation>,
 ) -> Result<CapturedRun, MxcError> {
     let exec = exec_request(request);
     let sandbox_id = match client
         .validate_exec(&exec)
+        .and_then(|()| cancellation.map_or(Ok(()), RunCancellation::check))
         .and_then(|()| client.probe())
+        .and_then(|()| cancellation.map_or(Ok(()), RunCancellation::check))
         .and_then(|()| client.provision())
     {
         Ok(sandbox_id) => sandbox_id,
@@ -103,8 +143,28 @@ fn run_with_client(
             .str("runtime", "signed-bundled-agent"),
     );
     let primary = (|| {
-        client.start(&sandbox_id)?;
-        client.exec_and_wait(&sandbox_id, &exec)
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        if let Err(mut error) = client.start(&sandbox_id) {
+            error.message.push_str("; startup diagnostics");
+            match client.diagnostics(&sandbox_id) {
+                Ok(diagnostics) => {
+                    error
+                        .message
+                        .push_str(&super::runtime::startup_diagnostics(&diagnostics));
+                }
+                Err(diagnostic_error) => {
+                    error.message.push_str(" unavailable: ");
+                    error.message.push_str(&diagnostic_error.to_string());
+                }
+            }
+            return Err(error);
+        }
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        client.exec_and_wait(&sandbox_id, &exec, cancellation, logger)
     })();
 
     let stop_error = match client.stop(&sandbox_id).err() {
@@ -180,6 +240,10 @@ fn finish_run<T>(
 }
 
 impl ScriptRunner for NvxRunner {
+    fn cancellation(&self) -> Option<RunCancellation> {
+        Some(self.cancellation.clone())
+    }
+
     fn validate_runner(&self, request: &ExecutionRequest) -> Result<(), ScriptResponse> {
         super::policy::validate_request(request)
             .map_err(|error| ScriptResponse::rejected(&error.message))
@@ -238,18 +302,7 @@ fn captured_to_script_response(
         .write_all(&result.stderr)
         .and_then(|()| stderr.flush())
         .map_err(|error| MxcError::backend_error(format!("cannot relay NVX stderr: {error}")))?;
-    Ok(match result.outcome {
-        CapturedOutcome::Exited(exit_code) => ScriptResponse {
-            exit_code,
-            ..Default::default()
-        },
-        CapturedOutcome::TimedOut => ScriptResponse {
-            exit_code: -1,
-            error_message: "NVX workload timed out".to_string(),
-            failure_phase: FailurePhase::Timeout,
-            ..Default::default()
-        },
-    })
+    Ok(result.response())
 }
 
 fn exec_request(request: &ExecutionRequest) -> ExecRequest {
@@ -270,6 +323,7 @@ fn exec_request(request: &ExecutionRequest) -> ExecRequest {
 mod tests {
     use std::cell::RefCell;
 
+    use super::super::abi::SandboxDiagnostics;
     use super::super::runtime::{ExecOutput, SandboxId};
     use super::*;
 
@@ -287,6 +341,32 @@ mod tests {
             map_outcome(ExecOutcome::TimedOut).unwrap(),
             CapturedOutcome::TimedOut
         );
+    }
+
+    #[test]
+    fn cancelled_runner_disarms_after_cleanup_and_can_be_reused() {
+        let mut runner = NvxRunner::new();
+        let signal = runner.cancellation().unwrap();
+        assert!(signal.request());
+        let request = ExecutionRequest {
+            script_code: "printf test".to_owned(),
+            ..Default::default()
+        };
+        let error = runner
+            .run_captured(
+                &request,
+                &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+            )
+            .unwrap_err();
+        assert_eq!(error.message, "execution cancelled");
+        assert!(signal.was_cancelled());
+        assert!(
+            !signal.request(),
+            "a finished backend must not claim output-relay interruption"
+        );
+        signal.begin();
+        assert!(signal.check().is_ok());
+        assert!(!signal.was_cancelled());
     }
 
     #[test]
@@ -444,10 +524,12 @@ mod tests {
         probe_res: Result<(), MxcError>,
         provision_res: Result<SandboxId, MxcError>,
         start_res: Result<(), MxcError>,
+        diagnostics_res: Result<SandboxDiagnostics, MxcError>,
         exec_res: Result<ExecOutput, MxcError>,
         stop_res: Result<(), MxcError>,
         deprovision_res: Result<(), MxcError>,
         close_res: Result<(), MxcError>,
+        cancel_at: Option<(&'static str, RunCancellation)>,
     }
 
     impl MockClient {
@@ -460,6 +542,7 @@ mod tests {
                 probe_res: Ok(()),
                 provision_res: SandboxId::from_token("0123456789abcdef0123456789abcdef"),
                 start_res: Ok(()),
+                diagnostics_res: Err(MxcError::backend_error("diagnostics unavailable")),
                 exec_res: Ok(ExecOutput {
                     outcome: ExecOutcome::Exited(0),
                     stdout: b"ok".to_vec(),
@@ -468,38 +551,58 @@ mod tests {
                 stop_res: Ok(()),
                 deprovision_res: Ok(()),
                 close_res: Ok(()),
+                cancel_at: None,
+            }
+        }
+
+        fn record(&self, phase: &'static str) {
+            self.calls.borrow_mut().push(phase);
+            if let Some((at, cancellation)) = &self.cancel_at {
+                if *at == phase {
+                    cancellation.request();
+                }
             }
         }
     }
 
     impl SandboxClient for MockClient {
         fn validate_exec(&self, request: &ExecRequest) -> Result<(), MxcError> {
-            self.calls.borrow_mut().push("validate");
+            self.record("validate");
             *self.validated_request.borrow_mut() = Some(request.clone());
             self.validate_res.clone()
         }
 
         fn probe(&self) -> Result<(), MxcError> {
-            self.calls.borrow_mut().push("probe");
+            self.record("probe");
             self.probe_res.clone()
         }
 
         fn provision(&self) -> Result<SandboxId, MxcError> {
-            self.calls.borrow_mut().push("provision");
+            self.record("provision");
             self.provision_res.clone()
         }
 
         fn start(&self, _sandbox_id: &SandboxId) -> Result<(), MxcError> {
-            self.calls.borrow_mut().push("start");
+            self.record("start");
             self.start_res.clone()
+        }
+
+        fn diagnostics(&self, _sandbox_id: &SandboxId) -> Result<SandboxDiagnostics, MxcError> {
+            self.calls.borrow_mut().push("diagnostics");
+            self.diagnostics_res.clone()
         }
 
         fn exec_and_wait(
             &self,
             _sandbox_id: &SandboxId,
             request: &ExecRequest,
+            cancellation: Option<&RunCancellation>,
+            _logger: &mut Logger,
         ) -> Result<ExecOutput, MxcError> {
-            self.calls.borrow_mut().push("exec");
+            self.record("exec");
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
             *self.executed_request.borrow_mut() = Some(request.clone());
             self.exec_res.clone()
         }
@@ -521,6 +624,175 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_startup_or_execution_runs_ordered_teardown() {
+        for phase in ["validate", "probe", "provision", "start", "exec"] {
+            for cleanup_fails in [false, true] {
+                let cancellation = RunCancellation::default();
+                let mut client = MockClient::ok();
+                client.cancel_at = Some((phase, cancellation.clone()));
+                if cleanup_fails {
+                    client.close_res = Err(MxcError::backend_error("host_close failed"));
+                }
+                let state_root = tempfile::tempdir().unwrap();
+                let path = state_root.path().to_path_buf();
+                let error = run_with_client(
+                    &mut client,
+                    state_root,
+                    &ExecutionRequest::default(),
+                    &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+                    Some(&cancellation),
+                )
+                .unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::BackendError);
+                assert!(error.message.starts_with("execution cancelled"));
+                assert!(cancellation.was_cancelled());
+                assert!(!path.exists());
+                let expected: &[&str] = match phase {
+                    "validate" => &["validate", "close"],
+                    "probe" => &["validate", "probe", "close"],
+                    "provision" => &[
+                        "validate",
+                        "probe",
+                        "provision",
+                        "stop",
+                        "deprovision",
+                        "close",
+                    ],
+                    "start" => &[
+                        "validate",
+                        "probe",
+                        "provision",
+                        "start",
+                        "stop",
+                        "deprovision",
+                        "close",
+                    ],
+                    _ => &[
+                        "validate",
+                        "probe",
+                        "provision",
+                        "start",
+                        "exec",
+                        "stop",
+                        "deprovision",
+                        "close",
+                    ],
+                };
+                assert_eq!(client.calls.borrow().as_slice(), expected);
+                if cleanup_fails {
+                    assert!(error.message.contains("cleanup failure"));
+                    assert!(error.message.contains("host_close failed"));
+                } else {
+                    assert_eq!(error.message, "execution cancelled");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn start_failure_wins_over_a_racing_cancellation() {
+        let cancellation = RunCancellation::default();
+        let mut client = MockClient::ok();
+        client.cancel_at = Some(("start", cancellation.clone()));
+        client.start_res = Err(MxcError::backend_unavailable("primary start failure"));
+        let state_root = tempfile::tempdir().unwrap();
+        let path = state_root.path().to_path_buf();
+        let error = run_with_client(
+            &mut client,
+            state_root,
+            &ExecutionRequest::default(),
+            &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+            Some(&cancellation),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error
+            .message
+            .starts_with("primary start failure; startup diagnostics unavailable"));
+        assert!(
+            !cancellation.was_cancelled(),
+            "the primary failure must keep its category"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            [
+                "validate",
+                "probe",
+                "provision",
+                "start",
+                "diagnostics",
+                "stop",
+                "deprovision",
+                "close"
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_diagnostics_survive_cleanup_with_bounded_logs_and_secondary_errors() {
+        for unavailable in [false, true] {
+            let state_root = tempfile::tempdir().unwrap();
+            let state_path = state_root.path().to_path_buf();
+            let log = state_path.join("native-vmm.log");
+            std::fs::write(
+                &log,
+                format!("{}boot failure marker", "x".repeat(40 * 1024)),
+            )
+            .unwrap();
+            let mut client = MockClient::ok();
+            client.start_res = Err(MxcError::backend_unavailable("primary start failure")
+                .with_details(serde_json::json!({"phase": "boot"})));
+            if !unavailable {
+                client.diagnostics_res = Ok(SandboxDiagnostics {
+                    vmm_log: log,
+                    console_log: state_path.join("missing-console"),
+                    outcome_report: state_path.join("missing-outcome"),
+                });
+            }
+            let error = run_with_client(
+                &mut client,
+                state_root,
+                &ExecutionRequest::default(),
+                &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                !state_path.exists(),
+                "diagnostics must not retain run state"
+            );
+            assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+            assert_eq!(error.details, Some(serde_json::json!({"phase": "boot"})));
+            assert!(error
+                .message
+                .starts_with("primary start failure; startup diagnostics"));
+            if unavailable {
+                assert!(error.message.contains("diagnostics unavailable"));
+            } else {
+                assert!(error.message.contains("[truncated]"));
+                assert!(error.message.contains("boot failure marker"));
+                assert!(error.message.contains("console_log: unavailable"));
+                assert!(error.message.contains("outcome_report: unavailable"));
+                assert!(error.message.len() < 12 * 1024);
+            }
+            assert_eq!(
+                *client.calls.borrow(),
+                [
+                    "validate",
+                    "probe",
+                    "provision",
+                    "start",
+                    "diagnostics",
+                    "stop",
+                    "deprovision",
+                    "close"
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn lifecycle_cleanup_surfaces_host_close_and_retains_state_on_deprovision_failure() {
         let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
         let request = ExecutionRequest {
@@ -534,7 +806,8 @@ mod tests {
         let mut client = MockClient::ok();
         client.probe_res = Err(MxcError::backend_unavailable("probe failed"));
         client.close_res = Err(MxcError::backend_error("host_close failed"));
-        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        let err =
+            run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::BackendUnavailable);
         assert!(err.message.contains("probe failed"));
         assert!(err.message.contains("host_close failed"));
@@ -550,8 +823,11 @@ mod tests {
             MxcErrorCode::AlreadyStopped,
             "already stopped",
         ));
-        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
-        assert_eq!(err.message, "start failed");
+        let err =
+            run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap_err();
+        assert!(err
+            .message
+            .starts_with("start failed; startup diagnostics unavailable: "));
         assert_eq!(
             *client.calls.borrow(),
             [
@@ -559,6 +835,7 @@ mod tests {
                 "probe",
                 "provision",
                 "start",
+                "diagnostics",
                 "stop",
                 "deprovision",
                 "close"
@@ -571,7 +848,8 @@ mod tests {
         let state_path = state_root.path().to_path_buf();
         let mut client = MockClient::ok();
         client.close_res = Err(MxcError::backend_error("host_close failed"));
-        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        let err =
+            run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap_err();
         assert!(err
             .message
             .contains("NVX cleanup failed after workload completion"));
@@ -583,7 +861,8 @@ mod tests {
         let state_path = state_root.path().to_path_buf();
         let mut client = MockClient::ok();
         client.deprovision_res = Err(MxcError::backend_error("deprovision failed"));
-        let err = run_with_client(&mut client, state_root, &request, &mut logger).unwrap_err();
+        let err =
+            run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap_err();
         assert!(err.message.contains("deprovision failed"));
         assert!(err
             .message
@@ -608,6 +887,7 @@ mod tests {
                 state_root,
                 &ExecutionRequest::default(),
                 &mut logger,
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code, MxcErrorCode::PolicyValidation);
@@ -639,7 +919,8 @@ mod tests {
             let state_root = tempfile::tempdir().unwrap();
             let state_path = state_root.path().to_path_buf();
             let mut client = MockClient::ok();
-            let result = run_with_client(&mut client, state_root, &request, &mut logger).unwrap();
+            let result =
+                run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap();
             assert_eq!(result.outcome, CapturedOutcome::Exited(0));
             assert_eq!(
                 *client.validated_request.borrow(),
@@ -684,6 +965,7 @@ mod tests {
                 state_root,
                 &ExecutionRequest::default(),
                 &mut logger,
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code, MxcErrorCode::BackendError);

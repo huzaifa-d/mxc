@@ -81,20 +81,7 @@ use crate::mxc_common::state_aware_request::MxcRequest;
 use crate::mxc_common::telemetry;
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CapturedOutcome {
-    Exited(i32),
-    TimedOut,
-}
-
-#[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CapturedExecutionResult {
-    pub outcome: CapturedOutcome,
-    pub warnings: Vec<String>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
+pub(crate) use crate::nvx_runner::{CapturedOutcome, CapturedRun as CapturedExecutionResult};
 
 pub(crate) enum OneShotExecution {
     #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
@@ -156,8 +143,23 @@ pub(crate) fn execute_one_shot_json(
     if request.containment == ContainmentBackend::MicroVm {
         #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
         {
-            return run_captured_execution_request(&request, logger)
-                .map(OneShotExecution::Captured);
+            experimental::require_experimental_optin(
+                &request.containment,
+                request.experimental_enabled,
+            )?;
+            return invoke_execution_request(&request, logger, |request, logger| {
+                run::log_policy_hash(request, logger);
+                crate::mxc_common::validator::validate_common(request).map_err(|response| {
+                    if request.script_code.is_empty() {
+                        MxcError::malformed_request(response.error_message)
+                    } else {
+                        MxcError::policy_validation(response.error_message)
+                    }
+                })?;
+                crate::nvx_runner::NvxRunner::new()
+                    .run_captured(request, logger)
+                    .map(OneShotExecution::Captured)
+            });
         }
         #[cfg(not(all(target_os = "windows", target_arch = "x86_64", feature = "microvm")))]
         {
@@ -193,92 +195,6 @@ fn parse_one_shot_json(
     Ok(request)
 }
 
-#[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
-fn run_captured_execution_request(
-    request: &ExecutionRequest,
-    mut logger: Logger,
-) -> Result<CapturedExecutionResult, Error> {
-    crate::mxc_engine::experimental::require_experimental_optin(
-        &request.containment,
-        request.experimental_enabled,
-    )?;
-
-    let telemetry_active = request
-        .telemetry
-        .as_ref()
-        .map(|config| telemetry::init(config, &mut logger))
-        .unwrap_or(false);
-    let mut telemetry_registration = TelemetryRegistration::new(telemetry_active);
-    let requested_sandbox_kind = request
-        .telemetry
-        .as_ref()
-        .and_then(|config| config.requested_sandbox_kind);
-    crate::mxc_engine::run::log_policy_hash(request, &mut logger);
-    if let Err(response) = crate::mxc_common::validator::validate_common(request) {
-        let error = if request.script_code.is_empty() {
-            MxcError::malformed_request(response.error_message)
-        } else {
-            MxcError::policy_validation(response.error_message)
-        };
-        telemetry::emit_sdk_early_exit_with_kind(
-            telemetry_registration.transfer(),
-            &request.containment,
-            requested_sandbox_kind,
-            telemetry::classify_mxc_error(&error),
-        );
-        return Err(Error::from(error));
-    }
-
-    let started = std::time::Instant::now();
-    let mut runner = crate::nvx_runner::NvxRunner::new();
-    let result = match runner.run_captured(request, &mut logger) {
-        Ok(result) => result,
-        Err(error) => {
-            telemetry::emit_sdk_early_exit_with_kind(
-                telemetry_registration.transfer(),
-                &request.containment,
-                requested_sandbox_kind,
-                telemetry::classify_mxc_error(&error),
-            );
-            return Err(Error::from(error));
-        }
-    };
-
-    let response = ScriptResponse {
-        exit_code: match result.outcome {
-            crate::nvx_runner::CapturedOutcome::Exited(code) => code,
-            crate::nvx_runner::CapturedOutcome::TimedOut => -1,
-        },
-        failure_phase: match result.outcome {
-            crate::nvx_runner::CapturedOutcome::Exited(_) => FailurePhase::None,
-            crate::nvx_runner::CapturedOutcome::TimedOut => FailurePhase::Timeout,
-        },
-        ..Default::default()
-    };
-    telemetry::emit_sdk_completion_with_kind(
-        telemetry_registration.transfer(),
-        &request.containment,
-        requested_sandbox_kind,
-        &response,
-        started.elapsed(),
-    );
-
-    let warnings = logger
-        .take_warnings()
-        .into_iter()
-        .chain(result.warnings)
-        .collect();
-    Ok(CapturedExecutionResult {
-        outcome: match result.outcome {
-            crate::nvx_runner::CapturedOutcome::Exited(code) => CapturedOutcome::Exited(code),
-            crate::nvx_runner::CapturedOutcome::TimedOut => CapturedOutcome::TimedOut,
-        },
-        warnings,
-        stdout: result.stdout,
-        stderr: result.stderr,
-    })
-}
-
 fn spawn_execution_request_with_logger(
     request: &ExecutionRequest,
     logger: Logger,
@@ -288,9 +204,25 @@ fn spawn_execution_request_with_logger(
 
 fn spawn_execution_request_with_logger_and(
     request: &ExecutionRequest,
-    mut logger: Logger,
+    logger: Logger,
     spawn: impl FnOnce(&ExecutionRequest, &mut Logger) -> Result<Box<dyn SandboxProcess>, MxcError>,
 ) -> Result<Box<dyn SandboxProcess>, Error> {
+    match invoke_execution_request(request, logger, |request, logger| {
+        spawn(request, logger).map(OneShotExecution::Streaming)
+    })? {
+        OneShotExecution::Streaming(process) => Ok(process),
+        #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
+        OneShotExecution::Captured(_) => {
+            unreachable!("streaming invocation returned captured output")
+        }
+    }
+}
+
+fn invoke_execution_request(
+    request: &ExecutionRequest,
+    mut logger: Logger,
+    execute: impl FnOnce(&ExecutionRequest, &mut Logger) -> Result<OneShotExecution, MxcError>,
+) -> Result<OneShotExecution, Error> {
     let telemetry_active = request
         .telemetry
         .as_ref()
@@ -303,8 +235,8 @@ fn spawn_execution_request_with_logger_and(
         .and_then(|config| config.requested_sandbox_kind);
     let containment = request.containment.clone();
     let started = std::time::Instant::now();
-    let process = match spawn(request, &mut logger) {
-        Ok(process) => process,
+    let execution = match execute(request, &mut logger) {
+        Ok(execution) => execution,
         Err(error) => {
             // Preserve the actual error category so bounded telemetry
             // categorises malformed requests, unsupported containment, and
@@ -321,19 +253,36 @@ fn spawn_execution_request_with_logger_and(
         }
     };
     let extra_warnings = logger.take_warnings();
-    let process: Box<dyn SandboxProcess> = ProcessWithWarnings::wrap(process, extra_warnings);
-    if telemetry_registration.active() {
-        Ok(Box::new(TelemetryProcess::new(
-            process,
-            telemetry_registration.transfer(),
-            TelemetryMode::OneShot {
-                containment,
+    match execution {
+        OneShotExecution::Streaming(process) => {
+            let process = ProcessWithWarnings::wrap(process, extra_warnings);
+            let process: Box<dyn SandboxProcess> = if telemetry_registration.active() {
+                Box::new(TelemetryProcess::new(
+                    process,
+                    telemetry_registration.transfer(),
+                    TelemetryMode::OneShot {
+                        containment,
+                        requested_sandbox_kind,
+                    },
+                    started,
+                ))
+            } else {
+                process
+            };
+            Ok(OneShotExecution::Streaming(process))
+        }
+        #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
+        OneShotExecution::Captured(mut result) => {
+            telemetry::emit_sdk_completion_with_kind(
+                telemetry_registration.transfer(),
+                &containment,
                 requested_sandbox_kind,
-            },
-            started,
-        )))
-    } else {
-        Ok(process)
+                &result.response(),
+                started.elapsed(),
+            );
+            result.warnings = extra_warnings.into_iter().chain(result.warnings).collect();
+            Ok(OneShotExecution::Captured(result))
+        }
     }
 }
 
@@ -1234,6 +1183,52 @@ mod telemetry_process_tests {
         .expect("alternate dispatcher should spawn");
 
         assert_eq!(process.warnings(), ["PTY spawn warning"]);
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
+    #[test]
+    fn shared_invocation_preserves_captured_results_warnings_and_errors() {
+        for outcome in [CapturedOutcome::Exited(42), CapturedOutcome::TimedOut] {
+            let mut calls = 0;
+            let result = invoke_execution_request(
+                &ExecutionRequest::default(),
+                Logger::new(Mode::Buffer),
+                |_, logger| {
+                    calls += 1;
+                    logger.warning_line("invocation warning");
+                    Ok(OneShotExecution::Captured(CapturedExecutionResult {
+                        outcome,
+                        warnings: vec!["backend warning".to_owned()],
+                        stdout: b"\xff\0\xfe".to_vec(),
+                        stderr: b"\x80\0\x81".to_vec(),
+                    }))
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            let OneShotExecution::Captured(result) = result else {
+                panic!("captured invocation must stay captured");
+            };
+            assert_eq!(result.outcome, outcome);
+            assert_eq!(result.warnings, ["invocation warning", "backend warning"]);
+            assert_eq!(result.stdout, b"\xff\0\xfe");
+            assert_eq!(result.stderr, b"\x80\0\x81");
+        }
+        for primary in [
+            MxcError::malformed_request("malformed"),
+            MxcError::policy_validation("policy"),
+            MxcError::backend_unavailable("unavailable"),
+            MxcError::backend_error("execution"),
+        ] {
+            let error = invoke_execution_request(
+                &ExecutionRequest::default(),
+                Logger::new(Mode::Buffer),
+                |_, _| Err(primary.clone()),
+            )
+            .err()
+            .expect("invocation failure");
+            assert_eq!(error, Error::from(primary));
+        }
     }
 
     #[test]

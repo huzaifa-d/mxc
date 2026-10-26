@@ -18,6 +18,8 @@ use mxc_sdk::mxc_common::error::WxcError;
 use mxc_sdk::mxc_common::logger::{Logger, Mode};
 use mxc_sdk::mxc_common::models::{ContainmentBackend, ExecutionRequest, ScriptResponse};
 use mxc_sdk::mxc_common::mxc_error::{MxcError, MxcErrorCode, ResponseEnvelope};
+#[cfg(target_os = "windows")]
+use mxc_sdk::mxc_common::script_runner::RunCancellation;
 use mxc_sdk::mxc_common::script_runner::{handle_dry_run_exit, ScriptRunner};
 use mxc_sdk::mxc_common::state_aware_dispatch::{resolve_backend, DispatchOutcome};
 use mxc_sdk::mxc_common::state_aware_request::{MxcRequest, ParsedStateAwareRequest, Phase};
@@ -874,23 +876,69 @@ fn config_file_path(cli: &Cli) -> Option<std::path::PathBuf> {
 //    threads through it.
 // 3. **Ctrl-C / Ctrl-Break / console close / logoff / shutdown** — the
 //    default Windows handler calls `ExitProcess` directly, skipping
-//    every Rust destructor. We install a `SetConsoleCtrlHandler` that
-//    takes-and-drops the parked manager before yielding to the
-//    default handler.
+//    every Rust destructor. Cooperative runners claim Ctrl-C / Ctrl-Break
+//    until their owner completes backend cleanup. Other signals and runners
+//    restore the parked manager before yielding to the default handler.
 //
 // The mutex in the slot serializes the Ctrl-C handler and the guard
 // against each other, so the manager is taken (and therefore
 // `Drop`'d) at most once.
 //
-// Parent-process kill (`TerminateProcess`) still bypasses every
-// handler; any leak there is reaped by `recover_orphaned_state` on
-// the next wxc-exec startup (which we already run at the top of
-// `main`).
+// Parent-process kill (`TerminateProcess`) bypasses every handler.
+// DACL orphan recovery is separate; this does not provide automatic NVX recovery.
 
 #[cfg(target_os = "windows")]
 static DACL_CLEANUP_SLOT: OnceLock<
     Mutex<Option<mxc_sdk::mxc_common::filesystem_dacl::DaclManager>>,
 > = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static RUN_CANCELLATION_SLOT: Mutex<Option<RunCancellation>> = Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+struct ConsoleRunGuard {
+    cancellation: Option<RunCancellation>,
+}
+
+#[cfg(target_os = "windows")]
+impl ConsoleRunGuard {
+    fn new(cancellation: Option<RunCancellation>) -> Self {
+        *RUN_CANCELLATION_SLOT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = cancellation.clone();
+        Self { cancellation }
+    }
+
+    fn finish(mut self) -> bool {
+        // Clear the handler's signal only after backend and DACL cleanup have finished.
+        *RUN_CANCELLATION_SLOT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        self.cancellation
+            .take()
+            .is_some_and(|signal| signal.was_cancelled())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ConsoleRunGuard {
+    fn drop(&mut self) {
+        *RUN_CANCELLATION_SLOT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn request_console_cancellation(ctrl_type: u32, cancellation: Option<&RunCancellation>) -> bool {
+    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if matches!(ctrl_type, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        if let Some(cancellation) = cancellation {
+            return cancellation.request();
+        }
+    }
+    false
+}
 
 #[cfg(target_os = "windows")]
 fn dacl_cleanup_slot() -> &'static Mutex<Option<mxc_sdk::mxc_common::filesystem_dacl::DaclManager>>
@@ -945,10 +993,9 @@ impl Drop for ParkedDaclGuard {
 }
 
 /// Windows console-control handler. Called by the OS on Ctrl-C, Ctrl-Break,
-/// console close, logoff, and shutdown. Takes the parked DACL manager and
-/// drops it — `Drop` runs `restore()` which removes the ACEs we applied.
-/// Returns `FALSE` so the default handler still runs (which terminates
-/// the process).
+/// console close, logoff, and shutdown. Cooperative runners claim Ctrl-C /
+/// Ctrl-Break and leave cleanup to the execution owner. Otherwise, drops the
+/// parked DACL manager and returns `FALSE` to the default termination handler.
 ///
 /// Acquires the slot with a bounded wait
 /// (`plm::coordination::CTRL_HANDLER_DRAIN_TIMEOUT`), not `try_lock`.
@@ -961,7 +1008,25 @@ impl Drop for ParkedDaclGuard {
 /// first. On timeout we proceed anyway; the recovery scan on the next
 /// `wxc-exec` startup reaps anything left behind.
 #[cfg(target_os = "windows")]
-unsafe extern "system" fn dacl_ctrl_handler(_ctrl_type: u32) -> windows::core::BOOL {
+unsafe extern "system" fn dacl_ctrl_handler(ctrl_type: u32) -> windows::core::BOOL {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_console_control(ctrl_type)
+    }))
+    .unwrap_or(windows::core::BOOL(0))
+}
+
+#[cfg(target_os = "windows")]
+fn handle_console_control(ctrl_type: u32) -> windows::core::BOOL {
+    {
+        let cancellation = RUN_CANCELLATION_SLOT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if request_console_cancellation(ctrl_type, cancellation.as_ref()) {
+            // The execution owner wakes its bounded native wait and runs teardown.
+            // Never call native lifecycle APIs or restore DACLs on this handler thread.
+            return windows::core::BOOL(1);
+        }
+    }
     // Ordering guarantee: best-effort cancellation telemetry runs STRICTLY
     // BEFORE the up-to-5s DACL cleanup loop, which can consume the OS
     // shutdown-handler budget. Factored through `cancel_then_cleanup` so a
@@ -1025,15 +1090,13 @@ fn cancel_then_cleanup(emit: impl FnOnce(), cleanup: impl FnOnce()) {
     cleanup();
 }
 
-/// Install the console-control handler. Idempotent — calling twice
-/// registers the same handler twice, which is harmless because the
-/// take-and-drop is `Option::take`-based.
+/// Install the executor's console-control handler before backend execution.
 #[cfg(target_os = "windows")]
-fn install_dacl_ctrl_handler() {
+fn install_dacl_ctrl_handler() -> windows::core::Result<()> {
     use windows::Win32::System::Console::SetConsoleCtrlHandler;
     // SAFETY: `dacl_ctrl_handler` has the correct ABI; the `Add=TRUE`
     // call merely appends to the OS handler chain.
-    let _ = unsafe { SetConsoleCtrlHandler(Some(dacl_ctrl_handler), true) };
+    unsafe { SetConsoleCtrlHandler(Some(dacl_ctrl_handler), true) }
 }
 
 fn main() {
@@ -1150,7 +1213,10 @@ fn main() {
     // DaclManager on signal. Cheap and idempotent. Windows-only: the parked
     // DACL manager it drains lives behind `#[cfg(target_os = "windows")]`.
     #[cfg(target_os = "windows")]
-    install_dacl_ctrl_handler();
+    if let Err(error) = install_dacl_ctrl_handler() {
+        eprintln!("cannot install executor console-control handler: {error}");
+        process::exit(1);
+    }
 
     // Stack-owned witness so a panic anywhere below — between
     // `park_dacl_for_cleanup` and the explicit `drop(take_parked_dacl())`
@@ -1656,6 +1722,8 @@ fn main() {
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    #[cfg(target_os = "windows")]
+    let console_run = ConsoleRunGuard::new(runner.cancellation());
     let run_start = Instant::now();
     let mut response = runner.run(&request, &mut logger);
     let run_elapsed = run_start.elapsed();
@@ -1701,6 +1769,10 @@ fn main() {
     drop(runner);
     #[cfg(target_os = "windows")]
     drop(take_parked_dacl());
+    #[cfg(target_os = "windows")]
+    let cancelled = console_run.finish();
+    #[cfg(not(target_os = "windows"))]
+    let cancelled = false;
 
     // Surface security warnings (e.g. permissiveLearningMode relaxing
     // deny-by-default under --audit). The logger only records these rather than
@@ -1724,13 +1796,25 @@ fn main() {
         ));
     }
 
-    telemetry::emit_completion_with_kind(
-        telemetry_active,
-        &request.containment,
-        requested_sandbox_kind,
-        &response,
-        run_elapsed,
-    );
+    if cancelled {
+        telemetry::emit_early_exit_with_kind(
+            telemetry_active,
+            &request.containment,
+            requested_sandbox_kind,
+            telemetry::FailureReason::Cancelled,
+        );
+        if response.exit_code != 0 {
+            response.exit_code = 130;
+        }
+    } else {
+        telemetry::emit_completion_with_kind(
+            telemetry_active,
+            &request.containment,
+            requested_sandbox_kind,
+            &response,
+            run_elapsed,
+        );
+    }
 
     if cli.dry_run {
         handle_dry_run_exit(&response, &mut logger);
@@ -3124,6 +3208,38 @@ mod tests {
             "state-aware command-rendering failures emit an envelope on stdout"
         );
         assert!(err.message.contains("invalid CLI command override"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn console_handler_claims_only_cooperatively_cancellable_interrupts() {
+        use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT};
+        for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+            let cancellation = RunCancellation::default();
+            let guard = ConsoleRunGuard::new(Some(cancellation.clone()));
+            assert!(unsafe { dacl_ctrl_handler(event) }.as_bool());
+            assert!(
+                !cancellation.was_cancelled(),
+                "requesting must not pretend cleanup completed"
+            );
+            assert!(
+                !guard.finish(),
+                "a completed run wins over an unobserved cancellation"
+            );
+        }
+        let cancellation = RunCancellation::default();
+        assert!(!request_console_cancellation(
+            CTRL_CLOSE_EVENT,
+            Some(&cancellation)
+        ));
+        assert!(!request_console_cancellation(CTRL_C_EVENT, None));
+        assert!(!request_console_cancellation(CTRL_BREAK_EVENT, None));
+        cancellation.complete();
+        assert!(!request_console_cancellation(
+            CTRL_C_EVENT,
+            Some(&cancellation)
+        ));
+        assert!(RUN_CANCELLATION_SLOT.lock().unwrap().is_none());
     }
 
     #[cfg(target_os = "windows")]
