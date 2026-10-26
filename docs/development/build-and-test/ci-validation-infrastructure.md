@@ -33,6 +33,7 @@ the individual local test scripts are documented in
 | `.github/workflows/Package.IsolationSession.TestBundle.Job.yml` | `workflow_call`-only. Builds the IsolationSession test bundle natively on x64 and arm64 and uploads it as `isolation-session-test-bundle-<target>`. |
 | `scripts/ci/build-isolation-session-test-bundle.ps1` | Builds and assembles the IsolationSession test bundle, and checks that each payload discovers its tests. |
 | `scripts/ci/stage-nvx-validation-tests.ps1` | Stages the compiled Windows x64 SDK MicroVM tests in the existing Windows artifact and checks required test discovery. |
+| `scripts/ci/Invoke-CratePackage.ps1 -VerifyMicrovmTests` | Extracts the `mxc-sdk` archive, requires its seven MicroVM fixtures, and compiles `nvx_e2e` with `microvm` on Windows x64 without running a VM. |
 | `scripts/ci/validation-test-matrix.json` | The matrix: OS versions, backends, triggers, job staggering. |
 | `scripts/ci/resolve-validation-test-matrix.mjs` | Matrix validator + plan expander. Emits the GitHub Actions matrices. |
 | `scripts/ci/prepare-windows-host.ps1` | Per-backend Windows host preparation / prerequisite assertions, plus the `winget` repair and the workload-tooling install. Runs in Windows PowerShell, because it installs the `pwsh` the steps after it use. |
@@ -234,7 +235,7 @@ get fixed or wired.
 | WSLC | ✅ Good | Might have to retry hung jobs - this is an issue with overzealous agent reclaiming. |
 | IsolationSession | ✅ Good | Runs the one-shot and state-aware suites, the Rust SDK in-process and helper tests, the C# end-to-end tests, the Node SDK suite and the COM apartment probe. Fails when the host cannot run isolation sessions, when a suite executes nothing, or when the run changes the set of local accounts. |
 | Windows Sandbox | ⛔ Blocked | Images don't support `Containers-DisposableClientVM` opt. feature |
-| MicroVM | Experimental | Windows 25H2 x64 nightly runs the prebuilt `mxc-sdk/tests/nvx_e2e.rs` suite, including executor config scenarios and captured JSON execution. Host-only checks remain in normal PR builds. |
+| MicroVM | Experimental | Windows 25H2 x64 nightly runs the prebuilt `mxc-sdk/tests/nvx_e2e.rs` suite, including executor config scenarios and captured JSON execution. Host-only and extracted-crate compilation checks remain in normal Windows x64 PR builds. |
 | Seatbelt | ✅ Good | Failures are genuine MXC bugs. |
 
 ## Host preparation

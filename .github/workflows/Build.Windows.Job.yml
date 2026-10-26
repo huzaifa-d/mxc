@@ -93,7 +93,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         shell: pwsh
         env:
-          ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR: ${{ github.workspace }}/src/target/${{ matrix.target }}/release/aci-edge-sandboxes
+          ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR: ${{ github.workspace }}\src\target\${{ matrix.target }}\release\aci-edge-sandboxes
         run: |
           & ./scripts/ci/Invoke-CratePackage.ps1 `
             -OutDir (Join-Path $env:RUNNER_TEMP 'microvm-crate') `

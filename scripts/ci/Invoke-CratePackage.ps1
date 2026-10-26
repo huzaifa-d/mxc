@@ -138,7 +138,7 @@ if ($VerifyMicrovmTests)
             'microvm_timeout.json'
         ))
         {
-            $fixturePath = Join-Path $extractedPackage "tests/fixtures/microvm/$fixture"
+            $fixturePath = Join-Path $extractedPackage "tests\fixtures\microvm\$fixture"
             if (-not (Test-Path -LiteralPath $fixturePath -PathType Leaf))
             {
                 throw "Packaged MicroVM fixture is missing: $fixture"
