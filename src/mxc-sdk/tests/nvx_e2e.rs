@@ -36,6 +36,7 @@ fn microvm_typed_stable_run_and_spawn_require_optin() {
         let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
         request.containment = mxc_sdk::v1::Containment::MicroVm {
             image: "python:3.12-alpine".to_owned(),
+            memory_mib: None,
         };
         let error = if spawn {
             mxc_sdk::v1::spawn(request, Default::default())
@@ -54,10 +55,38 @@ fn microvm_experimental_typed_run_rejects_blank_image_before_runtime() {
     let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
     request.containment = mxc_sdk::v1::Containment::MicroVm {
         image: " ".to_owned(),
+        memory_mib: None,
     };
     let error = mxc_sdk::v1::experimental::run(request, Default::default()).unwrap_err();
     assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
     assert!(error.message.contains("microvm.image"), "{error}");
+}
+
+#[test]
+fn declared_microvm_streaming_and_lifecycle_fail_closed() {
+    let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+    request.containment = mxc_sdk::v1::Containment::MicroVm {
+        image: "python:3.12-alpine".to_owned(),
+        memory_mib: None,
+    };
+    let error = mxc_sdk::v1::experimental::spawn(request, Default::default())
+        .err()
+        .expect("MicroVM streaming is not implemented");
+    assert_eq!(error.code, ErrorCode::UnsupportedContainment, "{error}");
+    assert!(error.message.contains("streaming"), "{error}");
+
+    for validate in [false, true] {
+        let request = mxc_sdk::v1::ProvisionRequest::microvm("python:3.12-alpine", None);
+        let error = if validate {
+            mxc_sdk::v1::experimental::container::validate_provision(request, Default::default())
+                .unwrap_err()
+        } else {
+            mxc_sdk::v1::experimental::container::provision_container(request, Default::default())
+                .unwrap_err()
+        };
+        assert_eq!(error.code, ErrorCode::UnsupportedPhase, "{error}");
+        assert!(error.message.contains("lifecycle"), "{error}");
+    }
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64", feature = "microvm")))]
@@ -102,6 +131,13 @@ mod windows_x64 {
     fn rejected_requests() -> Vec<(&'static str, Value)> {
         vec![
             ("ui", json!({"ui": {"disable": true}})),
+            (
+                "memory-override",
+                json!({"microvm": {
+                    "image": "python:3.12-alpine",
+                    "provision": {"memoryMib": 512}
+                }}),
+            ),
             (
                 "capture",
                 json!({"processContainer": {"captureDenials": {}}}),
@@ -205,6 +241,9 @@ mod windows_x64 {
 
     fn process_limit_error(label: &str) -> Option<&'static str> {
         match label {
+            "memory-override" => {
+                Some("NVX guest memory overrides are not available in this build")
+            }
             "cwd-limit" | "cwd-multibyte-limit" => {
                 Some("NVX process.cwd must not exceed 4095 UTF-8 bytes")
             }
@@ -276,6 +315,18 @@ mod windows_x64 {
                 error.code, error.message
             );
         }
+
+        let mut request = mxc_sdk::v1::ContainerRequest::new("printf forbidden");
+        request.containment = mxc_sdk::v1::Containment::MicroVm {
+            image: "python:3.12-alpine".to_owned(),
+            memory_mib: Some(512),
+        };
+        let error = mxc_sdk::v1::experimental::run(request, Default::default()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::PolicyValidation, "{error}");
+        assert_eq!(
+            error.message,
+            "NVX guest memory overrides are not available in this build"
+        );
 
         for (label, patch) in valid_process_boundaries() {
             let error =
@@ -481,6 +532,7 @@ print("NVX_TYPED_IMAGE_AND_POLICY_OK", end="")
             ContainerRequest {
                 containment: Containment::MicroVm {
                     image: "python:3.12-alpine".to_owned(),
+                    memory_mib: None,
                 },
                 filesystem: Some(FilesystemPolicy {
                     readonly_paths: vec![ro.to_str().unwrap().to_owned()],

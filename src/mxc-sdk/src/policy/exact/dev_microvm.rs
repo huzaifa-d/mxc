@@ -109,7 +109,7 @@ fn map_ingress(value: &NetworkIngressPolicy) -> contract::NetworkIngress {
 }
 
 pub(super) fn build(input: &PreparedInput<'_>) -> Result<contract::OneShotRequest, MxcError> {
-    let Containment::MicroVm { image } = input.containment else {
+    let Containment::MicroVm { image, memory_mib } = input.containment else {
         return Err(error(
             "development MicroVM builder requires MicroVm containment",
         ));
@@ -207,6 +207,12 @@ pub(super) fn build(input: &PreparedInput<'_>) -> Result<contract::OneShotReques
         hyperlight: Default::default(),
         microvm: contract::OptionalField::present(contract::OneShotMicroVm {
             image: contract::ImageReference::new(image.clone()).map_err(error)?,
+            provision: optional!(
+                contract,
+                memory_mib.map(|memory_mib| contract::MicroVmProvision {
+                    memory_mib: contract::OptionalField::present(memory_mib),
+                })
+            ),
         }),
     })
 }

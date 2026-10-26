@@ -14,8 +14,12 @@ Attached execution is not exposed by the V1 SDK.
 Experimental Windows x64 MicroVM captured execution uses
 `v1::experimental::run(request: ContainerRequest, options: RunOptions) -> Result<ExecutionResult, Error>`.
 It requires the `microvm` build feature and
-`Containment::MicroVm { image: String }`. Stable operations do not authorize
-MicroVM. There is no experimental streaming or MicroVM lifecycle API.
+`Containment::MicroVm { image: String, memory_mib: Option<u32> }`. Stable operations do not authorize
+MicroVM. Live execution uses `v1::experimental::spawn`, and container lifecycle
+operations use `v1::experimental::container`, as described below.
+These entry points do not imply that every operation is implemented by the
+selected backend. See the [NVX support matrix](../../../backends/nvx/nvx.md#supported-operations-and-policy)
+for the operations and settings supported by the current runtime.
 
 | Output | Create and run a container | Run in an existing container | Result |
 |---|---|---|---|
@@ -34,6 +38,49 @@ attaching the workload to the host process's global console streams.
 Read the terminal output concurrently rather than only after `wait`. On macOS
 a workload cannot exit while its terminal output is still unread, so a caller
 that waits first without reading can block indefinitely.
+
+## Experimental MicroVM operations
+
+NVX MicroVM uses the ordinary V1 request, process, result, and options types
+through explicit experimental entry points:
+Creation selects `Containment::MicroVm { image: String, memory_mib: Option<u32> }`; provision uses
+`ProvisionRequest::microvm(image, memory_mib)`. Both require a registry image
+reference. Provision fixes the image for the container, and execution in an
+existing container cannot select another image or memory size. On either creation
+path, `None` leaves memory unspecified and `Some(512)` requests 512 MiB.
+This experimental backend is exposed by Rust only; the .NET and Node V1
+APIs do not add MicroVM selection.
+
+```rust
+let default_creation = Containment::MicroVm {
+    image: "python:3.12-alpine".to_owned(), memory_mib: None,
+};
+let sized_creation = Containment::MicroVm {
+    image: "python:3.12-alpine".to_owned(), memory_mib: Some(512),
+};
+let default_provision = ProvisionRequest::microvm("python:3.12-alpine", None);
+let sized_provision = ProvisionRequest::microvm("python:3.12-alpine", Some(512));
+```
+
+```rust
+pub fn mxc_sdk::v1::experimental::spawn(
+    request: ContainerRequest,
+    options: SpawnOptions,
+) -> Result<MxcProcess, Error>;
+
+pub fn mxc_sdk::v1::experimental::run(
+    request: ContainerRequest,
+    options: RunOptions,
+) -> Result<ExecutionResult, Error>;
+```
+
+`mxc_sdk::v1::experimental::container` exposes `provision_container`,
+`validate_provision`, `start_container`, `validate_start`,
+`spawn_in_container`, `run_in_container`, `validate_process`,
+`stop_container`, `validate_stop`, `deprovision_container`, and
+`validate_deprovision` with the same signatures as `v1::container`.
+`spawn_in_container_with_pty` is present for API consistency but NVX rejects it
+before workload launch.
 
 ## Discovery and validation
 

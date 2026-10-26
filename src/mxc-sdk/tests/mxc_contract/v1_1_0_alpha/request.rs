@@ -7,6 +7,71 @@ use mxc_sdk::mxc_contract::dev::{
 };
 
 #[test]
+fn microvm_creation_requires_an_image_on_both_paths() {
+    for operation in [
+        r#""process":{"commandLine":"echo"}"#,
+        r#""phase":"provision""#,
+    ] {
+        for settings in [
+            "", r#","microvm":{}"#, r#","microvm":{"image":""}"#,
+            r#","microvm":{"image":" "}"#, r#","microvm":{"image":"python:\n3.12"}"#,
+            r#","microvm":{"image":"python:\u00003.12"}"#, r#","microvm":{"image":null}"#,
+        ] {
+            let json = format!(
+                r#"{{"version":"1.1.0-alpha","containment":"microvm",{operation}{settings}}}"#
+            );
+            assert!(parse_request(&json).is_err(), "accepted {json}");
+        }
+        let json = format!(
+            r#"{{"version":"1.1.0-alpha","containment":"microvm",{operation},"microvm":{{"image":"python:3.12-alpine"}}}}"#
+        );
+        assert!(parse_request(&json).is_ok(), "rejected {json}");
+    }
+}
+
+#[test]
+fn existing_microvm_execution_cannot_select_an_image() {
+    let json = r#"{
+        "version":"1.1.0-alpha",
+        "phase":"exec",
+        "sandboxId":"microvm:0123456789abcdef0123456789abcdef",
+        "process":{"commandLine":"echo"},
+        "microvm":{"image":"python:3.12-alpine"}
+    }"#;
+    assert!(parse_request(json).is_err());
+}
+
+#[test]
+fn both_microvm_creation_contracts_preserve_optional_provision_presence() {
+    for lifecycle in [false, true] {
+        for (settings, present, memory) in [
+            ("", false, None),
+            (r#","provision":{}"#, true, None),
+            (r#","provision":{"memoryMib":512}"#, true, Some(512)),
+        ] {
+            let operation = if lifecycle {
+                r#""phase":"provision""#
+            } else {
+                r#""process":{"commandLine":"echo"}"#
+            };
+            let json = format!(r#"{{"version":"1.1.0-alpha","containment":"microvm",{operation},"microvm":{{"image":"python:3.12-alpine"{settings}}}}}"#);
+            let provision = match parse_request(&json).unwrap() {
+                Request::OneShot(request) => request.microvm.into_option().unwrap().provision,
+                Request::Provision(ProvisionRequest::MicroVm(request)) => request.microvm.provision,
+                other => panic!("unexpected request {other:?}"),
+            };
+            assert_eq!(provision.as_ref().is_some(), present);
+            assert_eq!(
+                provision
+                    .into_option()
+                    .and_then(|config| config.memory_mib.into_option()),
+                memory
+            );
+        }
+    }
+}
+
+#[test]
 fn no_phase_selects_one_shot_request() {
     let json = r#"{
         "version": "1.1.0-alpha",

@@ -86,6 +86,11 @@ pub(super) fn exec_request(
 }
 
 pub(super) fn validate_request(request: &ExecutionRequest) -> Result<(), MxcError> {
+    if request.microvm_memory_mib.is_some() {
+        return Err(MxcError::policy_validation(
+            "NVX guest memory overrides are not available in this build",
+        ));
+    }
     if !request.lifecycle.destroy_on_exit {
         return Err(MxcError::policy_validation(
             "NVX requires lifecycle.destroyOnExit=true",
@@ -413,6 +418,7 @@ mod tests {
         let request = ContainerRequest {
             containment: Containment::MicroVm {
                 image: "python:3.12-alpine".to_owned(),
+                memory_mib: None,
             },
             network: Some(NetworkPolicy {
                 egress: Some(NetworkEgressPolicy {
@@ -563,6 +569,7 @@ mod tests {
             let request = ContainerRequest {
                 containment: Containment::MicroVm {
                     image: image.to_owned(),
+                    memory_mib: None,
                 },
                 filesystem: Some(FilesystemPolicy {
                     readonly_paths: vec![r"C:\ro".to_owned()],

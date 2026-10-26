@@ -186,16 +186,27 @@ bundle (`v0.1.0-dev.0430ce79d125` from NVX revision
 verified `bin/aci_edge_agent.dll` C ABI v1 in-process without unpublished Rust
 dependencies; it does not enable standalone OpenVMM execution.
 
-`mxc_sdk::v1::experimental::run(request, options)` supports typed MicroVM
-create-and-run requests with captured stdout/stderr, exit status and timeout.
-Select `Containment::MicroVm { image: String }` with a required registry image
-reference. The hidden JSON facade `mxc_sdk::__ffi::run_json(json, true)` accepts
-the development `1.1.0-alpha` contract with root `"microvm": {"image": "..."}`.
-Stable `run` and `spawn` do not authorize this backend. Streaming, PTY and
-public Rust MicroVM container lifecycle operations are not available.
-Distribute the complete `aci-edge-sandboxes/` directory beside the consuming
-executable. The native agent resolves the caller's image reference on the host;
-there is no default image or local image-file input.
+The `mxc_sdk::v1::experimental` entry points use the V1 request and result
+types. Creation requires an explicit registry image. The contract also
+defines memory settings and provision requests independently of backend
+availability:
+
+```rust,no_run
+use mxc_sdk::v1::{Containment, ContainerRequest, ProvisionRequest};
+
+let mut request = ContainerRequest::new("python --version");
+request.containment = Containment::MicroVm {
+    image: "python:3.12-alpine".to_owned(),
+    memory_mib: None, // Use the backend's memory default.
+};
+let mut sized_request = ContainerRequest::new("python --version");
+sized_request.containment = Containment::MicroVm {
+    image: "python:3.12-alpine".to_owned(),
+    memory_mib: Some(512),
+};
+let default_provision = ProvisionRequest::microvm("python:3.12-alpine", None);
+let provision = ProvisionRequest::microvm("python:3.12-alpine", Some(512));
+```
 
 NVX captures at most 64 MiB (67,108,864 bytes) of stdout and stderr combined,
 including when the process timeout is zero. Output up to that limit is returned
@@ -207,6 +218,20 @@ See the [NVX backend guide](../../docs/backends/nvx/nvx.md) for host
 requirements, the supported-operation and policy matrix, working-directory and
 environment limits, and the maintainer bundle-upgrade procedure. Windows ARM64
 and Linux MicroVM execution are not available in this phase.
+
+The development `1.1.0-alpha` JSON creation paths require `microvm.image`;
+both also accept optional `microvm.provision.memoryMib`. `None` leaves memory
+unspecified; `Some(512)` requests 512 MiB. Image and memory selection
+are fixed at creation, not accepted by later executions. Blank or
+whitespace/control-containing image input fails before backend setup, and
+unsupported image-reference capabilities fail explicitly. Registry syntax and
+resolution errors come from NVX; MXC does not implement a second image parser.
+Distribute the complete `aci-edge-sandboxes/` directory beside the consuming
+executable. The native agent materializes the caller-selected image on the host;
+this does not grant guest network access. There is no Azure Linux fallback.
+References are cached by text; prefer a digest when immutable content matters.
+The host requires Windows Hypervisor Platform and hardware virtualization.
+The complete signed bundle must match the pinned runtime's manifests and assets.
 
 Backend implementations, shared runtime support, backend dispatch, and host
 probing are internal modules of this published crate. The crate root exposes

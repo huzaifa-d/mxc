@@ -99,6 +99,7 @@ fn state_aware_common(
         ui: None,
         hyperlight: None,
         microvm_image: None,
+        microvm_memory_mib: None,
     }
 }
 

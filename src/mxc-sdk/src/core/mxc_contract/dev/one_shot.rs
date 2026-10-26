@@ -121,4 +121,7 @@ pub struct Request {
 pub struct OneShotMicroVm {
     /// Registry image reference resolved by the signed NVX agent.
     pub image: super::ImageReference,
+    /// Optional settings applied when creating the MicroVM.
+    #[serde(default)]
+    pub provision: super::OptionalField<super::MicroVmProvision>,
 }

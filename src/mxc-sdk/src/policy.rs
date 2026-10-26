@@ -605,7 +605,12 @@ pub enum Containment {
     ///
     /// Requires the `microvm` build feature and an operation under
     /// [`crate::v1::experimental`].
-    MicroVm { image: String },
+    MicroVm {
+        /// Registry image selected by the caller.
+        image: String,
+        /// Guest memory in MiB; absent leaves the backend default unchanged.
+        memory_mib: Option<u32>,
+    },
 }
 
 impl Containment {

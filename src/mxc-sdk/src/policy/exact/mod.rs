@@ -119,6 +119,45 @@ mod tests {
     }
 
     #[test]
+    fn microvm_zero_memory_typed_authoring_fails_during_normalization() {
+        let mut request = crate::v1::ContainerRequest::new("echo hello");
+        request.containment = Containment::MicroVm {
+            image: "python:3.12-alpine".to_owned(),
+            memory_mib: Some(0),
+        };
+        let error = crate::policy::prepare_creation_request(&request, None).unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::MalformedRequest);
+        assert_eq!(
+            error.message,
+            "failed to build request: Validation error: microvm.provision.memoryMib must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn microvm_zero_memory_json_fails_during_normalization() {
+        use crate::mxc_common::{config_parser::ParseError, error::WxcError};
+
+        let json = r#"{
+            "version":"1.1.0-alpha",
+            "containment":"microvm",
+            "process":{"commandLine":"echo hello"},
+            "microvm":{"image":"python:3.12-alpine","provision":{"memoryMib":0}}
+        }"#;
+        let error = crate::mxc_common::config_parser::load_mxc_request_from_json(
+            json,
+            &mut Logger::new(Mode::Buffer),
+        )
+        .unwrap_err();
+        let ParseError::OneShot(WxcError::Validation(message)) = error else {
+            panic!("expected one-shot semantic validation, got {error:?}");
+        };
+        assert_eq!(
+            message,
+            "microvm.provision.memoryMib must be greater than zero"
+        );
+    }
+
+    #[test]
     fn microvm_authoring_preserves_image_and_rejects_blank_input() {
         for image in [
             "python:3.12-alpine",
@@ -128,6 +167,7 @@ mod tests {
                 &ContainerPolicy::default(),
                 &Containment::MicroVm {
                     image: image.to_owned(),
+                    memory_mib: None,
                 },
                 "echo hello",
                 None,
@@ -140,6 +180,7 @@ mod tests {
                 &ContainerPolicy::default(),
                 &Containment::MicroVm {
                     image: image.to_owned(),
+                    memory_mib: None,
                 },
                 "echo hello",
                 None,

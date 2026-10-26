@@ -151,6 +151,8 @@ pub fn run_state_aware(
 /// Backend-specific metadata returned by typed engine lifecycle dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineProvisionMetadata {
+    /// MicroVM provision metadata.
+    MicroVm(serde_json::Value),
     /// IsolationSession provision metadata.
     IsolationSession {
         agent_user_name: String,

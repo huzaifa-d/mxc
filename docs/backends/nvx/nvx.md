@@ -7,8 +7,8 @@ command in a Linux guest on a Windows x64 host. Enable the Cargo feature
 `microvm` and authorize experimental execution at runtime. The Cargo feature
 and the JSON selector `containment: "microvm"` retain their existing names.
 
-Phase 1 supports Windows x64 only. Windows ARM64 and Linux hosts do not have an
-active MicroVM execution path in this phase; support for those platforms is
+The backend supports Windows x64 only. Windows ARM64 and Linux hosts do not have an
+active MicroVM execution path; support for those platforms is
 future work. Enabling the feature does not make an unsupported host available.
 
 ## Requirements and quick start
@@ -37,6 +37,9 @@ Use the development `1.1.0-alpha` request contract:
 {
   "version": "1.1.0-alpha",
   "containment": "microvm",
+  "microvm": {
+    "image": "mcr.microsoft.com/azurelinux/base/core:3.0"
+  },
   "process": {
     "commandLine": "printf 'hello from the guest\\n'",
     "timeout": 30000
@@ -49,30 +52,31 @@ wxc-exec.exe --experimental config.json
 ```
 
 Commands run in the guest's POSIX shell, not in a host shell or a Python
-interpreter. The workload image is fixed to
-`mcr.microsoft.com/azurelinux/base/core:3.0`; requests cannot select another
-image in Phase 1. The native agent pulls that image on the host, so the host
-needs access to the registry even though guest networking is not enabled.
+interpreter. Every creation request requires a registry image in
+`microvm.image`; there is no default or local image-file input. The native
+agent pulls the selected image on the host. Host-side image acquisition does
+not grant the guest network access.
 
 ## Supported operations and policy
 
 Schema-valid fields do not imply backend support. MXC rejects unsupported
 policy before creating a VM rather than ignoring it.
 
-| Surface | Phase 1 support |
+| Surface | Support |
 |---|---|
 | Host platforms | Windows x64 with WHP. Windows ARM64 and Linux execution are unavailable. |
 | Execution | Create-and-run development JSON requests with captured stdout, stderr, exit status, and timeout. |
-| Typed V1 SDK APIs | This phase does not add MicroVM targeting to the published typed APIs. |
-| Streaming, PTY, and container lifecycle operations | Unsupported. |
-| Workload image | Fixed Azure Linux image above; no request-level image selection. |
+| Typed V1 SDK APIs | `v1::experimental::run` supports captured execution. Ordinary V1 operations do not authorize MicroVM. Node and .NET do not expose typed MicroVM selection. |
+| Streaming, PTY, and container lifecycle operations | Unsupported. The development contract and experimental Rust entry points define these requests, but execution fails explicitly before backend setup. |
+| Workload image | Required caller-selected registry reference in `microvm.image`. |
+| Guest memory override | `microvm.provision.memoryMib` and Rust `memory_mib` are defined by the contract and typed requests, but explicit overrides return `PolicyValidation` before bundle discovery. Omit them to use the runtime default. |
 | Working directory | Optional absolute POSIX guest path; see the limits below. |
 | Environment | Guest default, optionally extended with additive entries; see below. |
 | Process timeout | `0` means no workload timeout; nonzero values may not exceed 3,600,000 ms. |
 | Captured output | At most 64 MiB (67,108,864 bytes) combined stdout and stderr. |
-| Filesystem policy | No host mounts or copy-back. Nonempty `readonlyPaths`, `readwritePaths`, or `deniedPaths` are rejected. |
-| Network policy | A supplied `network` section is rejected, including empty or deny-only sections. Omit it. |
-| Runtime proxy | `runtimeConfig.networkProxy` is rejected. Proxy environment variables are also rejected. |
+| Filesystem policy | Read-only, read-write, and denied paths are mapped to the agent and require the corresponding runtime capabilities. |
+| Network policy | Directional defaults and CIDR/protocol/port rules require the corresponding runtime capabilities. Unsupported ingress or host-loopback allow postures fail closed. |
+| Runtime proxy | `runtimeConfig.networkProxy` requires the runtime's proxy capability. Proxy environment variables remain rejected. |
 | UI policy | A supplied `ui` section is rejected. |
 | Fallback policy | A supplied `fallback` section is rejected. |
 | Lifecycle options | `destroyOnExit` must be `true` and `preservePolicy` must be `false`. |
@@ -121,7 +125,9 @@ Windows 25H2 x64. It consumes the same Windows build artifact, including the
 compiled `nvx_e2e` tests and the complete signed bundle; the validation host
 does not rebuild them.
 
-The SDK suite covers both the executor and captured JSON execution, binary
+The SDK suite covers both the executor and captured JSON execution, typed
+image selection, filesystem enforcement, directional network and proxy
+enforcement against controlled reachable host endpoints, binary
 stdout/stderr, exit codes, environment and working-directory settings,
 timeouts, capture limits, cleanup, and the seven MicroVM config fixtures.
 Missing prerequisites, skipped scenarios, and empty test runs fail validation.

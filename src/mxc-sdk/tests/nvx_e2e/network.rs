@@ -102,6 +102,7 @@ impl ControlledServices {
         ContainerRequest {
             containment: Containment::MicroVm {
                 image: "python:3.12-alpine".to_owned(),
+                memory_mib: None,
             },
             network: Some(network),
             environment: Some(vec![

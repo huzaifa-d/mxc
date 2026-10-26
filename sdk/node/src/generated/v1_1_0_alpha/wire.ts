@@ -262,6 +262,34 @@ export interface Lxc {
   release: string;
 }
 
+export type MicroVmContainment = "microvm";
+
+/**
+ * MicroVM creation settings shared by create-and-run and provision requests.
+ */
+export interface MicroVmProvision {
+  /**
+   * Guest memory in MiB. Zero is rejected by semantic validation.
+   */
+  memoryMib?: number;
+}
+
+/**
+ * A complete development provision request for the MicroVM backend.
+ */
+export interface MicroVmProvisionRequest {
+  $schema?: string;
+  _comment?: unknown;
+  containment: MicroVmContainment;
+  filesystem?: Filesystem;
+  microvm: StateAwareMicroVm;
+  network?: Network;
+  phase: ProvisionPhase;
+  runtimeConfig?: RuntimeConfig;
+  telemetry?: Telemetry;
+  version: Version;
+}
+
 /**
  * Network access policy shared by the stable containment backends.
  */
@@ -380,6 +408,10 @@ export interface OneShotMicroVm {
    * Registry image reference resolved by the signed NVX agent.
    */
   image: ImageReference;
+  /**
+   * Optional settings applied when creating the MicroVM.
+   */
+  provision?: MicroVmProvision;
 }
 
 /**
@@ -739,6 +771,20 @@ export interface StateAwareIsolationSession {
 }
 
 /**
+ * State-aware MicroVM settings.
+ */
+export interface StateAwareMicroVm {
+  /**
+   * Registry image fixed for the lifetime of this container.
+   */
+  image: ImageReference;
+  /**
+   * Optional provision-phase settings.
+   */
+  provision?: MicroVmProvision;
+}
+
+/**
  * State-aware WSLC settings.
  */
 export interface StateAwareWslc {
@@ -995,4 +1041,4 @@ export interface WslcProvisionSessionRequest {
 /**
  * Exact mutable MXC development configuration contract.
  */
-export type MXCConfiguration = OneShotRequest | WslcDeprovisionSessionRequest | DeprovisionRequest | StopRequest | ExecRequest | StartRequest | WslcProvisionRequest | IsolationSessionProvisionRequest | WindowsSandboxProvisionRequest | WslcProvisionSessionRequest;
+export type MXCConfiguration = OneShotRequest | WslcDeprovisionSessionRequest | DeprovisionRequest | StopRequest | ExecRequest | StartRequest | WslcProvisionRequest | MicroVmProvisionRequest | IsolationSessionProvisionRequest | WindowsSandboxProvisionRequest | WslcProvisionSessionRequest;

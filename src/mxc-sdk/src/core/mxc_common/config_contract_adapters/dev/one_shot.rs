@@ -296,6 +296,12 @@ pub(super) fn into_common_request_ir(
         hyperlight,
         microvm,
     } = request;
+    let microvm = microvm.into_option();
+    let microvm_memory_mib = microvm
+        .as_ref()
+        .and_then(|config| config.provision.as_ref())
+        .and_then(|config| config.memory_mib.as_ref())
+        .copied();
     crate::mxc_common::common_request_ir::CommonRequestIR {
         schema: schema.into_option(),
         comment: comment.into_option(),
@@ -321,9 +327,8 @@ pub(super) fn into_common_request_ir(
         test_feature: test.into_option().map(convert_test),
         windows_sandbox: windows_sandbox.into_option().map(convert_windows_sandbox),
         hyperlight: hyperlight.into_option().map(convert_hyperlight),
-        microvm_image: microvm
-            .into_option()
-            .map(|config| config.image.into_inner()),
+        microvm_image: microvm.map(|config| config.image.into_inner()),
+        microvm_memory_mib,
     }
 }
 

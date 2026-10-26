@@ -777,6 +777,7 @@ mod tests {
             &crate::v1::ContainerRequest {
                 containment: crate::v1::Containment::MicroVm {
                     image: "python:3.12-alpine".to_owned(),
+                    memory_mib: None,
                 },
                 filesystem: Some(crate::v1::FilesystemPolicy {
                     readonly_paths: vec![r"C:\ro".to_owned()],

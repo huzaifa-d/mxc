@@ -8,6 +8,39 @@ MXC uses a JSON configuration file. The current stable schema is at
 For development, the schema for version `1.1.0-alpha` at
 [`schemas/dev/mxc-config.schema.1.1.0-alpha.json`](../schemas/dev/mxc-config.schema.1.1.0-alpha.json)
 includes experimental features and may change without notice.
+Contract-valid requests remain subject to backend support. See the
+[NVX support matrix](backends/nvx/nvx.md#supported-operations-and-policy)
+for current MicroVM execution, lifecycle, and memory support.
+Development MicroVM creation requires an explicit registry image reference in
+`microvm.image` for both create-and-run and provision requests. For example:
+
+```json
+{
+  "version": "1.1.0-alpha",
+  "phase": "provision",
+  "containment": "microvm",
+  "microvm": {
+    "image": "python:3.12-alpine",
+    "provision": { "memoryMib": 512 }
+  }
+}
+```
+
+Create-and-run requests use the same `microvm.image` field, omit `phase`, and
+include `process.commandLine`. Both creation paths accept optional
+`microvm.provision.memoryMib`, a positive integer measured in MiB. Omitting it
+or supplying `provision: {}` leaves the backend's memory default unchanged.
+Explicit `null`, zero, negative values, and non-integer values are rejected
+before backend setup. Existing-container execution cannot replace image or memory. There is
+no default image. Missing, empty, whitespace-containing or control-character
+image input is rejected before backend setup. Registry-reference syntax and
+materialization are owned by the signed NVX runtime; host image files and
+registry credentials have no separate MXC input fields. Provision fixes the
+image for that container, and later lifecycle operations reject image settings.
+Host-side image acquisition does not grant workload network access. The
+runtime caches a reference by its text, so tags can retain the first pulled
+content; use a digest reference when content identity is required.
+
 For self-contained references to what each supported version accepts, see
 [containment policy language](containment-policy/README.md).
 
@@ -122,13 +155,6 @@ identity-less host proxies omit `allowedProxyPeer` and require
 deployment: it opens both host-loopback directions without restricting access
 to a named proxy peer. It does not enforce a proxy-only host-loopback exception.
 
-The experimental Windows x64 NVX MicroVM backend maps directional network policy
-and `runtimeConfig.networkProxy` to its runtime, rejecting capabilities the
-runtime cannot enforce before creating a sandbox. MicroVM creation requires
-`"microvm": {"image": "python:3.12-alpine"}` alongside
-`"containment": "microvm"` in the development contract. The image is a caller
-supplied registry reference, not a local file path; no default image is selected.
-Native execution still requires `--experimental` and a `microvm` feature build.
 For MicroVM networking and proxy support, see the
 [NVX backend capability table](backends/nvx/nvx.md#supported-operations-and-policy).
 
