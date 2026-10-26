@@ -41,30 +41,40 @@ function Invoke-MicroVmPhase {
             "--config-base64", $base64
         )
     }
-    $stdout = $null
-    $stderr = $null
     $process = $null
     try {
-        $stdout = [IO.Path]::GetTempFileName()
-        $stderr = [IO.Path]::GetTempFileName()
+        if (-not (Test-Path -LiteralPath $WxcExePath -PathType Leaf)) {
+            throw "wxc-exec.exe not found at $WxcExePath"
+        }
         # Native stderr becomes a terminating error under Windows PowerShell 5.1.
-        # Redirect at the process boundary so phase handling retains both streams.
-        $process = Start-Process -FilePath $WxcExePath -ArgumentList $arguments `
-            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $WxcExePath
+        $startInfo.Arguments = $arguments -join ' '
+        if ([IO.Path]::GetExtension($WxcExePath) -in @('.cmd', '.bat')) {
+            $startInfo.FileName = $env:ComSpec
+            $startInfo.Arguments = '/d /s /c ""' + $WxcExePath + '" ' + ($arguments -join ' ') + '"'
+        }
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw "Could not start $WxcExePath"
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        # Wait only for the executor, not its persistent VM descendants.
+        $process.WaitForExit()
         @{
             ExitCode = $process.ExitCode
-            Stdout = [IO.File]::ReadAllText($stdout)
-            Stderr = [IO.File]::ReadAllText($stderr)
+            Stdout = $stdout.GetAwaiter().GetResult()
+            Stderr = $stderr.GetAwaiter().GetResult()
         }
     } finally {
         if ($null -ne $process) {
             $process.Dispose()
-        }
-        if ($null -ne $stdout) {
-            Remove-Item $stdout -Force -ErrorAction SilentlyContinue
-        }
-        if ($null -ne $stderr) {
-            Remove-Item $stderr -Force -ErrorAction SilentlyContinue
         }
     }
 }

@@ -19,6 +19,25 @@ fn fixture_root() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\.."))
 }
 
+struct VmCleanup(String);
+
+impl Drop for VmCleanup {
+    fn drop(&mut self) {
+        for phase in ["stop", "deprovision"] {
+            let request = serde_json::json!({
+                "version": "1.1.0-alpha", "phase": phase, "sandboxId": self.0
+            });
+            if let Err(error) =
+                mxc_sdk::__ffi::run_lifecycle_json(&request.to_string(), false, true)
+            {
+                if !matches!(error.code, ErrorCode::StaleId | ErrorCode::AlreadyStopped) {
+                    eprintln!("NVX test cleanup {phase}: {error}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn discovery_without_bundle_is_read_only() {
     const CHILD: &str = "MXC_NVX_DISCOVERY_CHILD";
@@ -734,6 +753,7 @@ fn typed_lifecycle_reuses_running_microvm() {
         ProvisionOptions::default(),
     )
     .expect("provision MicroVM");
+    let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
     assert!(provisioned.container_id.as_str().starts_with("microvm:"));
     v1::experimental::container::start_container(
         &provisioned.container_id,
@@ -775,11 +795,13 @@ fn deprovisioning_one_microvm_does_not_disrupt_another() {
         ProvisionOptions::default(),
     )
     .expect("provision first MicroVM");
+    let _first_cleanup = VmCleanup(first.container_id.as_str().to_owned());
     let second = v1::experimental::container::provision_container(
         ProvisionRequest::microvm("mcr.microsoft.com/azurelinux/base/core:3.0", None),
         ProvisionOptions::default(),
     )
     .expect("provision second MicroVM");
+    let _second_cleanup = VmCleanup(second.container_id.as_str().to_owned());
     v1::experimental::container::start_container(&first.container_id, StartOptions::default())
         .expect("start first MicroVM");
     v1::experimental::container::start_container(&second.container_id, StartOptions::default())
@@ -828,6 +850,7 @@ fn typed_lifecycle_streams_stdin_stdout_and_cancels() {
         ProvisionOptions::default(),
     )
     .expect("provision MicroVM");
+    let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
     v1::experimental::container::start_container(
         &provisioned.container_id,
         StartOptions::default(),
@@ -937,6 +960,7 @@ fn lifecycle_filesystem_policy_is_enforced() {
     let provisioned =
         v1::experimental::container::provision_container(provision, ProvisionOptions::default())
             .unwrap();
+    let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
     v1::experimental::container::start_container(
         &provisioned.container_id,
         StartOptions::default(),
@@ -975,6 +999,7 @@ fn exact_json_lifecycle_routes_microvm_end_to_end() {
     let response = mxc_sdk::__ffi::run_lifecycle_json(&provision.to_string(), false, true).unwrap();
     let envelope: serde_json::Value = serde_json::from_str(&response).unwrap();
     let id = envelope["result"]["sandboxId"].as_str().unwrap();
+    let _cleanup = VmCleanup(id.to_owned());
     assert!(id.starts_with("microvm:"));
 
     for phase in ["start", "stop", "deprovision"] {
@@ -1008,6 +1033,7 @@ fn run_with_network(network: NetworkPolicy, command: &str) -> v1::ExecutionResul
     let provisioned =
         v1::experimental::container::provision_container(provision, ProvisionOptions::default())
             .unwrap();
+    let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
     v1::experimental::container::start_container(
         &provisioned.container_id,
         StartOptions::default(),
@@ -1153,6 +1179,7 @@ fn pty_and_exec_time_proxy_fail_before_workload_launch() {
         ProvisionOptions::default(),
     )
     .unwrap();
+    let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
     v1::experimental::container::start_container(
         &provisioned.container_id,
         StartOptions::default(),

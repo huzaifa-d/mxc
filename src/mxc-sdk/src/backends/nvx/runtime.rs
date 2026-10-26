@@ -723,6 +723,18 @@ mod tests {
         close.unwrap();
     }
 
+    #[test]
+    #[ignore = "requires Windows x64, WHP and the signed agent bundle; does not provision a VM"]
+    fn signed_agent_probe_verifies_host_without_provisioning() {
+        let state = tempfile::tempdir().unwrap();
+        let mut client = create_client(state.path()).unwrap();
+        let probe = client.probe();
+        let closed = client.close();
+        probe.expect("signed NVX agent must confirm the host virtualization prerequisites");
+        closed.unwrap();
+        println!("HOST_VERIFIED signed NVX agent probe; no VM provisioned");
+    }
+
     enum FakeStep {
         Event {
             kind: u32,
