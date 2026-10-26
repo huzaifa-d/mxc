@@ -81,6 +81,39 @@ fn discovery_without_bundle_is_read_only() {
     assert!(!bundle.exists());
     assert!(!temp.exists());
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+    for payload in ["manifest-only", "tampered-library"] {
+        let bundle = root.path().join(payload);
+        std::fs::create_dir_all(bundle.join("bin")).unwrap();
+        std::fs::write(bundle.join("SOURCE-MANIFEST.json"), "{}").unwrap();
+        if payload == "tampered-library" {
+            std::fs::write(
+                bundle.join("bin").join("aci_edge_agent.dll"),
+                b"not the approved library",
+            )
+            .unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery_without_bundle_is_read_only",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("LOCALAPPDATA", &local)
+            .env("TEMP", &temp)
+            .env("TMP", &temp)
+            .env("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", &bundle)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{payload}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!local.exists(), "{payload} created lifecycle state");
+        assert!(!temp.exists(), "{payload} created temporary state");
+    }
 }
 
 fn process_only_request(command: &str) -> serde_json::Value {
@@ -748,42 +781,65 @@ fn typed_lifecycle_reuses_running_microvm() {
             .any(|backend| backend.backend == "microvm"),
         "configured signed NVX runtime should be discoverable"
     );
-    let provisioned = v1::experimental::container::provision_container(
-        ProvisionRequest::microvm("mcr.microsoft.com/azurelinux/base/core:3.0", Some(512)),
-        ProvisionOptions::default(),
-    )
-    .expect("provision MicroVM");
-    let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
-    assert!(provisioned.container_id.as_str().starts_with("microvm:"));
-    v1::experimental::container::start_container(
-        &provisioned.container_id,
-        StartOptions::default(),
-    )
-    .expect("start MicroVM");
+    for memory_mib in [512u32, 768] {
+        let provisioned = v1::experimental::container::provision_container(
+            ProvisionRequest::microvm(
+                "mcr.microsoft.com/azurelinux/base/core:3.0",
+                Some(memory_mib),
+            ),
+            ProvisionOptions::default(),
+        )
+        .expect("provision MicroVM");
+        let _cleanup = VmCleanup(provisioned.container_id.as_str().to_owned());
+        assert!(provisioned.container_id.as_str().starts_with("microvm:"));
+        v1::experimental::container::start_container(
+            &provisioned.container_id,
+            StartOptions::default(),
+        )
+        .expect("start MicroVM");
 
-    let first = v1::experimental::container::run_in_container(
-        &provisioned.container_id,
-        ExecutionRequest::new("printf first > /tmp/mxc-state"),
-        RunInContainerOptions::default(),
-    )
-    .expect("first exec");
-    assert_eq!(first.outcome, WaitResult::Exited(0));
-    let second = v1::experimental::container::run_in_container(
-        &provisioned.container_id,
-        ExecutionRequest::new("cat /tmp/mxc-state"),
-        RunInContainerOptions::default(),
-    )
-    .expect("second exec");
-    assert_eq!(second.outcome, WaitResult::Exited(0));
-    assert_eq!(second.stdout, b"first");
+        let first = v1::experimental::container::run_in_container(
+            &provisioned.container_id,
+            ExecutionRequest::new("printf first > /tmp/mxc-state && cat /proc/meminfo"),
+            RunInContainerOptions::default(),
+        )
+        .expect("first exec");
+        assert_eq!(first.outcome, WaitResult::Exited(0));
+        let memory = std::str::from_utf8(&first.stdout).unwrap();
+        let total_kib: u64 = memory
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some("MemTotal:"))
+                    .then(|| fields.next().unwrap().parse().unwrap())
+            })
+            .expect("guest must report MemTotal in /proc/meminfo");
+        // MemTotal excludes reserved firmware/kernel memory. These ranges remain disjoint.
+        let minimum_kib = u64::from(memory_mib - 64) * 1024;
+        let maximum_kib = u64::from(memory_mib) * 1024;
+        assert!((minimum_kib..=maximum_kib).contains(&total_kib),
+        "{memory_mib} MiB provision reported {total_kib} KiB; expected {minimum_kib}..={maximum_kib}");
+        println!("VM_MEMORY_OBSERVED requested_mib={memory_mib} memtotal_kib={total_kib}");
+        let second = v1::experimental::container::run_in_container(
+            &provisioned.container_id,
+            ExecutionRequest::new("cat /tmp/mxc-state"),
+            RunInContainerOptions::default(),
+        )
+        .expect("second exec");
+        assert_eq!(second.outcome, WaitResult::Exited(0));
+        assert_eq!(second.stdout, b"first");
 
-    v1::experimental::container::stop_container(&provisioned.container_id, StopOptions::default())
+        v1::experimental::container::stop_container(
+            &provisioned.container_id,
+            StopOptions::default(),
+        )
         .expect("stop MicroVM");
-    v1::experimental::container::deprovision_container(
-        &provisioned.container_id,
-        DeprovisionOptions::default(),
-    )
-    .expect("deprovision MicroVM");
+        v1::experimental::container::deprovision_container(
+            &provisioned.container_id,
+            DeprovisionOptions::default(),
+        )
+        .expect("deprovision MicroVM");
+    }
     println!("VM_EXECUTED phase3 typed_lifecycle_reuses_running_microvm");
 }
 

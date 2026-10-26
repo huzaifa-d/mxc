@@ -124,7 +124,19 @@ operations preserve guest state between executions until the caller stops and
 deprovisions the container. Their state lives under
 `%LOCALAPPDATA%\Microsoft\MXC\nvx`; MXC creates an owner-only directory and rejects
 an existing root with a permissive ACL or a reparse point rather than repairing
-it. Backend discovery never creates lifecycle state.
+it. Backend discovery checks the approved runtime manifest, DLL, image helper,
+hypervisor executable, kernel, and guest image without opening a native host or
+creating lifecycle state. A manifest marker alone does not make the backend
+available.
+
+If native cancellation fails, MXC ends local stream I/O and reports the failure;
+it does not report a timeout or claim that the workload stopped. Create-and-run
+still attempts VM teardown; lifecycle callers can stop and deprovision their
+container if its workload may still be running. Native host-resource
+release failures are reported after lifecycle operations and when waiting for
+streaming execution, alongside any original error. If provisioning succeeded
+before a release failure, the error includes the new sandbox ID so it can be
+stopped and deprovisioned.
 
 ## Validation
 
@@ -140,7 +152,8 @@ enforcement against controlled reachable host endpoints, binary
 stdout/stderr, exit codes, environment and working-directory settings,
 timeouts, capture limits, cleanup, and the seven MicroVM config fixtures.
 Lifecycle scenarios additionally exercise persistent state, independent
-containers, memory selection, stdin EOF, streaming, cancellation, and policy
+containers, guest-visible memory at two distinct requested sizes, stdin EOF,
+streaming, cancellation, and policy
 enforcement. The staged PowerShell harness runs the executor's complete
 provision/start/exec/stop/deprovision sequence.
 Missing prerequisites, skipped scenarios, and empty test runs fail validation.

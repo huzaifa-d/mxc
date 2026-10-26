@@ -188,37 +188,51 @@ struct Shared {
     stdout: Arc<OutputPipe>,
     stderr: Arc<OutputPipe>,
     finishing: AtomicBool,
-    cancelled: AtomicBool,
+    // Keep refusals observable to the pump and retained cancellers after handle release.
+    cancellation: Mutex<Option<Result<(), MxcError>>>,
     expired: AtomicBool,
     done: Mutex<bool>,
     wake: Condvar,
 }
 
 impl Shared {
-    fn cancel(&self) -> Result<(), MxcError> {
-        let result = {
-            let handle = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
-            if self.cancelled.load(Ordering::Acquire) {
-                return Ok(());
+    fn request_cancel(&self) {
+        self.finishing.store(true, Ordering::Release);
+        {
+            let mut cancellation = self
+                .cancellation
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if cancellation.is_none() {
+                let handle = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
+                *cancellation = Some(match *handle {
+                    Some(handle) => self.library.exec_cancel(handle),
+                    None => Ok(()),
+                });
             }
-            let result = match *handle {
-                Some(handle) => self.library.exec_cancel(handle),
-                None => Ok(()),
-            };
-            if result.is_ok() {
-                self.cancelled.store(true, Ordering::Release);
-                self.finishing.store(true, Ordering::Release);
-            }
-            result
-        };
-        if result.is_ok() {
-            if let Some(stdin) = &self.stdin {
-                stdin.close();
-            }
-            self.stdout.close();
-            self.stderr.close();
         }
-        result
+        // Local I/O must end even when the native workload refuses termination.
+        if let Some(stdin) = &self.stdin {
+            stdin.close();
+        }
+        self.stdout.close();
+        self.stderr.close();
+    }
+
+    fn cancellation_result(&self) -> Option<Result<(), MxcError>> {
+        self.cancellation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn cancel(&self) -> Result<(), MxcError> {
+        self.request_cancel();
+        self.cancellation_result().unwrap_or_else(|| {
+            Err(MxcError::backend_error(
+                "NVX cancellation result is missing",
+            ))
+        })
     }
 }
 
@@ -289,7 +303,7 @@ pub(super) fn launch(
         stdout: OutputPipe::new(output),
         stderr: OutputPipe::new(errors),
         finishing: AtomicBool::new(false),
-        cancelled: AtomicBool::new(false),
+        cancellation: Mutex::new(None),
         expired: AtomicBool::new(false),
         done: Mutex::new(false),
         wake: Condvar::new(),
@@ -355,13 +369,21 @@ fn pump_execution(
                                 if shared.finishing.load(Ordering::Acquire) {
                                     return Ok(());
                                 }
-                                let written = shared.library.exec_write(handle, bytes)?;
+                                let written = match shared.library.exec_write(handle, bytes) {
+                                    Ok(written) => written,
+                                    Err(_)
+                                        if matches!(shared.cancellation_result(), Some(Ok(()))) =>
+                                    {
+                                        return Ok(())
+                                    }
+                                    Err(error) => return Err(error),
+                                };
                                 bytes = &bytes[written..];
                             }
                         }
                     })();
                     if result.is_err() && !shared.finishing.load(Ordering::Acquire) {
-                        let _ = shared.cancel();
+                        shared.request_cancel();
                     }
                     result
                 })
@@ -395,16 +417,20 @@ fn pump_execution(
                     if !*done {
                         drop(done);
                         shared.expired.store(true, Ordering::Release);
-                        shared.cancel()?;
+                        shared.request_cancel();
                     }
-                    Ok::<(), MxcError>(())
                 })
                 .map_err(io_error)
         })
         .transpose();
+    let mut cancellation_is_primary = false;
     let mut outcome = match &watchdog {
         Err(error) => Err(error.clone()),
         Ok(_) => loop {
+            if let Some(Err(error)) = shared.cancellation_result() {
+                cancellation_is_primary = true;
+                break Err(error);
+            }
             let event = shared
                 .library
                 .exec_next(handle, Some(100), |event| match event {
@@ -436,7 +462,7 @@ fn pump_execution(
     *shared.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
     shared.wake.notify_all();
     if outcome.is_err() {
-        let _ = shared.cancel();
+        shared.request_cancel();
     }
     if let Some(stdin) = &shared.stdin {
         stdin.close();
@@ -446,17 +472,29 @@ fn pump_execution(
             .join()
             .unwrap_or_else(|_| Err(MxcError::backend_error("NVX input worker panicked")));
         if let Err(error) = result {
-            if outcome.is_ok() && !shared.expired.load(Ordering::Acquire) {
+            if outcome.is_ok() || cancellation_is_primary {
                 outcome = Err(error);
+                cancellation_is_primary = false;
+            } else if let Err(primary) = &mut outcome {
+                append_error(primary, Err(error));
             }
         }
     }
     if let Ok(Some(watchdog)) = watchdog {
-        if let Err(error) = watchdog
-            .join()
-            .unwrap_or_else(|_| Err(MxcError::backend_error("NVX deadline worker panicked")))
-        {
-            if outcome.is_ok() {
+        if watchdog.join().is_err() {
+            let error = MxcError::backend_error("NVX deadline worker panicked");
+            if let Err(primary) = &mut outcome {
+                append_error(primary, Err(error));
+            } else {
+                outcome = Err(error);
+            }
+        }
+    }
+    if let Some(Err(error)) = shared.cancellation_result() {
+        if !cancellation_is_primary {
+            if let Err(primary) = &mut outcome {
+                append_error(primary, Err(error));
+            } else {
                 outcome = Err(error);
             }
         }

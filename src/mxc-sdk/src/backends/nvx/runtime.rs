@@ -27,6 +27,8 @@ pub(super) const APPROVED_DLL_SHA256: &str =
     "a203e58b97a642bd4a68824c0387965541895b25582e18db6f55e28947f5f135";
 pub(super) const APPROVED_OPENVMM_SHA256: &str =
     "697f8221e62a1ea4efb3846fefde6f595c89f4f81c0153a2609bf6fb4c81ea9e";
+const APPROVED_IMAGE_TOOL_SHA256: &str =
+    "633b679a8f8f2586626b7475b1e5e3faa3d2ea7119082ffc5873191194feb6fe";
 pub(super) const APPROVED_KERNEL_SHA256: &str =
     "b36ab45b22d1c14438047b24c3724f54cc71dd03601d0f3cbdca11438f40e768";
 pub(super) const APPROVED_INITRD_SHA256: &str =
@@ -133,8 +135,7 @@ impl Drop for NvxClient {
 
 pub(super) fn create_client(state_root: &Path) -> Result<NvxClient, MxcError> {
     let bundle_dir = discover_bundle_dir()?;
-    let dll_path = bundle_dir.join("bin").join("aci_edge_agent.dll");
-    let library = AgentLibrary::load_verified(&dll_path, APPROVED_DLL_SHA256)?;
+    let library = load_bundle_library(&bundle_dir)?;
     let setup = SetupConfig {
         schema_version: 1,
         state_root: state_root.to_path_buf(),
@@ -300,7 +301,31 @@ fn discover_bundle_dir() -> Result<PathBuf, MxcError> {
 }
 
 pub(super) fn bundle_available() -> bool {
-    discover_bundle_dir().is_ok()
+    discover_bundle_dir()
+        .and_then(|directory| load_bundle_library(&directory))
+        .is_ok()
+}
+
+fn load_bundle_library(directory: &Path) -> Result<&'static AgentLibrary, MxcError> {
+    if !directory.join("bundle-manifest.json").is_file() {
+        return Err(MxcError::backend_unavailable(format!(
+            "NVX signed bundled agent: missing bundle-manifest.json in {}",
+            directory.display()
+        )));
+    }
+    for (path, expected) in [
+        (SOURCE_MANIFEST, APPROVED_MANIFEST_SHA256),
+        (r"bin\direct-images.exe", APPROVED_IMAGE_TOOL_SHA256),
+        (r"bin\openvmm.exe", APPROVED_OPENVMM_SHA256),
+        (r"guest\vmlinux", APPROVED_KERNEL_SHA256),
+        (r"guest\initramfs-edge.cpio.gz", APPROVED_INITRD_SHA256),
+    ] {
+        super::abi::verify_file_digest(&directory.join(path), expected)?;
+    }
+    AgentLibrary::load_verified(
+        &directory.join(r"bin\aci_edge_agent.dll"),
+        APPROVED_DLL_SHA256,
+    )
 }
 
 fn discover_bundle_with(
@@ -600,7 +625,8 @@ mod tests {
 
     use super::super::abi::{
         ErrorBody, ExecEvent, Exports, WireErrorCode, EVENT_EXIT, EVENT_STDERR, EVENT_STDOUT,
-        STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_INVALID_HANDLE, STATUS_OK, STATUS_TIMEOUT,
+        STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_INVALID_HANDLE, STATUS_OK, STATUS_PANIC,
+        STATUS_TIMEOUT,
     };
     use super::*;
 
@@ -645,6 +671,57 @@ mod tests {
         let err = discover_bundle_with(bad_env, exe_in(&exe_dir)).unwrap_err();
         assert_eq!(err.code, MxcErrorCode::BackendUnavailable);
         assert!(err.message.contains("holds no agent bundle"));
+    }
+
+    #[test]
+    fn review_discovery_requires_approved_runtime_without_opening_host() {
+        let source = discover_bundle_dir().unwrap();
+        load_bundle_library(&source).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            "bundle-manifest.json",
+            SOURCE_MANIFEST,
+            r"bin\aci_edge_agent.dll",
+            r"bin\direct-images.exe",
+            r"bin\openvmm.exe",
+            r"guest\vmlinux",
+            r"guest\initramfs-edge.cpio.gz",
+        ];
+        for file in files {
+            let path = root.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::copy(source.join(file), path).unwrap();
+        }
+        for file in files {
+            let path = root.path().join(file);
+            fs::remove_file(&path).unwrap();
+            let error = load_bundle_library(root.path()).unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+            assert!(
+                error.message.contains(
+                    std::path::Path::new(file)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                ),
+                "{file}: {error}"
+            );
+            if file != "bundle-manifest.json" {
+                fs::write(&path, b"tampered runtime bytes").unwrap();
+                let error = load_bundle_library(root.path()).unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+                assert!(
+                    error.message.contains("approved SHA-256"),
+                    "{file}: {error}"
+                );
+            }
+            fs::copy(source.join(file), path).unwrap();
+        }
+        assert!(
+            !root.path().join("aci").exists(),
+            "read-only discovery opened native state"
+        );
     }
 
     #[test]
@@ -757,6 +834,10 @@ mod tests {
         echo_input: bool,
         blocked_input: bool,
         input_closed: bool,
+        write_status: i32,
+        wait_for_input_failure: bool,
+        next_entered: bool,
+        write_failed: bool,
     }
 
     static FAKE_EXECS: OnceLock<Mutex<std::collections::BTreeMap<u64, FakeExecState>>> =
@@ -784,6 +865,10 @@ mod tests {
                     echo_input: false,
                     blocked_input: false,
                     input_closed: false,
+                    write_status: STATUS_OK,
+                    wait_for_input_failure: false,
+                    next_entered: false,
+                    write_failed: false,
                 },
             );
         handle
@@ -908,6 +993,175 @@ mod tests {
         assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
     }
 
+    #[test]
+    fn review_cancel_refusal_interrupts_blocked_output_and_completes() {
+        use std::io::Read;
+        for kind in [EVENT_STDOUT, EVENT_STDERR] {
+            let handle = register_fake_exec(vec![FakeStep::Event {
+                kind,
+                bytes: Some(vec![b'x'; 1024 * 1024]),
+                reported_len: None,
+            }]);
+            FAKE_EXECS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_mut(&handle)
+                .unwrap()
+                .cancel_status = STATUS_PANIC;
+            let client = NvxClient::from_library(fake_library(), handle);
+            let mut execution = client
+                .exec(
+                    &test_id(),
+                    &ExecRequest::command_line("output").with_timeout_ms(25),
+                )
+                .unwrap();
+            let mut output = if kind == EVENT_STDOUT {
+                execution.take_stdout().unwrap()
+            } else {
+                execution.take_stderr().unwrap()
+            };
+            let canceller = execution.canceller();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || tx.send(execution.wait()).unwrap());
+            let completed = rx.recv_timeout(Duration::from_secs(2));
+            let was_finite = completed.is_ok();
+            // Rescue the old blocked-writer path before asserting so the regression leaves no worker.
+            if !was_finite {
+                FAKE_EXECS
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&handle)
+                    .unwrap()
+                    .steps
+                    .push_back(outcome_step(ExecOutcome::Exited(0)));
+            }
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).unwrap();
+            let result =
+                completed.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            waiter.join().unwrap();
+            assert!(
+                was_finite,
+                "rejected cancellation left output or owned teardown blocked"
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::BackendError);
+            assert!(error.message.contains("agent library panicked"), "{error}");
+            let calls = fake_calls(handle);
+            assert_eq!(
+                canceller.cancel().unwrap_err(),
+                error,
+                "release must not turn a refused cancellation into success"
+            );
+            assert_eq!(
+                fake_calls(handle),
+                calls,
+                "a retained canceller used a released native handle"
+            );
+            assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+        }
+    }
+
+    #[test]
+    fn review_protocol_error_preserves_refused_cancellation() {
+        let handle = register_fake_exec(vec![FakeStep::Status(STATUS_INVALID_ARGUMENT)]);
+        FAKE_EXECS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&handle)
+            .unwrap()
+            .cancel_status = STATUS_PANIC;
+        let client = NvxClient::from_library(fake_library(), handle);
+        let error = client
+            .exec(&test_id(), &ExecRequest::command_line("invalid"))
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert!(error.message.contains("rejected an argument"), "{error}");
+        assert!(error.message.contains("cleanup failure"), "{error}");
+        assert!(error.message.contains("agent library panicked"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn review_protocol_stdin_and_cancel_errors_are_combined() {
+        use std::io::Write;
+        let handle = register_fake_exec(vec![FakeStep::Status(STATUS_INVALID_ARGUMENT)]);
+        {
+            let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+            let state = map.get_mut(&handle).unwrap();
+            state.cancel_status = STATUS_PANIC;
+            state.write_status = STATUS_ERROR;
+            state.wait_for_input_failure = true;
+        }
+        let client = NvxClient::from_library(fake_library(), handle);
+        let mut request = ExecRequest::command_line("input");
+        request.stdin = true;
+        let mut execution = client.exec(&test_id(), &request).unwrap();
+        let mut stdin = execution.take_stdin().unwrap();
+        stdin.write_all(b"rejected input").unwrap();
+        let error = execution.wait().unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert!(error.message.contains("rejected an argument"), "{error}");
+        assert!(error.message.contains("injected stdin failure"), "{error}");
+        assert!(error.message.contains("agent library panicked"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
+    #[test]
+    fn review_stdin_failure_and_refused_cancel_complete_without_an_exit_event() {
+        use std::io::Write;
+        let handle = register_fake_exec(Vec::new());
+        {
+            let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+            let state = map.get_mut(&handle).unwrap();
+            state.write_status = STATUS_ERROR;
+            state.cancel_status = STATUS_PANIC;
+        }
+        let client = NvxClient::from_library(fake_library(), handle);
+        let mut request = ExecRequest::command_line("input");
+        request.stdin = true;
+        let mut execution = client.exec(&test_id(), &request).unwrap();
+        execution
+            .take_stdin()
+            .unwrap()
+            .write_all(b"failed input")
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || tx.send(execution.wait()).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        let finite = result.is_ok();
+        if !finite {
+            FAKE_EXECS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_mut(&handle)
+                .unwrap()
+                .steps
+                .push_back(outcome_step(ExecOutcome::Exited(0)));
+        }
+        let result = result.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+        assert!(
+            finite,
+            "stdin failure depended on an unconfirmed native exit"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert!(error.message.contains("injected stdin failure"), "{error}");
+        assert!(error.message.contains("agent library panicked"), "{error}");
+        assert_eq!(fake_calls(handle), ["validate", "cancel", "release"]);
+    }
+
     fn fake_calls(handle: u64) -> Vec<&'static str> {
         FAKE_EXECS
             .get_or_init(Default::default)
@@ -992,7 +1246,7 @@ mod tests {
             .get_mut(&handle)
         {
             state.calls.push("cancel");
-            if state.steps.is_empty() {
+            if state.cancel_status == STATUS_OK && state.steps.is_empty() {
                 state.steps.push_back(outcome_step(ExecOutcome::Cancelled));
             }
             return state.cancel_status;
@@ -1065,6 +1319,18 @@ mod tests {
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let Some(state) = map.get_mut(&handle) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            state.next_entered = true;
+            if !state.wait_for_input_failure || state.write_failed {
+                break;
+            }
+            drop(map);
+            std::thread::yield_now();
+            map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        }
         let Some(state) = map.get_mut(&handle) else {
             return STATUS_INVALID_HANDLE;
         };
@@ -1111,15 +1377,41 @@ mod tests {
         len: usize,
         _timeout: i64,
         written: *mut usize,
-        _out: *mut *mut u8,
-        _out_len: *mut usize,
+        out: *mut *mut u8,
+        out_len: *mut usize,
     ) -> i32 {
         let mut map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        loop {
+            let Some(state) = map.get_mut(&handle) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            if !state.wait_for_input_failure || state.next_entered {
+                break;
+            }
+            drop(map);
+            std::thread::yield_now();
+            map = FAKE_EXECS.get().unwrap().lock().unwrap();
+        }
         let Some(state) = map.get_mut(&handle) else {
             return STATUS_INVALID_HANDLE;
         };
         if state.blocked_input {
             return STATUS_TIMEOUT;
+        }
+        if state.write_status != STATUS_OK {
+            state.write_failed = true;
+            if state.write_status == STATUS_ERROR {
+                alloc_buf(
+                    &serde_json::to_vec(&ErrorBody {
+                        code: WireErrorCode::BackendError,
+                        message: "injected stdin failure".to_owned(),
+                    })
+                    .unwrap(),
+                    out,
+                    out_len,
+                );
+            }
+            return state.write_status;
         }
         let accepted = len.min(32 * 1024);
         state

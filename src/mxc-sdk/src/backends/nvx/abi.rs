@@ -588,11 +588,43 @@ fn decode_json<T: DeserializeOwned>(bytes: Option<Vec<u8>>, what: &str) -> Resul
     })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+fn verified_file_digest(path: &Path, file: &mut File, expected: &str) -> Result<String, MxcError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            MxcError::backend_unavailable(format!(
+                "NVX signed bundled agent: cannot read runtime file {}: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual = digest
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .collect::<String>();
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(MxcError::backend_unavailable(format!(
+            "NVX signed bundled agent: runtime file {} does not match the approved SHA-256",
+            path.display()
+        )));
+    }
+    Ok(actual)
+}
+
+pub(super) fn verify_file_digest(path: &Path, expected: &str) -> Result<(), MxcError> {
+    let mut file = open_for_load(path).map_err(|error| {
+        MxcError::backend_unavailable(format!(
+            "NVX signed bundled agent: cannot verify runtime file {}: {error}",
+            path.display()
+        ))
+    })?;
+    verified_file_digest(path, &mut file, expected).map(|_| ())
 }
 
 /// Opens `path` for read with `FILE_SHARE_READ` (`1`) only, preventing any concurrent writer,
@@ -672,20 +704,7 @@ impl AgentLibrary {
         mut lock_file: File,
         expected_sha256: &str,
     ) -> Result<Self, MxcError> {
-        let mut bytes = Vec::new();
-        lock_file.read_to_end(&mut bytes).map_err(|error| {
-            MxcError::backend_unavailable(format!(
-                "NVX signed bundled agent: cannot read the agent library at {}: {error}",
-                path.display()
-            ))
-        })?;
-        let actual_sha256 = sha256_hex(&bytes);
-        if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-            return Err(MxcError::backend_unavailable(format!(
-                "NVX signed bundled agent: the agent library at {} does not match the approved SHA-256",
-                path.display()
-            )));
-        }
+        let actual_sha256 = verified_file_digest(path, &mut lock_file, expected_sha256)?;
 
         let library = unsafe { LoadedLibrary::new(path) }.map_err(|error| {
             MxcError::backend_unavailable(format!(

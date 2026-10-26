@@ -27,6 +27,9 @@ pub(super) struct Fixture {
     pub stdin_reader: Arc<Mutex<Option<InterruptiblePipeReader>>>,
     pub stdin_closer: Arc<Mutex<Option<PipeReadCanceller>>>,
     pub stop_gate: Option<Arc<CleanupGate>>,
+    pub close_gate: Option<Arc<CleanupGate>>,
+    pub close_fails: bool,
+    pub close_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Default)]
@@ -169,7 +172,18 @@ impl SandboxClient for Fixture {
         }
     }
     fn close(&mut self) -> Result<(), MxcError> {
-        Ok(())
+        self.close_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(gate) = &self.close_gate {
+            gate.wait();
+        }
+        if self.close_fails {
+            Err(MxcError::backend_error(
+                "NVX signed bundled agent: injected host_close failure",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 

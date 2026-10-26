@@ -152,7 +152,7 @@ fn spawn_streaming_with<C: SandboxClient + Send + 'static>(
             return Err(error);
         }
     };
-    Ok(Box::new(NvxOneShotProcess::new(
+    Ok(Box::new(NvxOwnedProcess::new(
         inner,
         Box::new(move || cleanup_sandbox(client, sandbox_id, state_root)),
     )))
@@ -193,7 +193,7 @@ enum CleanupState {
     },
 }
 
-struct NvxOneShotProcess {
+pub(super) struct NvxOwnedProcess {
     inner: Box<dyn SandboxProcess>,
     terminal: Option<Result<i32, CachedIoError>>,
     cleanup: CleanupState,
@@ -251,8 +251,8 @@ fn finish_cleanup(
     }
 }
 
-impl NvxOneShotProcess {
-    fn new(inner: Box<dyn SandboxProcess>, teardown: Teardown) -> Self {
+impl NvxOwnedProcess {
+    pub(super) fn new(inner: Box<dyn SandboxProcess>, teardown: Teardown) -> Self {
         Self {
             inner,
             terminal: None,
@@ -379,7 +379,7 @@ fn finish_wait<T>(primary: std::io::Result<T>, cleanup: std::io::Result<()>) -> 
     }
 }
 
-impl SandboxProcess for NvxOneShotProcess {
+impl SandboxProcess for NvxOwnedProcess {
     fn warnings(&self) -> Vec<String> {
         self.inner.warnings()
     }
@@ -448,7 +448,7 @@ impl SandboxProcess for NvxOneShotProcess {
     }
 }
 
-impl Drop for NvxOneShotProcess {
+impl Drop for NvxOwnedProcess {
     fn drop(&mut self) {
         if self.terminal.is_none() {
             match self.inner.kill() {
@@ -1336,11 +1336,11 @@ mod tests {
         timeout: bool,
         cleanup_fails: bool,
         refuse_kill: bool,
-    ) -> (NvxOneShotProcess, Arc<Mutex<Vec<&'static str>>>) {
+    ) -> (NvxOwnedProcess, Arc<Mutex<Vec<&'static str>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let cleanup_events = Arc::clone(&events);
         (
-            NvxOneShotProcess::new(
+            NvxOwnedProcess::new(
                 Box::new(TestProcess {
                     events: Arc::clone(&events),
                     timeout,
@@ -1430,7 +1430,7 @@ mod tests {
                 }),
             })
             .unwrap();
-        let process = NvxOneShotProcess::new(
+        let process = NvxOwnedProcess::new(
             Box::new(inner),
             Box::new(move || {
                 cleanup_events.lock().unwrap().push("cleanup");
@@ -1542,7 +1542,7 @@ mod tests {
         }
         let stdout = Arc::new((Mutex::new(false), Condvar::new()));
         let stderr = Arc::new((Mutex::new(false), Condvar::new()));
-        let process = NvxOneShotProcess::new(
+        let process = NvxOwnedProcess::new(
             Box::new(CaptureProcess {
                 stdout: Arc::clone(&stdout),
                 stderr: Arc::clone(&stderr),
