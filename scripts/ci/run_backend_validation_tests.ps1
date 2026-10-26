@@ -397,6 +397,7 @@ function Invoke-MicroVmTests {
         'facade' = 'VM_EXECUTED facade sequential '
         'executor' = 'VM_EXECUTED executor sequential '
         'executor configs' = 'VM_EXECUTED executor configs '
+        'executor interruption' = 'VM_EXECUTED executor console interruption '
     }
     foreach ($scenario in $scenarios.Keys) {
         if (-not $output.Contains($scenarios[$scenario])) {

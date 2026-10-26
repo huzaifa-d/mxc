@@ -53,6 +53,7 @@ foreach ($name in @(
     'windows_x64::host_only_executor_request_matrix',
     'windows_x64::signed_bundle_executor_configs',
     'windows_x64::signed_bundle_executor_create_and_run',
+    'windows_x64::signed_bundle_executor_console_interrupt',
     'windows_x64::signed_bundle_facade_create_and_run'
 )) {
     if ($discovered -notcontains "$name`: test") {

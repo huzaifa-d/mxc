@@ -122,6 +122,18 @@ A workload timeout preserves captured partial output and tears down the
 container. Each create-and-run request gets fresh workload state; this phase
 does not offer persistent containers or manual lifecycle operations.
 
+On startup failure, the returned error includes bounded tails of the agent's
+VM log, boot-console log, and outcome report before teardown removes them.
+Each tail is limited to 8 KiB; truncation and unavailable diagnostics are
+identified without replacing the original failure.
+
+In the Windows executor, Ctrl-C and Ctrl-Break request cancellation and allow
+VM shutdown, deprovisioning, and temporary-directory cleanup before exit code
+130 is returned. A request received during startup is observed when the native
+startup call returns. Closing the console or forcibly terminating the process
+does not provide this cooperative-cleanup guarantee. Embedding the SDK does not
+install a process-wide console handler.
+
 ### Temporary agent workspace
 
 MXC allocates a private temporary directory for each create-and-run operation.
@@ -147,6 +159,9 @@ does not rebuild them.
 The SDK suite covers both the executor and captured JSON execution, binary
 stdout/stderr, exit codes, environment and working-directory settings,
 timeouts, capture limits, cleanup, and the seven MicroVM config fixtures.
+An isolated-console scenario interrupts both startup and running execution,
+then verifies that the owned OpenVMM process has terminated and run storage
+has been removed.
 Missing prerequisites, skipped scenarios, and empty test runs fail validation.
 See the [CI validation runbook](../../development/build-and-test/ci-validation-infrastructure.md).
 

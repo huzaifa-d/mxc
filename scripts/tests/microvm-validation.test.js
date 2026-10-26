@@ -116,6 +116,9 @@ fn main() {
         println!("windows_x64::host_only_executor_request_matrix: test");
         println!("windows_x64::signed_bundle_executor_configs: test");
         println!("windows_x64::signed_bundle_executor_create_and_run: test");
+        if mode != "missing-interruption-discovery" {
+            println!("windows_x64::signed_bundle_executor_console_interrupt: test");
+        }
         if mode != "missing-discovery" {
             println!("windows_x64::signed_bundle_facade_create_and_run: test");
         }
@@ -141,11 +144,14 @@ fn main() {
     if mode != "missing-configs" {
         println!("VM_EXECUTED executor configs all seven fixtures");
     }
+    if mode != "missing-interruption" {
+        println!("VM_EXECUTED executor console interruption startup/execution/owned-vmm/cleanup");
+    }
     if mode == "skipped" {
         println!("SKIPPED: fixture VM unavailable");
     }
     let ignored = if mode == "ignored" { 1 } else { 0 };
-    println!("test result: ok. 6 passed; 0 failed; {ignored} ignored; 0 measured; 0 filtered out;");
+    println!("test result: ok. 7 passed; 0 failed; {ignored} ignored; 0 measured; 0 filtered out;");
 }
 `);
   const build = spawnSync(
@@ -286,6 +292,7 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   const log = readFileSync(join(directory, "logs", "microvm-nvx.log"), "utf8");
   assert.match(log, /VM_EXECUTED facade /);
   assert.match(log, /VM_EXECUTED executor /);
+  assert.match(log, /VM_EXECUTED executor console interruption /);
 });
 
 for (const [mode, message] of [
@@ -294,6 +301,7 @@ for (const [mode, message] of [
   ["missing-facade", /did not execute the facade VM scenario/],
   ["missing-executor", /did not execute the executor VM scenario/],
   ["missing-configs", /did not execute the executor configs VM scenario/],
+  ["missing-interruption", /did not execute the executor interruption VM scenario/],
   ["skipped", /skipped or filtered tests/],
   ["ignored", /skipped or filtered tests/],
 ]) {
@@ -346,12 +354,13 @@ for (const [mode, message] of [
   ["cargo-failure", /cargo test --no-run failed with exit code 17/],
   ["cargo-no-artifact", /Expected one nvx_e2e test executable/],
   ["missing-discovery", /did not discover windows_x64::signed_bundle_facade_create_and_run/],
+  ["missing-interruption-discovery", /did not discover windows_x64::signed_bundle_executor_console_interrupt/],
 ]) {
   test(`staging rejects ${mode}`, () => {
     const result = stage(mode);
     assert.notEqual(result.status, 0, result.output);
     assert.match(result.output, message);
-    if (mode !== "missing-discovery") {
+    if (!["missing-discovery", "missing-interruption-discovery"].includes(mode)) {
       assert.equal(existsSync(join(result.directory, "nvx-e2e-tests.exe")), false);
     }
   });
