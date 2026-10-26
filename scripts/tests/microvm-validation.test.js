@@ -183,10 +183,12 @@ function artifact() {
 function dispatch(directory, mode = "", architecture = "x64") {
   return runScript(
     dispatcher,
-    ["-Backend", "microvm", "-BinaryDirectory", directory, "-Architecture", architecture],
+    [
+      "-Backend", "microvm", "-BinaryDirectory", directory, "-Architecture", architecture,
+      "-TempDirectory", join(directory, "logs"),
+    ],
     {
       MXC_CI_FIXTURE_MODE: mode,
-      RUNNER_TEMP: join(directory, "logs"),
     }
   );
 }

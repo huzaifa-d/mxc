@@ -39,8 +39,6 @@ hyperlight = [
     "dep:flate2",
     "dep:tar",
 ]
-force-tier-testing = []
-tier2_bfs = []
 schema-gen = ["dep:schemars"]
 
 [dependencies]
@@ -83,6 +81,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+serial_test.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 flate2 = { version = "1", optional = true }

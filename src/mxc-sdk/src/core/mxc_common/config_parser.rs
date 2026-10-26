@@ -1576,13 +1576,7 @@ fn normalize_common_request_ir(
     validate_filesystem_paths(&policy)?;
     normalize_filesystem_paths(&mut policy, logger);
 
-    // Fallback section
-    policy.fallback_specified = cfg.fallback.is_some();
-    if let Some(fbcfg) = cfg.fallback {
-        if let Some(v) = fbcfg.allow_dacl_mutation {
-            policy.fallback.allow_dacl_mutation = v;
-        }
-    }
+    policy.fallback_specified = cfg.fallback_specified;
 
     parse_network_policy(
         &mut policy,
@@ -1869,24 +1863,21 @@ mod tests {
     }
 
     #[test]
-    fn preserves_fallback_presence_without_changing_backend_defaults() {
-        for containment in ["microvm", "processcontainer"] {
-            for (fallback, supplied, allow_dacl_mutation) in [
-                (None, false, true),
-                (Some(serde_json::json!({})), true, true),
-                (
-                    Some(serde_json::json!({"allowDaclMutation": true})),
-                    true,
-                    true,
-                ),
-                (
-                    Some(serde_json::json!({"allowDaclMutation": false})),
-                    true,
-                    false,
-                ),
+    fn preserves_fallback_presence_without_restoring_retired_policy() {
+        for (version, containment) in [
+            ("0.9.0-alpha", "processcontainer"),
+            ("1.0.0", "processcontainer"),
+            ("1.1.0-alpha", "processcontainer"),
+            ("1.1.0-alpha", "microvm"),
+        ] {
+            for (fallback, supplied) in [
+                (None, false),
+                (Some(serde_json::json!({})), true),
+                (Some(serde_json::json!({"allowDaclMutation": true})), true),
+                (Some(serde_json::json!({"allowDaclMutation": false})), true),
             ] {
                 let mut json = serde_json::json!({
-                    "version": "1.1.0-alpha",
+                    "version": version,
                     "containment": containment,
                     "process": {"commandLine": "echo hello"}
                 });
@@ -1899,14 +1890,9 @@ mod tests {
                     panic!("expected a create-and-run request");
                 };
                 assert_eq!(request.policy.fallback_specified, supplied);
-                assert_eq!(
-                    request.policy.fallback.allow_dacl_mutation,
-                    allow_dacl_mutation
-                );
-                assert!(serde_json::to_value(request.policy)
-                    .unwrap()
-                    .get("fallback_specified")
-                    .is_none());
+                let serialized = serde_json::to_value(request.policy).unwrap();
+                assert!(serialized.get("fallback_specified").is_none());
+                assert!(serialized.get("fallback").is_none());
             }
         }
     }
@@ -2232,6 +2218,10 @@ mod tests {
             "0.9.0",
             "0.9.1-alpha",
             "0.10.1-alpha",
+            "0.10.0-alpha",
+            "0.5.0-alpha",
+            "1.2.0-alpha",
+            "not-a-version",
         ] {
             let json = format!(
                 r#"{{
@@ -2270,6 +2260,32 @@ mod tests {
             );
             assert!(error.message().contains("Unsupported contract version"));
         }
+    }
+
+    #[test]
+    fn capture_output_path_requires_an_absolute_file_with_an_existing_parent() {
+        let directory = tempfile::tempdir().expect("temporary capture directory");
+        let missing = directory.path().join("missing").join("capture.json");
+        let root = directory.path().ancestors().last().unwrap();
+        for (path, message) in [
+            (
+                std::path::Path::new("capture.json"),
+                "must be an absolute path",
+            ),
+            (root, "directory root"),
+            (missing.as_path(), "parent directory does not exist"),
+            (directory.path(), "existing directory"),
+        ] {
+            let error =
+                validate_capture_denials_output_path(&path.to_string_lossy(), &mut test_logger())
+                    .unwrap_err();
+            assert!(error.to_string().contains(message), "{path:?}: {error}");
+        }
+        validate_capture_denials_output_path(
+            &directory.path().join("capture.json").to_string_lossy(),
+            &mut test_logger(),
+        )
+        .expect("valid absolute output file");
     }
 
     #[test]

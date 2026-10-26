@@ -42,7 +42,7 @@ sandbox.
 | `filesystem`, `network`, `ui` | Cross-cutting policy sections (below). An omitted section is not proof that every backend enforces a restriction. |
 | `runtimeConfig` | Runtime settings, including a caller-managed network proxy. |
 | `lifecycle` | Optional `destroyOnExit` (default `true`) and `preservePolicy` (default `false`) booleans. |
-| `fallback` | Optional `allowDaclMutation` boolean (default `true`); `false` refuses the Windows host-DACL fallback. |
+| `fallback` | Optional `allowDaclMutation` boolean accepted for 1.x compatibility and ignored. Removing this accepted field requires a new major contract. |
 | `telemetry` | Optional `enabled` boolean. On Windows, emission also requires MXC-owned user consent and a permitting administrative policy. |
 | `processContainer`, `lxc`, `seatbelt`, `wslc`, `windowsSandbox`, `hyperlight` | Backend-specific settings; only the section matching the selected backend is accepted. |
 | `test` | Optional development-only placeholder with an optional string `message`; it has no policy enforcement effect. |
@@ -139,7 +139,7 @@ experimental authorization and suitable host/build support.
 |---|---|
 | `processContainer` | `leastPrivilege` (boolean), `capabilities` (array of single capability names, no commas), `learningMode` (boolean), `captureDenials` (`mode`: `block` or `allow`, default `block`; optional `outputPath` and `retainEtl`), `filesystem.enumeratePaths` (array of paths), `network.allowedProxyPeer` (proxy peer identity), and `ui` (below). `enumeratePaths` needs host support and cannot combine with `leastPrivilege`. `captureDenials.mode: "allow"` permits and records otherwise denied access. |
 | `processContainer.ui` | Optional `isolation` (`container`, `desktop`, `handles`, `atoms`), `desktopSystemControl` and `ime` booleans, and `systemSettings` (`none`, `parameters`, `display`, `all`). |
-| `lxc` | `distribution` and `release` strings, both required if this section is present. LXC rejects `runtimeConfig.networkProxy`. |
+| `lxc` | `distribution` and `release` strings, both required if this section is present. |
 | `seatbelt` | Optional `profileOverride` (raw profile), `guiAccess`, `nestedPty`, `keychainAccess` (booleans), and `extraMachLookups` (string array). |
 | `wslc` | Optional `image`, `imageTarPath`, `storagePath`, `targetOs` (strings), `cpuCount` and `memoryMb` (non-negative integers), `gpu` (boolean), and `portMappings` (array of `windowsPort` / `containerPort`, 1-65535, optional `protocol`: TCP only). These are create-and-run settings. |
 | `windowsSandbox` | Optional `idleTimeoutMs` (non-negative integer milliseconds), legacy `idleTimeout` (non-negative integer), and `daemonPipeName` (string). Compatibility fields, not live controls of the current execution path. |
