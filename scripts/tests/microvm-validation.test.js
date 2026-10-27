@@ -9,12 +9,14 @@ const {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { delimiter, join, resolve } = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
 const { pathToFileURL } = require("node:url");
 const { stripVTControlCharacters } = require("node:util");
 
@@ -221,6 +223,163 @@ test("Windows builds stage and upload the SDK tests and the complete runtime bun
   assert.match(workflow, /ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR:/);
   assert.equal(existsSync(join(root, ".github", "workflows", "microvm-e2e.yml")), false);
 });
+
+function azureBundleStep() {
+  const pipeline = readFileSync(
+    join(root, ".azure-pipelines", "templates", "Rust.Build.Job.yml"),
+    "utf8"
+  );
+  const match = pipeline.match(
+    /      - pwsh: \|\r?\n((?:          .*\r?\n)+)        displayName: Copy signed NVX runtime bundle\r?\n        condition: (.*)/
+  );
+  assert.ok(match, "Azure builds must stage the signed NVX runtime bundle");
+  assert.equal(
+    match[2].trim(),
+    "and(succeeded(), eq('${{ item.os }}', 'windows'), eq('${{ item.arch }}', 'x64'))"
+  );
+  assert.ok(pipeline.indexOf(match[0]) < pipeline.search(/displayName: Publish\r?\n/));
+  const signing = pipeline.match(/        signPattern: \|\r?\n((?:            .*\r?\n)+)/);
+  assert.ok(signing, "Windows signing patterns must remain explicit");
+  assert.doesNotMatch(signing[1], /aci.edge|openvmm|direct-images|guest[\\/]|[*?]/);
+  return match[1].replace(/^          /gm, "");
+}
+
+function azureBundleFixture(mode = "") {
+  const directory = mkdtempSync(join(scratch, "azure-bundle-"));
+  const target = join(directory, "target");
+  const outputDirectory = join(directory, "out");
+  const triplet = "x86_64-pc-windows-msvc";
+  const bundle = join(target, "aci-edge-sandboxes");
+  mkdirSync(target);
+  mkdirSync(join(outputDirectory, triplet), { recursive: true });
+  const pins = readFileSync(join(root, "src", "mxc-sdk", "build", "build_nvx_bundled.rs"), "utf8");
+  const inventory = [...pins.matchAll(/"([^"\r\n]+)",\s*"([0-9a-f]{64})"/g)].map((match) => match[1]);
+  assert.equal(inventory.length, 18, "fixture must exercise the complete approved bundle inventory");
+  if (mode !== "absent") {
+    mkdirSync(bundle);
+    if (mode !== "empty") {
+      for (const relative of inventory) {
+        if (mode === "missing-manifest" && relative === "SOURCE-MANIFEST.json") continue;
+        const path = join(bundle, ...relative.split("/"));
+        mkdirSync(resolve(path, ".."), { recursive: true });
+        writeFileSync(path, Buffer.from(`signed fixture bytes: ${relative}\0\xff`, "latin1"));
+      }
+    }
+  }
+  const script = azureBundleStep()
+    .replaceAll("$(targetTripleDir)", target.replaceAll("'", "''"))
+    .replaceAll("$(outputDirectory)", outputDirectory.replaceAll("'", "''"))
+    .replaceAll("$(targetTriple)", triplet);
+  const scriptPath = join(directory, "copy-bundle.ps1");
+  writeFileSync(scriptPath, script);
+  const result = runScript(scriptPath, [], {});
+  return { ...result, directory, bundle, outputDirectory, triplet, inventory };
+}
+
+function fileDigests(directory, prefix = "") {
+  return readdirSync(directory, { withFileTypes: true })
+    .flatMap((entry) => {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      return entry.isDirectory()
+        ? fileDigests(join(directory, entry.name), relative)
+        : [[relative, createHash("sha256").update(readFileSync(join(directory, entry.name))).digest("hex")]];
+    })
+    .sort(([left], [right]) => left.localeCompare(right));
+}
+
+test("Azure release artifact includes the complete signed NVX bundle with unchanged hashes", () => {
+  const result = azureBundleFixture();
+  assert.equal(result.status, 0, result.output);
+  const expected = fileDigests(result.bundle);
+  assert.equal(expected.length, result.inventory.length);
+  assert.deepEqual(fileDigests(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes")), expected);
+
+  // The release job downloads the Windows x64 artifact into x64/ before archiving.
+  const release = readFileSync(
+    join(root, ".azure-pipelines", "templates", "Mxc.Binary.Packaging.Job.yml"),
+    "utf8"
+  );
+  assert.match(release, /artifact: wxc-binaries-x86_64-pc-windows-msvc\s+sdkArch: x64/);
+  assert.ok(release.includes("path: $(stagingDirectory)/${{ target.sdkArch }}"));
+  assert.ok(release.includes("includeRootFolder: false"));
+  const staging = join(result.directory, "release-staging");
+  const x64 = join(staging, "x64");
+  const archive = join(result.directory, "mxc-release-binaries.zip");
+  const extracted = join(result.directory, "extracted");
+  mkdirSync(x64, { recursive: true });
+  mkdirSync(extracted);
+  const script = join(result.directory, "release-archive.ps1");
+  const quote = (path) => `'${path.replaceAll("'", "''")}'`;
+  writeFileSync(script, [
+    "$ErrorActionPreference = 'Stop'",
+    `Copy-Item -LiteralPath ${quote(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes"))} -Destination ${quote(x64)} -Recurse`,
+    `Compress-Archive -Path ${quote(join(staging, "*"))} -DestinationPath ${quote(archive)}`,
+    `Expand-Archive -LiteralPath ${quote(archive)} -DestinationPath ${quote(extracted)}`,
+  ].join("\n"));
+  const archived = runScript(script, [], {});
+  assert.equal(archived.status, 0, archived.output);
+  assert.deepEqual(fileDigests(join(extracted, "x64", "aci-edge-sandboxes")), expected);
+});
+
+test("npm pack excludes the NVX bundle without removing supported SDK binaries", () => {
+  const result = azureBundleFixture();
+  assert.equal(result.status, 0, result.output);
+  const packageRoot = join(result.directory, "node-sdk");
+  const binaryRoot = join(packageRoot, "bin");
+  const x64 = join(binaryRoot, "x64");
+  mkdirSync(x64, { recursive: true });
+  copyFileSync(join(root, "sdk", "node", "package.json"), join(packageRoot, "package.json"));
+  copyFileSync(join(root, "sdk", "node", "bin", ".npmignore"), join(binaryRoot, ".npmignore"));
+  writeFileSync(join(x64, "wxc-exec.exe"), "executor fixture");
+  writeFileSync(join(x64, "mxc_ffi.dll"), "SDK library fixture");
+  const script = join(result.directory, "npm-artifact.ps1");
+  const quote = (path) => `'${path.replaceAll("'", "''")}'`;
+  writeFileSync(script, [
+    "$ErrorActionPreference = 'Stop'",
+    `Copy-Item -LiteralPath ${quote(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes"))} -Destination ${quote(x64)} -Recurse`,
+  ].join("\n"));
+  const copied = runScript(script, [], {});
+  assert.equal(copied.status, 0, copied.output);
+  const packed = spawnSync("npm pack --ignore-scripts --offline --json", {
+    cwd: packageRoot,
+    shell: true,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  assert.ifError(packed.error);
+  assert.equal(packed.status, 0, packed.stdout + packed.stderr);
+  const files = JSON.parse(packed.stdout)[0].files.map(({ path }) => path).sort();
+  assert.deepEqual(files, ["bin/x64/mxc_ffi.dll", "bin/x64/wxc-exec.exe", "package.json"]);
+  const expected = fileDigests(result.bundle);
+  assert.deepEqual(fileDigests(join(x64, "aci-edge-sandboxes")), expected);
+  assert.deepEqual(fileDigests(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes")), expected);
+
+  rmSync(join(binaryRoot, ".npmignore"));
+  const unfiltered = spawnSync("npm pack --ignore-scripts --offline --json", {
+    cwd: packageRoot,
+    shell: true,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  assert.ifError(unfiltered.error);
+  assert.equal(unfiltered.status, 0, unfiltered.stdout + unfiltered.stderr);
+  assert.deepEqual(
+    JSON.parse(unfiltered.stdout)[0].files
+      .map(({ path }) => path)
+      .filter((path) => path.startsWith("bin/x64/aci-edge-sandboxes/"))
+      .sort(),
+    result.inventory.map((path) => `bin/x64/aci-edge-sandboxes/${path}`).sort()
+  );
+});
+
+for (const mode of ["absent", "empty", "missing-manifest"]) {
+  test(`Azure bundle copy rejects ${mode} runtime input`, () => {
+    const result = azureBundleFixture(mode);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, /missing the signed NVX bundle/);
+    assert.equal(existsSync(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes")), false);
+  });
+}
 
 test("MicroVM fixtures are canonical packaged inputs and remain in schema validation", () => {
   const fixtureRoot = join(root, "src", "mxc-sdk", "tests", "fixtures", "microvm");

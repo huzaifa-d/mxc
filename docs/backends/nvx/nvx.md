@@ -31,6 +31,12 @@ The build stages the pinned official `aci-edge-sandboxes.zip` release
 runtime binaries, guest images, and provenance files. Do not substitute a
 standalone OpenVMM executable or a partial bundle.
 
+Windows x64 Azure build artifacts, release ZIPs, and VPack artifacts include
+this complete directory beside the executor. The Node SDK package excludes
+it because typed V1 does not support MicroVM targeting. The bundle retains the
+NVX release's signatures and pinned hashes; MXC's executable-signing step does
+not modify it.
+
 Use the development `1.1.0-alpha` request contract:
 
 ```json
