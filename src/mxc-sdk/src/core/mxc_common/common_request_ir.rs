@@ -21,7 +21,6 @@ pub(crate) struct CommonRequestIR {
     pub(crate) lxc: Option<wire::Lxc>,
     pub(crate) wslc: Option<wire::Wslc>,
     pub(crate) filesystem: Option<wire::Filesystem>,
-    pub(crate) fallback_specified: bool,
     pub(crate) network: Option<wire::Network>,
     pub(crate) runtime_config: Option<wire::RuntimeConfig>,
     pub(crate) ui: Option<wire::Ui>,

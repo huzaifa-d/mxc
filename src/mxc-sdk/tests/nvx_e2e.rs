@@ -99,15 +99,6 @@ mod windows_x64 {
                 "enumerate",
                 json!({"processContainer": {"filesystem": {"enumeratePaths": ["C:\\work"]}}}),
             ),
-            ("fallback", json!({"fallback": {}})),
-            (
-                "fallback-allow",
-                json!({"fallback": {"allowDaclMutation": true}}),
-            ),
-            (
-                "fallback-deny",
-                json!({"fallback": {"allowDaclMutation": false}}),
-            ),
             ("destroy", json!({"lifecycle": {"destroyOnExit": false}})),
             ("preserve", json!({"lifecycle": {"preservePolicy": true}})),
             ("timeout-limit", json!({"process": {"timeout": 3_600_001}})),
@@ -164,6 +155,15 @@ mod windows_x64 {
 
     fn valid_process_boundaries() -> Vec<(&'static str, Value)> {
         vec![
+            ("legacy-fallback-empty", json!({"fallback": {}})),
+            (
+                "legacy-fallback-true",
+                json!({"fallback": {"allowDaclMutation": true}}),
+            ),
+            (
+                "legacy-fallback-false",
+                json!({"fallback": {"allowDaclMutation": false}}),
+            ),
             (
                 "cwd-boundary",
                 json!({"process": {"cwd": format!("/{}", "x".repeat(4094))}}),
@@ -248,9 +248,6 @@ mod windows_x64 {
                     "{label} must use the parser error contract"
                 );
                 assert_eq!(error.message, MIXED_BACKEND_ERROR, "{label}");
-            } else if matches!(label, "fallback" | "fallback-allow" | "fallback-deny") {
-                assert_eq!(error.code, ErrorCode::PolicyValidation);
-                assert_eq!(error.message, "NVX does not support fallback policy");
             }
             if let Some(expected) = process_limit_error(label) {
                 assert_eq!(error.code, ErrorCode::PolicyValidation, "{label}");
@@ -428,12 +425,21 @@ mod windows_x64 {
     #[ignore = "VM: requires Windows x64, WHP and the exact signed official bundle"]
     fn signed_bundle_facade_create_and_run() {
         let marker = nonce();
-        for _ in 0..2 {
+        for fallback in [
+            None,
+            Some(json!({})),
+            Some(json!({"allowDaclMutation": true})),
+            Some(json!({"allowDaclMutation": false})),
+        ] {
             let command = format!(
                 "test ! -e /tmp/{marker} || exit 99; touch /tmp/{marker}; \
                  printf '{marker}'; printf 'separate-stderr' >&2; exit 42"
             );
-            let result = facade_run(process_only_request(&command));
+            let mut request = process_only_request(&command);
+            if let Some(fallback) = fallback {
+                request["fallback"] = fallback;
+            }
+            let result = facade_run(request);
             assert_eq!(result.outcome, WaitResult::Exited(42));
             assert_eq!(result.stdout, marker.as_bytes());
             assert_eq!(result.stderr, b"separate-stderr");
@@ -804,13 +810,19 @@ mod windows_x64 {
     #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
     fn signed_bundle_executor_create_and_run() {
         let marker = nonce();
-        for _ in 0..2 {
-            let output = executor_output(
-                &process_only_request(&format!(
-                    "printf '{marker}'; printf executor-stderr >&2; exit 42"
-                )),
-                false,
-            );
+        for fallback in [
+            None,
+            Some(json!({})),
+            Some(json!({"allowDaclMutation": true})),
+            Some(json!({"allowDaclMutation": false})),
+        ] {
+            let mut request = process_only_request(&format!(
+                "printf '{marker}'; printf executor-stderr >&2; exit 42"
+            ));
+            if let Some(fallback) = fallback {
+                request["fallback"] = fallback;
+            }
+            let output = executor_output(&request, false);
             assert_eq!(output.status.code(), Some(42));
             assert_eq!(output.stdout, marker.as_bytes());
             assert_eq!(output.stderr, b"executor-stderr");

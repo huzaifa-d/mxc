@@ -637,9 +637,6 @@ pub struct ContainerPolicy {
     pub readonly_paths: Vec<String>,
     pub enumerate_paths: Vec<String>,
     pub denied_paths: Vec<String>,
-    /// Whether the caller supplied fallback policy, including an empty section.
-    #[serde(skip)]
-    pub fallback_specified: bool,
     /// Outbound CIDR, protocol, and port policy.
     pub network_egress: Option<NetworkEgressPolicy>,
     /// Inbound and host-loopback policy.

@@ -48,11 +48,6 @@ pub(super) fn validate_request(request: &ExecutionRequest) -> Result<(), MxcErro
             "NVX does not support processContainer.captureDenials",
         ));
     }
-    if request.policy.fallback_specified {
-        return Err(MxcError::policy_validation(
-            "NVX does not support fallback policy",
-        ));
-    }
     validate_process(request)
 }
 

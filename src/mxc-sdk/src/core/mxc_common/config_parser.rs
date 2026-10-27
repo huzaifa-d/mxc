@@ -1576,8 +1576,6 @@ fn normalize_common_request_ir(
     validate_filesystem_paths(&policy)?;
     normalize_filesystem_paths(&mut policy, logger);
 
-    policy.fallback_specified = cfg.fallback_specified;
-
     parse_network_policy(
         &mut policy,
         NetworkSections {
@@ -1863,18 +1861,19 @@ mod tests {
     }
 
     #[test]
-    fn preserves_fallback_presence_without_restoring_retired_policy() {
+    fn legacy_fallback_settings_do_not_change_runtime_policy() {
         for (version, containment) in [
             ("0.9.0-alpha", "processcontainer"),
             ("1.0.0", "processcontainer"),
             ("1.1.0-alpha", "processcontainer"),
             ("1.1.0-alpha", "microvm"),
         ] {
-            for (fallback, supplied) in [
-                (None, false),
-                (Some(serde_json::json!({})), true),
-                (Some(serde_json::json!({"allowDaclMutation": true})), true),
-                (Some(serde_json::json!({"allowDaclMutation": false})), true),
+            let mut expected = None;
+            for fallback in [
+                None,
+                Some(serde_json::json!({})),
+                Some(serde_json::json!({"allowDaclMutation": true})),
+                Some(serde_json::json!({"allowDaclMutation": false})),
             ] {
                 let mut json = serde_json::json!({
                     "version": version,
@@ -1889,10 +1888,13 @@ mod tests {
                 else {
                     panic!("expected a create-and-run request");
                 };
-                assert_eq!(request.policy.fallback_specified, supplied);
                 let serialized = serde_json::to_value(request.policy).unwrap();
-                assert!(serialized.get("fallback_specified").is_none());
                 assert!(serialized.get("fallback").is_none());
+                if let Some(expected) = &expected {
+                    assert_eq!(&serialized, expected);
+                } else {
+                    expected = Some(serialized);
+                }
             }
         }
     }
@@ -1916,7 +1918,6 @@ mod tests {
         network_mode_specified: bool,
         runtime_network_proxy_specified: bool,
         ui_specified: bool,
-        fallback_specified: bool,
         requested_sandbox_kind: Option<&'static str>,
     }
 
@@ -1937,7 +1938,6 @@ mod tests {
                 network_mode_specified: request.policy.network_mode_specified,
                 runtime_network_proxy_specified: request.policy.runtime_network_proxy_specified,
                 ui_specified: request.policy.ui_specified,
-                fallback_specified: request.policy.fallback_specified,
                 requested_sandbox_kind: request
                     .telemetry
                     .as_ref()

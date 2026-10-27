@@ -174,7 +174,6 @@ impl SdkStateAwareInput {
                 timeout: process.timeout,
             }),
             lifecycle: None,
-            fallback_specified: false,
             process_container: None,
             lxc: None,
             wslc: None,

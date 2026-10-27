@@ -62,7 +62,7 @@ policy before creating a VM rather than ignoring it.
 The table describes this MXC integration, not every capability of NVX. The
 signed agent limits workloads to one hour and constrains their working
 directories and environments as described below. Fixed image selection,
-captured-only execution, and refusal of filesystem, network, UI, fallback,
+captured-only execution, and refusal of filesystem, network, UI,
 and public lifecycle policies are MXC Phase 1 restrictions.
 The [signed-agent documentation](https://github.com/microsoft/nvx/blob/0430ce79d125203c20f0aa69243480513a774296/aci_edge_sandboxes/README.md#agent-backend-opt-in)
 describes its contract; the direct OpenVMM backend uses a different guest and
@@ -83,7 +83,7 @@ does not define the limits of this integration.
 | Network policy | A supplied `network` section is rejected, including empty or deny-only sections. Omit it. |
 | Runtime proxy | `runtimeConfig.networkProxy` is rejected. Proxy environment variables are also rejected. |
 | UI policy | A supplied `ui` section is rejected. |
-| Fallback policy | A supplied `fallback` section is rejected. |
+| Legacy fallback settings | Accepted and ignored for contract compatibility; they do not enable host-DACL mutation. |
 | Lifecycle options | `destroyOnExit` must be `true` and `preservePolicy` must be `false`. |
 
 Backend-specific sections must match the selected backend. For example,

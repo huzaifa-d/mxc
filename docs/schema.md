@@ -307,9 +307,6 @@ that can be executed independently.
 > for compatibility and ignore it. It does not enable host-DACL mutation or
 > change native enforcement. Removing this accepted field from the 1.x line
 > requires a new major contract.
-> Backend support is checked separately: the experimental MicroVM integration
-> rejects supplied fallback policy, as described in the
-> [NVX backend guide](backends/nvx/nvx.md#supported-operations-and-policy).
 
 > **Lifecycle operation fields.** The `phase` top-level field selects a
 > container lifecycle operation: JSON that includes it is parsed as input for
