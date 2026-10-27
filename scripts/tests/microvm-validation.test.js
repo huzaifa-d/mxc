@@ -321,7 +321,7 @@ test("Azure release artifact includes the complete signed NVX bundle with unchan
   assert.deepEqual(fileDigests(join(extracted, "x64", "aci-edge-sandboxes")), expected);
 });
 
-test("npm pack excludes the NVX bundle without removing supported SDK binaries", () => {
+test("npm pack excludes NVX runtime and validation payloads without removing supported SDK binaries", () => {
   const result = azureBundleFixture();
   assert.equal(result.status, 0, result.output);
   const packageRoot = join(result.directory, "node-sdk");
@@ -332,6 +332,10 @@ test("npm pack excludes the NVX bundle without removing supported SDK binaries",
   copyFileSync(join(root, "sdk", "node", "bin", ".npmignore"), join(binaryRoot, ".npmignore"));
   writeFileSync(join(x64, "wxc-exec.exe"), "executor fixture");
   writeFileSync(join(x64, "mxc_ffi.dll"), "SDK library fixture");
+  const validationSuite = Buffer.from("nightly validation executable");
+  const artifactSuite = join(result.outputDirectory, result.triplet, "nvx-e2e-tests.exe");
+  writeFileSync(artifactSuite, validationSuite);
+  writeFileSync(join(x64, "nvx-e2e-tests.exe"), validationSuite);
   const script = join(result.directory, "npm-artifact.ps1");
   const quote = (path) => `'${path.replaceAll("'", "''")}'`;
   writeFileSync(script, [
@@ -353,6 +357,8 @@ test("npm pack excludes the NVX bundle without removing supported SDK binaries",
   const expected = fileDigests(result.bundle);
   assert.deepEqual(fileDigests(join(x64, "aci-edge-sandboxes")), expected);
   assert.deepEqual(fileDigests(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes")), expected);
+  assert.deepEqual(readFileSync(artifactSuite), validationSuite);
+  assert.deepEqual(readFileSync(join(x64, "nvx-e2e-tests.exe")), validationSuite);
 
   rmSync(join(binaryRoot, ".npmignore"));
   const unfiltered = spawnSync("npm pack --ignore-scripts --offline --json", {
@@ -363,9 +369,10 @@ test("npm pack excludes the NVX bundle without removing supported SDK binaries",
   });
   assert.ifError(unfiltered.error);
   assert.equal(unfiltered.status, 0, unfiltered.stdout + unfiltered.stderr);
+  const unfilteredFiles = JSON.parse(unfiltered.stdout)[0].files.map(({ path }) => path);
+  assert.ok(unfilteredFiles.includes("bin/x64/nvx-e2e-tests.exe"));
   assert.deepEqual(
-    JSON.parse(unfiltered.stdout)[0].files
-      .map(({ path }) => path)
+    unfilteredFiles
       .filter((path) => path.startsWith("bin/x64/aci-edge-sandboxes/"))
       .sort(),
     result.inventory.map((path) => `bin/x64/aci-edge-sandboxes/${path}`).sort()
