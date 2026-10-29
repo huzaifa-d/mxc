@@ -149,8 +149,7 @@ fn sdk_json_rejects_microvm_streaming_pty_and_lifecycle() {
             ..Default::default()
         },
     )
-    .err()
-    .expect("MicroVM PTY must be rejected");
+    .expect_err("MicroVM PTY must be rejected");
     assert_eq!(error.code, ErrorCode::UnsupportedContainment, "{error}");
 
     request.as_object_mut().unwrap().remove("process");
