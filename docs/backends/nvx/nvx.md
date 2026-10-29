@@ -57,6 +57,20 @@ Use the development `1.1.0-alpha` request contract:
 wxc-exec.exe --experimental config.json
 ```
 
+For in-process Rust execution, pass the same JSON to `v1::dev::run_json` and
+authorize the experimental backend separately:
+
+```rust,no_run
+use mxc_sdk::v1::dev::{self, JsonOptions};
+
+let json = std::fs::read_to_string("config.json")?;
+let result = dev::run_json(&json, JsonOptions { experimental: true })?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The result contains captured stdout and stderr as bytes; it does not provide
+live streams or a persistent container.
+
 Commands run in the guest's POSIX shell, not in a host shell or a Python
 interpreter. Every creation request requires a registry image in
 `microvm.image`; there is no default or local image-file input. Include a
@@ -89,7 +103,7 @@ does not define the limits of this integration.
 |---|---|
 | Host platforms | Windows x64 with WHP. Windows ARM64 and Linux execution are unavailable. |
 | Execution | Create-and-run development JSON requests with captured stdout, stderr, exit status, and timeout. |
-| Rust SDK API | Typed V1 operations do not expose MicroVM selection. |
+| Rust SDK API | `v1::dev::run_json` supports captured execution with a MicroVM JSON request; typed V1 operations do not expose MicroVM selection. |
 | Streaming, PTY, and container lifecycle operations | Unsupported. Requests fail explicitly before backend setup. |
 | Workload image | Required caller-selected registry reference in `microvm.image`. |
 | Guest memory override | The contract defines `microvm.provision.memoryMib`, but explicit overrides return `PolicyValidation` before bundle discovery. Omit it to use the runtime default. |

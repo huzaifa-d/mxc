@@ -58,6 +58,7 @@ foreach ($name in @(
     'windows_x64::signed_bundle_executor_create_and_run',
     'windows_x64::signed_bundle_executor_console_interrupt',
     'windows_x64::signed_bundle_facade_create_and_run',
+    'windows_x64::signed_bundle_sdk_json_capture',
     'windows_x64::signed_bundle_json_image_and_filesystem_policy'
 )) {
     if ($discovered -notcontains "$name`: test") {
