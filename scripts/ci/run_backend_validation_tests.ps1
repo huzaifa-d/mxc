@@ -437,9 +437,13 @@ function Invoke-MicroVmTests {
     }
     $scenarios = [ordered]@{
         'facade' = 'VM_EXECUTED facade sequential '
+        'SDK JSON capture' = 'VM_EXECUTED SDK JSON binary capture timeout limit and cleanup'
+        'JSON image and policy' = 'VM_EXECUTED JSON selected-image filesystem '
         'executor' = 'VM_EXECUTED executor sequential '
         'executor configs' = 'VM_EXECUTED executor configs '
         'executor interruption' = 'VM_EXECUTED executor console interruption '
+        'network rules' = 'VM_EXECUTED reachable controls and network allow/deny/nonmatching-port enforcement'
+        'network proxy' = 'VM_EXECUTED reachable controls, blocked direct egress and successful proxy traffic'
     }
     foreach ($scenario in $scenarios.Keys) {
         if (-not $output.Contains($scenarios[$scenario])) {
