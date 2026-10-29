@@ -90,6 +90,10 @@ immutable content identity is required.
 Schema-valid fields do not imply backend support. MXC rejects unsupported
 policy before creating a VM rather than ignoring it.
 
+The executor's `--dry-run` checks the signed bundle's capabilities and native
+request validation without probing or starting a VM. The complete signed
+bundle must be available even when only validating a request.
+
 The table describes this MXC integration, not every capability of NVX. The
 signed agent limits workloads to one hour and constrains their working
 directories and environments as described below. Captured-only execution

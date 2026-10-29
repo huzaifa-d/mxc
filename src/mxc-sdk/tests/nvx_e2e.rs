@@ -563,11 +563,18 @@ mod windows_x64 {
     }
 
     fn executor_output(request: &Value, missing_bundle: bool) -> Output {
+        executor_output_with_mode(request, missing_bundle, false)
+    }
+
+    fn executor_output_with_mode(request: &Value, missing_bundle: bool, dry_run: bool) -> Output {
         let directory = tempfile::tempdir().expect("executor request directory");
         let path = directory.path().join("request.json");
         std::fs::write(&path, request.to_string()).expect("write executor request");
         let mut command = Command::new(executor());
         command.arg("--experimental").arg(&path);
+        if dry_run {
+            command.arg("--dry-run");
+        }
         if missing_bundle {
             command.env(BUNDLE_ENV, directory.path().join("absent"));
         }
@@ -943,6 +950,43 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
     #[test]
     #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
     fn signed_bundle_executor_configs() {
+        let valid = process_only_request("printf forbidden");
+        let output = executor_output_with_mode(&valid, false, true);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            stdout.contains("Dry run completed. Result: validation passed"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("forbidden"), "{stdout}");
+
+        let mut invalid_proxy = valid.clone();
+        invalid_proxy["runtimeConfig"] = json!({"networkProxy": "http://[::1]:3128"});
+        let output = executor_output_with_mode(&invalid_proxy, false, true);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("policy_validation"), "{stderr}");
+        assert!(stderr.contains("OpenVMM reaches host loopback"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("forbidden"));
+
+        invalid_proxy["runtimeConfig"] =
+            json!({"networkProxy": "http://synthetic:secret@[::1]:3128"});
+        let output = executor_output_with_mode(&invalid_proxy, false, true);
+        assert!(!output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("policy_validation"), "{stderr}");
+        assert!(stderr.contains("validate_provision"), "{stderr}");
+        assert!(stderr.contains("withheld"), "{stderr}");
+        assert!(!stdout.contains("synthetic"));
+        assert!(!stderr.contains("synthetic"));
+
+        let output = executor_output_with_mode(&valid, true, true);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("backend_unavailable"), "{stderr}");
+        assert!(stderr.contains("holds no agent bundle"), "{stderr}");
+
         let cases = [
             (
                 "microvm_hello.json",

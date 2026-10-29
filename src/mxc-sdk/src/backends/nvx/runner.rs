@@ -15,7 +15,7 @@ use crate::mxc_common::script_runner::{RunCancellation, ScriptRunner};
 #[cfg(test)]
 use super::abi::{Capabilities, ExecRequest};
 use super::abi::{ExecOutcome, ProvisionInput};
-use super::runtime::SandboxClient;
+use super::runtime::{NvxClient, SandboxClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedOutcome {
@@ -69,6 +69,13 @@ impl NvxRunner {
         result
     }
 
+    fn validate_dry_run(request: &ExecutionRequest) -> Result<(), MxcError> {
+        super::policy::validate_request(request)?;
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        let (state_root, mut client) = open_client(&mut logger)?;
+        validate_with_client(&mut client, state_root, request)
+    }
+
     fn run_captured_inner(
         &mut self,
         request: &ExecutionRequest,
@@ -76,28 +83,7 @@ impl NvxRunner {
     ) -> Result<CapturedRun, MxcError> {
         super::policy::validate_request(request)?;
         self.cancellation.check()?;
-        let state_root = tempfile::Builder::new()
-            .prefix(&format!("mxc-nvx-{}-", std::process::id()))
-            .tempdir()
-            .map_err(|error| {
-                MxcError::backend_unavailable(format!(
-                    "cannot create a private NVX state directory: {error}"
-                ))
-            })?;
-        let mut client = match super::runtime::create_client(state_root.path()) {
-            Ok(client) => client,
-            Err(error) => {
-                let cleanup = state_root
-                    .close()
-                    .err()
-                    .map(|error| {
-                        MxcError::backend_error(format!("cannot remove NVX state: {error}"))
-                    })
-                    .into_iter()
-                    .collect();
-                return finish_run(Err(error), cleanup, logger);
-            }
-        };
+        let (state_root, mut client) = open_client(logger)?;
         run_with_client(
             &mut client,
             state_root,
@@ -108,6 +94,85 @@ impl NvxRunner {
     }
 }
 
+fn open_client(logger: &mut Logger) -> Result<(tempfile::TempDir, NvxClient), MxcError> {
+    let state_root = tempfile::Builder::new()
+        .prefix(&format!("mxc-nvx-{}-", std::process::id()))
+        .tempdir()
+        .map_err(|error| {
+            MxcError::backend_unavailable(format!(
+                "cannot create a private NVX state directory: {error}"
+            ))
+        })?;
+    match super::runtime::create_client(state_root.path()) {
+        Ok(client) => Ok((state_root, client)),
+        Err(error) => {
+            let cleanup = state_root
+                .close()
+                .err()
+                .map(|error| MxcError::backend_error(format!("cannot remove NVX state: {error}")))
+                .into_iter()
+                .collect();
+            finish_run(Err(error), cleanup, logger)
+        }
+    }
+}
+
+fn request_has_sensitive_proxy(request: &ExecutionRequest) -> bool {
+    request
+        .policy
+        .network_proxy
+        .address
+        .as_ref()
+        .is_some_and(|proxy| proxy_url_has_credentials(&proxy.to_url()))
+}
+
+fn prepare_request(
+    client: &impl SandboxClient,
+    request: &ExecutionRequest,
+) -> Result<(ProvisionInput, super::abi::ExecRequest), MxcError> {
+    let sensitive_proxy = request_has_sensitive_proxy(request);
+    let protect = |operation, error| protect_native_error(error, operation, sensitive_proxy);
+    let capabilities = client
+        .capabilities()
+        .map_err(|error| protect("capabilities", error))?;
+    let (provision, spec) = super::policy::provision_request(request, &capabilities)?;
+    let exec = super::policy::exec_request(request, &capabilities)?;
+    let input = ProvisionInput {
+        request: provision,
+        spec,
+    };
+    client
+        .validate_provision(&input)
+        .map_err(|error| protect("validate_provision", error))?;
+    client
+        .validate_exec(&exec)
+        .map_err(|error| protect("validate_exec", error))?;
+    Ok((input, exec))
+}
+
+fn validate_with_client(
+    client: &mut impl SandboxClient,
+    state_root: tempfile::TempDir,
+    request: &ExecutionRequest,
+) -> Result<(), MxcError> {
+    let sensitive_proxy = request_has_sensitive_proxy(request);
+    let result = prepare_request(client, request).map(|_| ());
+    let mut cleanup = Vec::new();
+    if let Err(error) = client.close() {
+        cleanup.push(protect_native_error(error, "close", sensitive_proxy));
+    }
+    if let Err(error) = state_root.close() {
+        cleanup.push(MxcError::backend_error(format!(
+            "cannot remove NVX state directory: {error}"
+        )));
+    }
+    finish_run(
+        result,
+        cleanup,
+        &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+    )
+}
+
 fn run_with_client(
     client: &mut impl SandboxClient,
     state_root: tempfile::TempDir,
@@ -115,29 +180,10 @@ fn run_with_client(
     logger: &mut Logger,
     cancellation: Option<&RunCancellation>,
 ) -> Result<CapturedRun, MxcError> {
-    let sensitive_proxy = request
-        .policy
-        .network_proxy
-        .address
-        .as_ref()
-        .is_some_and(|proxy| proxy_url_has_credentials(&proxy.to_url()));
+    let sensitive_proxy = request_has_sensitive_proxy(request);
     let protect = |operation, error| protect_native_error(error, operation, sensitive_proxy);
     let prepared = (|| {
-        let capabilities = client
-            .capabilities()
-            .map_err(|error| protect("capabilities", error))?;
-        let (provision, spec) = super::policy::provision_request(request, &capabilities)?;
-        let exec = super::policy::exec_request(request, &capabilities)?;
-        let input = ProvisionInput {
-            request: provision,
-            spec,
-        };
-        client
-            .validate_provision(&input)
-            .map_err(|error| protect("validate_provision", error))?;
-        client
-            .validate_exec(&exec)
-            .map_err(|error| protect("validate_exec", error))?;
+        let (input, exec) = prepare_request(client, request)?;
         if let Some(cancellation) = cancellation {
             cancellation.check()?;
         }
@@ -317,8 +363,18 @@ impl ScriptRunner for NvxRunner {
     }
 
     fn validate_runner(&self, request: &ExecutionRequest) -> Result<(), ScriptResponse> {
-        super::policy::validate_request(request)
-            .map_err(|error| ScriptResponse::rejected(&error.message))
+        let result = if request.dry_run {
+            Self::validate_dry_run(request)
+        } else {
+            super::policy::validate_request(request)
+        };
+        result.map_err(|error| match error.code {
+            MxcErrorCode::PolicyValidation | MxcErrorCode::MalformedRequest => {
+                ScriptResponse::rejected(&error.message)
+            }
+            MxcErrorCode::BackendUnavailable => ScriptResponse::unavailable(&error.message),
+            _ => ScriptResponse::failed(FailurePhase::PostLaunchFailed, &error.to_string()),
+        })
     }
 
     fn execute(&mut self, request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
@@ -733,6 +789,104 @@ mod tests {
             self.calls.borrow_mut().push("close");
             self.close_res.clone()
         }
+    }
+
+    #[test]
+    fn dry_run_prepares_and_closes_without_probing_or_provisioning() {
+        for failure in ["none", "capabilities", "provision", "exec", "close", "both"] {
+            let mut client = MockClient::ok();
+            match failure {
+                "capabilities" => {
+                    client.capabilities_res =
+                        Err(MxcError::backend_unavailable("missing capability"));
+                }
+                "provision" | "both" => {
+                    client.validate_provision_res = Err(MxcError::policy_validation("bad policy"));
+                    if failure == "both" {
+                        client.close_res = Err(MxcError::backend_error("close failed"));
+                    }
+                }
+                "exec" => client.validate_res = Err(MxcError::policy_validation("bad process")),
+                "close" => client.close_res = Err(MxcError::backend_error("close failed")),
+                _ => {}
+            }
+            let state_root = tempfile::tempdir().unwrap();
+            let path = state_root.path().to_path_buf();
+            let result = validate_with_client(&mut client, state_root, &test_request());
+            assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+            if failure == "capabilities" {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+                assert_eq!(error.message, "missing capability");
+            } else if failure == "provision" {
+                assert_eq!(result.unwrap_err().message, "bad policy");
+            } else if failure == "exec" {
+                assert_eq!(result.unwrap_err().message, "bad process");
+            } else if failure == "close" {
+                assert!(result.unwrap_err().message.contains("close failed"));
+            } else if failure == "both" {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::PolicyValidation);
+                assert!(error.message.starts_with("bad policy; cleanup failure: "));
+                assert!(error.message.contains("close failed"));
+            }
+            let expected: &[&str] = if failure == "capabilities" {
+                &["capabilities", "close"]
+            } else if matches!(failure, "provision" | "both") {
+                &["capabilities", "validate_provision", "close"]
+            } else {
+                &["capabilities", "validate_provision", "validate", "close"]
+            };
+            assert_eq!(*client.calls.borrow(), expected, "{failure}");
+            assert!(!path.exists(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn dry_run_rejects_ingress_capabilities_not_advertised_by_the_runtime() {
+        let mut client = MockClient::ok();
+        let mut request = test_request();
+        request.policy.network_specified = true;
+        request.policy.network_ingress = Some(crate::mxc_common::models::NetworkIngressPolicy {
+            default: crate::mxc_common::models::NetworkAction::Allow,
+            ..Default::default()
+        });
+        let state_root = tempfile::tempdir().unwrap();
+        let path = state_root.path().to_path_buf();
+        let error = validate_with_client(&mut client, state_root, &request).unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::PolicyValidation);
+        assert!(error.message.contains("network.ingress.default=allow"));
+        assert_eq!(*client.calls.borrow(), ["capabilities", "close"]);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dry_run_withholds_native_proxy_credentials() {
+        let mut client = MockClient::ok();
+        client
+            .capabilities_res
+            .as_mut()
+            .unwrap()
+            .network
+            .network_proxy = true;
+        client.validate_provision_res = Err(MxcError::policy_validation("native synthetic secret"));
+        let state_root = tempfile::tempdir().unwrap();
+        let path = state_root.path().to_path_buf();
+        let error = validate_with_client(
+            &mut client,
+            state_root,
+            &request_with_proxy("http://synthetic:secret@localhost:3128"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::PolicyValidation);
+        assert!(error.message.contains("validate_provision"));
+        assert!(error.message.contains("withheld"));
+        assert!(!format!("{error:?}").contains("synthetic"));
+        assert!(!path.exists());
+        assert_eq!(
+            *client.calls.borrow(),
+            ["capabilities", "validate_provision", "close"]
+        );
     }
 
     fn request_with_proxy(url: &str) -> ExecutionRequest {
