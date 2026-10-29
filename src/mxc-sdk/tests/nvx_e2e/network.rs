@@ -168,6 +168,11 @@ fn signed_bundle_network_rules_enforce_allow_deny_and_port_selectors() {
         rule["ports"] = json!([{"protocol": "tcp", "port": start, "endPort": end}]);
         rule
     };
+    let protocol_rule = |protocol: &str| {
+        let mut rule = services.rule(None);
+        rule["ports"] = json!([{"protocol": protocol, "port": low, "endPort": high}]);
+        rule
+    };
     let nonmatching_host = Ipv4Addr::from(u32::from(services.host) ^ 1);
     for (label, policy, expected) in [
         (
@@ -184,6 +189,21 @@ fn signed_bundle_network_rules_enforce_allow_deny_and_port_selectors() {
             "explicit deny overrides the broad allow",
             json!({"allow": [services.rule(None)], "deny": [services.rule(Some(services.ports[0]))]}),
             json!(["blocked", "reached"]),
+        ),
+        (
+            "TCP protocol matches both TCP endpoints",
+            json!({"allow": [protocol_rule("tcp")]}),
+            json!(["reached", "reached"]),
+        ),
+        (
+            "UDP protocol does not grant TCP connections",
+            json!({"allow": [protocol_rule("udp")]}),
+            json!(["blocked", "blocked"]),
+        ),
+        (
+            "any protocol includes both TCP endpoints",
+            json!({"allow": [protocol_rule("any")]}),
+            json!(["reached", "reached"]),
         ),
         (
             "a nonmatching destination CIDR grants neither reachable endpoint",
