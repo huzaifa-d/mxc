@@ -134,6 +134,9 @@ fn main() {
         if mode != "missing-discovery" {
             println!("windows_x64::signed_bundle_facade_create_and_run: test");
         }
+        if mode != "missing-sdk-json-discovery" {
+            println!("windows_x64::signed_bundle_sdk_json_capture: test");
+        }
         return;
     }
     assert!(args.contains(&"--include-ignored".to_owned()));
@@ -149,6 +152,9 @@ fn main() {
     }
     if mode != "missing-facade" {
         println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/capture-limit/cleanup");
+    }
+    if mode != "missing-sdk-json" {
+        println!("VM_EXECUTED SDK JSON binary capture timeout limit and cleanup");
     }
     if mode != "missing-json-image" {
         println!("VM_EXECUTED JSON selected-image filesystem read/write/deny and cleanup");
@@ -472,6 +478,7 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   assert.equal(result.status, 0, result.output);
   const log = readFileSync(join(directory, "logs", "microvm-nvx.log"), "utf8");
   assert.match(log, /VM_EXECUTED facade /);
+  assert.match(log, /VM_EXECUTED SDK JSON binary capture /);
   assert.match(log, /VM_EXECUTED JSON selected-image filesystem /);
   assert.match(log, /VM_EXECUTED executor /);
   assert.match(log, /VM_EXECUTED executor console interruption /);
@@ -481,6 +488,7 @@ for (const [mode, message] of [
   ["native-failure", /exited 23/],
   ["zero-tests", /executed no tests/],
   ["missing-facade", /did not execute the facade VM scenario/],
+  ["missing-sdk-json", /did not execute the SDK JSON capture VM scenario/],
   ["missing-json-image", /did not execute the JSON image and policy VM scenario/],
   ["missing-executor", /did not execute the executor VM scenario/],
   ["missing-configs", /did not execute the executor configs VM scenario/],
@@ -540,6 +548,7 @@ for (const [mode, message] of [
   ["missing-alias-discovery", /did not discover windows_x64::guest_path_resolves_windows_case_alias/],
   ["missing-executor-proxy-discovery", /did not discover windows_x64::signed_executor_proxy_validation_withholds_credentials/],
   ["missing-discovery", /did not discover windows_x64::signed_bundle_facade_create_and_run/],
+  ["missing-sdk-json-discovery", /did not discover windows_x64::signed_bundle_sdk_json_capture/],
   ["missing-interruption-discovery", /did not discover windows_x64::signed_bundle_executor_console_interrupt/],
 ]) {
   test(`staging rejects ${mode}`, () => {
@@ -551,6 +560,7 @@ for (const [mode, message] of [
       "missing-alias-discovery",
       "missing-executor-proxy-discovery",
       "missing-discovery",
+      "missing-sdk-json-discovery",
       "missing-interruption-discovery",
     ].includes(mode)) {
       assert.equal(existsSync(join(result.directory, "nvx-e2e-tests.exe")), false);

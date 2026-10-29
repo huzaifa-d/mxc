@@ -201,9 +201,10 @@ For PowerShell startup failures, see
 ### Experimental MicroVM support
 
 Enable the `microvm` Cargo feature on Windows x64 for experimental captured
-create-and-run execution through the executor. Typed V1 APIs do not expose
-MicroVM selection. Distribute the complete staged `aci-edge-sandboxes/`
-directory beside the executable. See the
+create-and-run execution with `v1::dev::run_json`. Supply a MicroVM JSON
+request and set `JsonOptions { experimental: true }`. Typed V1 APIs do not
+expose MicroVM selection. Distribute the complete staged `aci-edge-sandboxes/`
+directory beside the application executable. See the
 [NVX backend guide](https://github.com/microsoft/mxc/blob/main/docs/backends/nvx/nvx.md)
 for host requirements, image references, and supported operations and policy.
 

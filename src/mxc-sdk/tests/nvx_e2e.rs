@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use mxc_sdk::{__ffi, v1::ErrorCode};
+use mxc_sdk::{
+    __ffi,
+    v1::{dev, ErrorCode},
+};
 
 #[cfg(all(windows, target_arch = "x86_64", feature = "microvm"))]
 #[path = "nvx_e2e/network.rs"]
@@ -95,6 +98,67 @@ fn microvm_json_operations_require_explicit_optin() {
         let error = __ffi::run_lifecycle_json(&request.to_string(), dry_run, false).unwrap_err();
         assert_eq!(error.code, ErrorCode::BackendUnavailable, "{error}");
         assert!(error.message.contains("experimental"), "{error}");
+    }
+}
+
+#[test]
+fn sdk_json_rejects_invalid_requests_and_requires_explicit_optin() {
+    let request = process_only_request("printf forbidden");
+    let json = request.to_string();
+    let error = dev::run_json(&json, dev::JsonOptions::default()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::BackendUnavailable, "{error}");
+    assert!(error.message.contains("experimental"), "{error}");
+
+    for experimental in [false, true] {
+        let options = dev::JsonOptions { experimental };
+        for invalid in [
+            "{ not json".to_owned(),
+            r#"{"version":"999.0.0","process":{"commandLine":"echo"}}"#.to_owned(),
+            r#"{"version":"1.0.0","phase":"start","sandboxId":"iso:unused"}"#.to_owned(),
+        ] {
+            let error = dev::run_json(&invalid, options).unwrap_err();
+            assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
+        }
+        let mut invalid_image = request.clone();
+        invalid_image["microvm"]["image"] = serde_json::json!("python:3.12-alpine");
+        let error = dev::run_json(&invalid_image.to_string(), options).unwrap_err();
+        assert_eq!(error.code, ErrorCode::MalformedRequest, "{error}");
+    }
+
+    #[cfg(not(all(windows, target_arch = "x86_64", feature = "microvm")))]
+    {
+        let error = dev::run_json(&json, dev::JsonOptions { experimental: true }).unwrap_err();
+        assert_eq!(error.code, ErrorCode::BackendUnavailable, "{error}");
+        assert!(error.message.contains("Windows x64"), "{error}");
+    }
+}
+
+#[test]
+fn sdk_json_rejects_microvm_streaming_pty_and_lifecycle() {
+    let mut request = process_only_request("printf forbidden");
+    let options = dev::JsonOptions { experimental: true };
+    let json = request.to_string();
+    let error = dev::spawn_json(&json, options)
+        .err()
+        .expect("MicroVM streaming must be rejected");
+    assert_eq!(error.code, ErrorCode::UnsupportedContainment, "{error}");
+    let error = dev::spawn_with_pty_json(
+        &json,
+        dev::PtyJsonOptions {
+            experimental: true,
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("MicroVM PTY must be rejected");
+    assert_eq!(error.code, ErrorCode::UnsupportedContainment, "{error}");
+
+    request.as_object_mut().unwrap().remove("process");
+    request["phase"] = serde_json::json!("provision");
+    let json = request.to_string();
+    for call in [dev::provision_container_json, dev::validate_provision_json] {
+        let error = call(&json, options).unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedPhase, "{error}");
     }
 }
 
@@ -738,6 +802,48 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert_eq!(std::fs::read(rw.join("result")).unwrap(), b"write-ok");
         assert_no_run_state(std::process::id());
         println!("VM_EXECUTED JSON selected-image filesystem read/write/deny and cleanup");
+    }
+
+    #[test]
+    #[ignore = "VM: requires Windows x64, WHP and the exact signed official bundle"]
+    fn signed_bundle_sdk_json_capture() {
+        let options = dev::JsonOptions { experimental: true };
+        let mut invalid_proxy = process_only_request("printf forbidden");
+        invalid_proxy["runtimeConfig"] =
+            json!({"networkProxy": "http://synthetic-user:synthetic-password@[::1]:3128"});
+        let error = dev::run_json(&invalid_proxy.to_string(), options).unwrap_err();
+        assert_eq!(error.code, ErrorCode::PolicyValidation);
+        assert!(error.message.contains("validate_provision"), "{error}");
+        assert!(error.message.contains("withheld"), "{error}");
+        assert!(!format!("{error:?}").contains("synthetic"));
+        assert_no_run_state(std::process::id());
+
+        let request =
+            process_only_request("printf '\\377\\000\\376'; printf '\\200\\000\\201' >&2; exit 42");
+        let result = dev::run_json(&request.to_string(), options).unwrap();
+        assert_eq!(result.outcome, WaitResult::Exited(42));
+        assert_eq!(result.stdout, b"\xff\0\xfe");
+        assert_eq!(result.stderr, b"\x80\0\x81");
+        assert_no_run_state(std::process::id());
+
+        let mut timeout =
+            process_only_request("printf partial-out; printf partial-err >&2; sleep 5");
+        timeout["process"]["timeout"] = json!(200);
+        let result = dev::run_json(&timeout.to_string(), options).unwrap();
+        assert_eq!(result.outcome, WaitResult::TimedOut);
+        assert_eq!(result.stdout, b"partial-out");
+        assert_eq!(result.stderr, b"partial-err");
+        assert_no_run_state(std::process::id());
+
+        let error = dev::run_json(
+            &capture_boundary_request(CAPTURE_LIMIT / 2 + 1).to_string(),
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BackendError);
+        assert_eq!(error.message, CAPTURE_ERROR);
+        assert_no_run_state(std::process::id());
+        println!("VM_EXECUTED SDK JSON binary capture timeout limit and cleanup");
     }
 
     #[test]
