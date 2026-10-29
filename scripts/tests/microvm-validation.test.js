@@ -115,9 +115,19 @@ fn main() {
         return;
     }
     if args == ["--list"] {
+        if mode != "missing-proxy-discovery" {
+            println!("windows_x64::signed_agent_proxy_validation_withholds_credentials: test");
+        }
+        if mode != "missing-alias-discovery" {
+            println!("windows_x64::guest_path_resolves_windows_case_alias: test");
+        }
+        if mode != "missing-executor-proxy-discovery" {
+            println!("windows_x64::signed_executor_proxy_validation_withholds_credentials: test");
+        }
         println!("windows_x64::host_only_executor_request_matrix: test");
         println!("windows_x64::signed_bundle_executor_configs: test");
         println!("windows_x64::signed_bundle_executor_create_and_run: test");
+        println!("windows_x64::signed_bundle_json_image_and_filesystem_policy: test");
         if mode != "missing-interruption-discovery" {
             println!("windows_x64::signed_bundle_executor_console_interrupt: test");
         }
@@ -139,6 +149,9 @@ fn main() {
     }
     if mode != "missing-facade" {
         println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/capture-limit/cleanup");
+    }
+    if mode != "missing-json-image" {
+        println!("VM_EXECUTED JSON selected-image filesystem read/write/deny and cleanup");
     }
     if mode != "missing-executor" {
         println!("VM_EXECUTED executor sequential stdout/stderr/exit/timeout/capture-limit/cleanup");
@@ -459,6 +472,7 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   assert.equal(result.status, 0, result.output);
   const log = readFileSync(join(directory, "logs", "microvm-nvx.log"), "utf8");
   assert.match(log, /VM_EXECUTED facade /);
+  assert.match(log, /VM_EXECUTED JSON selected-image filesystem /);
   assert.match(log, /VM_EXECUTED executor /);
   assert.match(log, /VM_EXECUTED executor console interruption /);
 });
@@ -467,6 +481,7 @@ for (const [mode, message] of [
   ["native-failure", /exited 23/],
   ["zero-tests", /executed no tests/],
   ["missing-facade", /did not execute the facade VM scenario/],
+  ["missing-json-image", /did not execute the JSON image and policy VM scenario/],
   ["missing-executor", /did not execute the executor VM scenario/],
   ["missing-configs", /did not execute the executor configs VM scenario/],
   ["missing-interruption", /did not execute the executor interruption VM scenario/],
@@ -521,6 +536,9 @@ test("staging uses Cargo's reported executable and checks VM test discovery", ()
 for (const [mode, message] of [
   ["cargo-failure", /cargo test --no-run failed with exit code 17/],
   ["cargo-no-artifact", /Expected one nvx_e2e test executable/],
+  ["missing-proxy-discovery", /did not discover windows_x64::signed_agent_proxy_validation_withholds_credentials/],
+  ["missing-alias-discovery", /did not discover windows_x64::guest_path_resolves_windows_case_alias/],
+  ["missing-executor-proxy-discovery", /did not discover windows_x64::signed_executor_proxy_validation_withholds_credentials/],
   ["missing-discovery", /did not discover windows_x64::signed_bundle_facade_create_and_run/],
   ["missing-interruption-discovery", /did not discover windows_x64::signed_bundle_executor_console_interrupt/],
 ]) {
@@ -528,7 +546,13 @@ for (const [mode, message] of [
     const result = stage(mode);
     assert.notEqual(result.status, 0, result.output);
     assert.match(result.output, message);
-    if (!["missing-discovery", "missing-interruption-discovery"].includes(mode)) {
+    if (![
+      "missing-proxy-discovery",
+      "missing-alias-discovery",
+      "missing-executor-proxy-discovery",
+      "missing-discovery",
+      "missing-interruption-discovery",
+    ].includes(mode)) {
       assert.equal(existsSync(join(result.directory, "nvx-e2e-tests.exe")), false);
     }
   });

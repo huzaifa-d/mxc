@@ -9,9 +9,12 @@ use crate::mxc_common::audit::{AuditEvent, AuditEventName};
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, FailurePhase, ScriptResponse};
 use crate::mxc_common::mxc_error::{MxcError, MxcErrorCode};
+use crate::mxc_common::proxy_env::proxy_url_has_credentials;
 use crate::mxc_common::script_runner::{RunCancellation, ScriptRunner};
 
-use super::abi::{ExecOutcome, ExecRequest};
+#[cfg(test)]
+use super::abi::{Capabilities, ExecRequest};
+use super::abi::{ExecOutcome, ProvisionInput};
 use super::runtime::SandboxClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,19 +115,47 @@ fn run_with_client(
     logger: &mut Logger,
     cancellation: Option<&RunCancellation>,
 ) -> Result<CapturedRun, MxcError> {
-    let exec = exec_request(request);
-    let sandbox_id = match client
-        .validate_exec(&exec)
-        .and_then(|()| cancellation.map_or(Ok(()), RunCancellation::check))
-        .and_then(|()| client.probe())
-        .and_then(|()| cancellation.map_or(Ok(()), RunCancellation::check))
-        .and_then(|()| client.provision())
-    {
-        Ok(sandbox_id) => sandbox_id,
+    let sensitive_proxy = request
+        .policy
+        .network_proxy
+        .address
+        .as_ref()
+        .is_some_and(|proxy| proxy_url_has_credentials(&proxy.to_url()));
+    let protect = |operation, error| protect_native_error(error, operation, sensitive_proxy);
+    let prepared = (|| {
+        let capabilities = client
+            .capabilities()
+            .map_err(|error| protect("capabilities", error))?;
+        let (provision, spec) = super::policy::provision_request(request, &capabilities)?;
+        let exec = super::policy::exec_request(request, &capabilities)?;
+        let input = ProvisionInput {
+            request: provision,
+            spec,
+        };
+        client
+            .validate_provision(&input)
+            .map_err(|error| protect("validate_provision", error))?;
+        client
+            .validate_exec(&exec)
+            .map_err(|error| protect("validate_exec", error))?;
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        client.probe().map_err(|error| protect("probe", error))?;
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        let sandbox_id = client
+            .provision(&input)
+            .map_err(|error| protect("provision", error))?;
+        Ok((sandbox_id, exec))
+    })();
+    let (sandbox_id, exec) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             let mut cleanup = Vec::new();
             if let Err(close_error) = client.close() {
-                cleanup.push(close_error);
+                cleanup.push(protect("close", close_error));
             }
             if let Err(remove_error) = state_root.close() {
                 cleanup.push(MxcError::backend_error(format!(
@@ -146,17 +177,22 @@ fn run_with_client(
         if let Some(cancellation) = cancellation {
             cancellation.check()?;
         }
-        if let Err(mut error) = client.start(&sandbox_id) {
-            error.message.push_str("; startup diagnostics");
-            match client.diagnostics(&sandbox_id) {
-                Ok(diagnostics) => {
-                    error
-                        .message
-                        .push_str(&super::runtime::startup_diagnostics(&diagnostics));
-                }
-                Err(diagnostic_error) => {
-                    error.message.push_str(" unavailable: ");
-                    error.message.push_str(&diagnostic_error.to_string());
+        if let Err(error) = client.start(&sandbox_id) {
+            let mut error = protect("start", error);
+            if sensitive_proxy {
+                error.message.push_str("; startup diagnostics withheld");
+            } else {
+                error.message.push_str("; startup diagnostics");
+                match client.diagnostics(&sandbox_id) {
+                    Ok(diagnostics) => {
+                        error
+                            .message
+                            .push_str(&super::runtime::startup_diagnostics(&diagnostics));
+                    }
+                    Err(diagnostic_error) => {
+                        error.message.push_str(" unavailable: ");
+                        error.message.push_str(&diagnostic_error.to_string());
+                    }
                 }
             }
             return Err(error);
@@ -164,16 +200,21 @@ fn run_with_client(
         if let Some(cancellation) = cancellation {
             cancellation.check()?;
         }
-        client.exec_and_wait(&sandbox_id, &exec, cancellation, logger)
+        client
+            .exec_and_wait(&sandbox_id, &exec, cancellation, logger)
+            .map_err(|error| protect("exec", error))
     })();
 
     let stop_error = match client.stop(&sandbox_id).err() {
         Some(error) if primary.is_err() && error.code == MxcErrorCode::AlreadyStopped => None,
-        other => other,
+        other => other.map(|error| protect("stop", error)),
     };
-    let deprovision_error = client.deprovision(&sandbox_id).err();
+    let deprovision_error = client
+        .deprovision(&sandbox_id)
+        .err()
+        .map(|error| protect("deprovision", error));
     let retain_state = deprovision_error.is_some();
-    let close_error = client.close().err();
+    let close_error = client.close().err().map(|error| protect("close", error));
     let mut cleanup_errors: Vec<MxcError> = [stop_error, deprovision_error, close_error]
         .into_iter()
         .flatten()
@@ -211,6 +252,37 @@ fn run_with_client(
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+fn protect_native_error(mut error: MxcError, operation: &str, sensitive_proxy: bool) -> MxcError {
+    if !sensitive_proxy {
+        return error;
+    }
+
+    error.details = None;
+    error.api_failure = None;
+    error.remediation = None;
+
+    if operation == "exec" {
+        let (primary, cleanup) = match error.message.split_once("; cleanup failure: ") {
+            Some((primary, _)) => (primary, true),
+            None => (error.message.as_str(), false),
+        };
+        let capture_limit =
+            super::runtime::capture_limit_error(super::runtime::CAPTURE_LIMIT_BYTES);
+        if primary == "execution cancelled" || primary == capture_limit.message {
+            if cleanup {
+                error.message = format!(
+                    "{primary}; execution cleanup failed; native error detail withheld because the configured proxy contains credentials"
+                );
+            }
+            return error;
+        }
+    }
+    error.message = format!(
+        "NVX {operation} failed; native error detail withheld because the configured proxy contains credentials"
+    );
+    error
 }
 
 fn finish_run<T>(
@@ -305,20 +377,6 @@ fn captured_to_script_response(
     Ok(result.response())
 }
 
-fn exec_request(request: &ExecutionRequest) -> ExecRequest {
-    let mut exec = ExecRequest::command_line(request.script_code.clone());
-    if request.script_timeout != 0 {
-        exec = exec.with_timeout_ms(u64::from(request.script_timeout));
-    }
-    if !request.working_directory.is_empty() {
-        exec = exec.with_cwd(request.working_directory.clone());
-    }
-    if let Some(environment) = &request.env {
-        exec = exec.with_envs(environment.clone());
-    }
-    exec.with_inherit_default_env(request.inherit_default_env)
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -326,6 +384,28 @@ mod tests {
     use super::super::abi::SandboxDiagnostics;
     use super::super::runtime::{ExecOutput, SandboxId};
     use super::*;
+
+    fn test_capabilities() -> Capabilities {
+        let mut capabilities = Capabilities::default();
+        capabilities.exec.command_line = true;
+        capabilities.exec.cwd = true;
+        capabilities.exec.env = true;
+        capabilities.spec.image_reference = true;
+        capabilities.filesystem.readonly_paths = true;
+        capabilities.filesystem.readwrite_paths = true;
+        capabilities.filesystem.denied_paths = true;
+        capabilities.network.egress_deny = true;
+        capabilities.network.ingress_deny = true;
+        capabilities.network.host_loopback_deny = true;
+        capabilities
+    }
+
+    fn test_request() -> ExecutionRequest {
+        ExecutionRequest {
+            microvm_image: Some("docker.io/library/python:3.12-alpine".to_owned()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn maps_exit_signal_and_timeout_outcomes() {
@@ -350,7 +430,7 @@ mod tests {
         assert!(signal.request());
         let request = ExecutionRequest {
             script_code: "printf test".to_owned(),
-            ..Default::default()
+            ..test_request()
         };
         let error = runner
             .run_captured(
@@ -495,22 +575,34 @@ mod tests {
 
     #[test]
     fn process_mapping_preserves_command_timeout_cwd_and_environment_presence() {
+        let mut capabilities = Capabilities::default();
+        capabilities.exec.command_line = true;
+        capabilities.exec.cwd = true;
+        capabilities.exec.env = true;
         let request = ExecutionRequest {
             script_code: "printf '%s' \"$KEY\"".to_owned(),
             working_directory: "/tmp".to_owned(),
             script_timeout: 250,
             env: Some(Vec::new()),
             inherit_default_env: true,
+            microvm_image: Some("docker.io/library/python:3.12-alpine".to_owned()),
             ..Default::default()
         };
-        let mapped = exec_request(&request);
+        let mapped = super::super::policy::exec_request(&request, &capabilities).unwrap();
         assert_eq!(mapped.process.command_line, request.script_code);
         assert_eq!(mapped.process.timeout, Some(250));
         assert_eq!(mapped.process.cwd.as_deref(), Some("/tmp"));
         assert_eq!(mapped.process.env, Some(Vec::new()));
         assert_eq!(mapped.process.inherit_default_env, Some(true));
 
-        let defaults = exec_request(&ExecutionRequest::default());
+        let defaults = super::super::policy::exec_request(
+            &ExecutionRequest {
+                microvm_image: Some("docker.io/library/python:3.12-alpine".to_owned()),
+                ..Default::default()
+            },
+            &capabilities,
+        )
+        .unwrap();
         assert_eq!(defaults.process.env, None);
         assert_eq!(defaults.process.timeout, None);
         assert_eq!(defaults.process.cwd, None);
@@ -520,6 +612,10 @@ mod tests {
         calls: RefCell<Vec<&'static str>>,
         validated_request: RefCell<Option<ExecRequest>>,
         executed_request: RefCell<Option<ExecRequest>>,
+        validated_provision: RefCell<Option<ProvisionInput>>,
+        provisioned_input: RefCell<Option<ProvisionInput>>,
+        capabilities_res: Result<Capabilities, MxcError>,
+        validate_provision_res: Result<(), MxcError>,
         validate_res: Result<(), MxcError>,
         probe_res: Result<(), MxcError>,
         provision_res: Result<SandboxId, MxcError>,
@@ -538,6 +634,10 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 validated_request: RefCell::new(None),
                 executed_request: RefCell::new(None),
+                validated_provision: RefCell::new(None),
+                provisioned_input: RefCell::new(None),
+                capabilities_res: Ok(test_capabilities()),
+                validate_provision_res: Ok(()),
                 validate_res: Ok(()),
                 probe_res: Ok(()),
                 provision_res: SandboxId::from_token("0123456789abcdef0123456789abcdef"),
@@ -566,6 +666,17 @@ mod tests {
     }
 
     impl SandboxClient for MockClient {
+        fn capabilities(&self) -> Result<Capabilities, MxcError> {
+            self.calls.borrow_mut().push("capabilities");
+            self.capabilities_res.clone()
+        }
+
+        fn validate_provision(&self, input: &ProvisionInput) -> Result<(), MxcError> {
+            self.calls.borrow_mut().push("validate_provision");
+            *self.validated_provision.borrow_mut() = Some(input.clone());
+            self.validate_provision_res.clone()
+        }
+
         fn validate_exec(&self, request: &ExecRequest) -> Result<(), MxcError> {
             self.record("validate");
             *self.validated_request.borrow_mut() = Some(request.clone());
@@ -577,8 +688,9 @@ mod tests {
             self.probe_res.clone()
         }
 
-        fn provision(&self) -> Result<SandboxId, MxcError> {
+        fn provision(&self, input: &ProvisionInput) -> Result<SandboxId, MxcError> {
             self.record("provision");
+            *self.provisioned_input.borrow_mut() = Some(input.clone());
             self.provision_res.clone()
         }
 
@@ -623,6 +735,264 @@ mod tests {
         }
     }
 
+    fn request_with_proxy(url: &str) -> ExecutionRequest {
+        let mut request = test_request();
+        request.policy.runtime_network_proxy_specified = true;
+        request.policy.network_proxy.address = Some(
+            crate::mxc_common::models::ProxyAddress::from_url(url, "localhost".to_owned(), 3128),
+        );
+        request
+    }
+
+    #[test]
+    fn credential_proxy_withholds_native_errors_and_preserves_input() {
+        let proxy = "http://synthetic%3Auser:synthetic%40secret@localhost:3128";
+        for phase in [
+            "capabilities",
+            "validate_provision",
+            "validate_exec",
+            "probe",
+            "provision",
+            "start",
+            "exec",
+        ] {
+            let mut client = MockClient::ok();
+            client
+                .capabilities_res
+                .as_mut()
+                .unwrap()
+                .network
+                .network_proxy = true;
+            let failure = MxcError::policy_validation("native synthetic@secret fragment")
+                .with_details(serde_json::json!({"native": "synthetic detail"}))
+                .with_api_failure(
+                    crate::mxc_common::mxc_error::ApiFailure::new("synthetic operation")
+                        .with_native_code("synthetic code"),
+                )
+                .with_remediation("synthetic remediation");
+            match phase {
+                "capabilities" => client.capabilities_res = Err(failure),
+                "validate_provision" => client.validate_provision_res = Err(failure),
+                "validate_exec" => client.validate_res = Err(failure),
+                "probe" => client.probe_res = Err(failure),
+                "provision" => client.provision_res = Err(failure),
+                "start" => client.start_res = Err(failure),
+                "exec" => client.exec_res = Err(failure),
+                _ => unreachable!(),
+            }
+            let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+            let error = run_with_client(
+                &mut client,
+                tempfile::tempdir().unwrap(),
+                &request_with_proxy(proxy),
+                &mut logger,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, MxcErrorCode::PolicyValidation, "{phase}");
+            assert!(error.message.contains(phase), "{phase}: {}", error.message);
+            assert!(
+                error.message.contains("withheld"),
+                "{phase}: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("synthetic"),
+                "{phase}: {}",
+                error.message
+            );
+            assert!(!format!("{error:?}").contains("synthetic"), "{phase}");
+            assert!(
+                !serde_json::to_string(&error.to_envelope())
+                    .unwrap()
+                    .contains("synthetic"),
+                "{phase}"
+            );
+            assert!(!logger.get_buffer().contains("synthetic"), "{phase}");
+            if phase != "capabilities" {
+                let input = client.validated_provision.borrow();
+                assert_eq!(
+                    input
+                        .as_ref()
+                        .unwrap()
+                        .request
+                        .runtime_config
+                        .as_ref()
+                        .unwrap()
+                        .network_proxy
+                        .as_deref(),
+                    Some(proxy),
+                    "{phase}"
+                );
+            }
+            if phase == "start" {
+                assert!(error.message.contains("startup diagnostics withheld"));
+                assert!(!client.calls.borrow().contains(&"diagnostics"));
+            }
+        }
+    }
+
+    #[test]
+    fn credential_proxy_withholds_cleanup_errors_before_logging() {
+        let mut client = MockClient::ok();
+        client
+            .capabilities_res
+            .as_mut()
+            .unwrap()
+            .network
+            .network_proxy = true;
+        client.start_res = Err(MxcError::backend_error("synthetic primary detail"));
+        client.stop_res = Err(MxcError::backend_error("synthetic cleanup detail"));
+        client.close_res = Err(MxcError::backend_error("synthetic close detail"));
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        let error = run_with_client(
+            &mut client,
+            tempfile::tempdir().unwrap(),
+            &request_with_proxy("http://user:synthetic-secret@localhost:3128"),
+            &mut logger,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("start"));
+        assert!(error.message.contains("stop"));
+        assert!(error.message.contains("close"));
+        assert!(error.message.contains("withheld"));
+        assert!(!error.message.contains("synthetic"));
+        assert!(!logger.get_buffer().contains("synthetic"));
+        assert!(logger
+            .warnings()
+            .iter()
+            .all(|warning| !warning.contains("synthetic")));
+    }
+
+    #[test]
+    fn credential_proxy_preserves_local_execution_failures() {
+        for message in [
+            "execution cancelled",
+            "NVX signed bundled agent: combined stdout/stderr capture limit of 67108864 bytes exceeded",
+        ] {
+            for cleanup_failure in [false, true] {
+                let mut client = MockClient::ok();
+                client
+                    .capabilities_res
+                    .as_mut()
+                    .unwrap()
+                    .network
+                    .network_proxy = true;
+                let detail = if cleanup_failure {
+                    format!("{message}; cleanup failure: synthetic secret")
+                } else {
+                    message.to_owned()
+                };
+                client.exec_res = Err(MxcError::backend_error(detail));
+                let error = run_with_client(
+                    &mut client,
+                    tempfile::tempdir().unwrap(),
+                    &request_with_proxy("http://user:synthetic-secret@localhost:3128"),
+                    &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+                    None,
+                )
+                .unwrap_err();
+                assert!(error.message.starts_with(message), "{}", error.message);
+                assert!(!error.message.contains("synthetic"), "{}", error.message);
+                if cleanup_failure {
+                    assert!(error.message.contains("withheld"), "{}", error.message);
+                } else {
+                    assert_eq!(error.message, message);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn credential_free_proxy_keeps_native_diagnostics() {
+        let mut client = MockClient::ok();
+        client
+            .capabilities_res
+            .as_mut()
+            .unwrap()
+            .network
+            .network_proxy = true;
+        client.start_res = Err(MxcError::backend_error("native start detail"));
+        let error = run_with_client(
+            &mut client,
+            tempfile::tempdir().unwrap(),
+            &request_with_proxy("http://localhost:3128"),
+            &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("native start detail"));
+        assert!(error.message.contains("diagnostics unavailable"));
+        assert!(!error.message.contains("withheld"));
+        assert!(client.calls.borrow().contains(&"diagnostics"));
+    }
+
+    #[test]
+    fn credential_proxy_keeps_runtime_input_and_captured_output() {
+        let proxy = "http://synthetic%3Auser:synthetic%40secret@localhost:3128";
+        let mut client = MockClient::ok();
+        client
+            .capabilities_res
+            .as_mut()
+            .unwrap()
+            .network
+            .network_proxy = true;
+        let result = run_with_client(
+            &mut client,
+            tempfile::tempdir().unwrap(),
+            &request_with_proxy(proxy),
+            &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, CapturedOutcome::Exited(0));
+        assert_eq!(result.stdout, b"ok");
+        for input in [&client.validated_provision, &client.provisioned_input] {
+            assert_eq!(
+                input
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .runtime_config
+                    .as_ref()
+                    .unwrap()
+                    .network_proxy
+                    .as_deref(),
+                Some(proxy)
+            );
+        }
+    }
+
+    #[test]
+    fn credential_proxy_withholds_retained_state_cleanup_error() {
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().to_path_buf();
+        let mut client = MockClient::ok();
+        client
+            .capabilities_res
+            .as_mut()
+            .unwrap()
+            .network
+            .network_proxy = true;
+        client.deprovision_res = Err(MxcError::backend_error("synthetic secret"));
+        let error = run_with_client(
+            &mut client,
+            state_root,
+            &request_with_proxy("http://user:synthetic-secret@localhost:3128"),
+            &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("deprovision"));
+        assert!(error.message.contains("withheld"));
+        assert!(error.message.contains("state retained"));
+        assert!(!error.message.contains("synthetic"));
+        assert!(state_path.exists());
+        std::fs::remove_dir_all(state_path).unwrap();
+    }
+
     #[test]
     fn cancellation_during_startup_or_execution_runs_ordered_teardown() {
         for phase in ["validate", "probe", "provision", "start", "exec"] {
@@ -638,7 +1008,7 @@ mod tests {
                 let error = run_with_client(
                     &mut client,
                     state_root,
-                    &ExecutionRequest::default(),
+                    &test_request(),
                     &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
                     Some(&cancellation),
                 )
@@ -678,7 +1048,11 @@ mod tests {
                         "close",
                     ],
                 };
-                assert_eq!(client.calls.borrow().as_slice(), expected);
+                let expected: Vec<_> = ["capabilities", "validate_provision"]
+                    .into_iter()
+                    .chain(expected.iter().copied())
+                    .collect();
+                assert_eq!(*client.calls.borrow(), expected);
                 if cleanup_fails {
                     assert!(error.message.contains("cleanup failure"));
                     assert!(error.message.contains("host_close failed"));
@@ -700,7 +1074,7 @@ mod tests {
         let error = run_with_client(
             &mut client,
             state_root,
-            &ExecutionRequest::default(),
+            &test_request(),
             &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
             Some(&cancellation),
         )
@@ -717,6 +1091,8 @@ mod tests {
         assert_eq!(
             client.calls.borrow().as_slice(),
             [
+                "capabilities",
+                "validate_provision",
                 "validate",
                 "probe",
                 "provision",
@@ -753,7 +1129,7 @@ mod tests {
             let error = run_with_client(
                 &mut client,
                 state_root,
-                &ExecutionRequest::default(),
+                &test_request(),
                 &mut Logger::new(crate::mxc_common::logger::Mode::Buffer),
                 None,
             )
@@ -779,6 +1155,8 @@ mod tests {
             assert_eq!(
                 *client.calls.borrow(),
                 [
+                    "capabilities",
+                    "validate_provision",
                     "validate",
                     "probe",
                     "provision",
@@ -797,7 +1175,7 @@ mod tests {
         let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
         let request = ExecutionRequest {
             script_code: "echo ok".to_owned(),
-            ..Default::default()
+            ..test_request()
         };
 
         // 1. Probe failure still closes host and surfaces close failure.
@@ -811,7 +1189,16 @@ mod tests {
         assert_eq!(err.code, MxcErrorCode::BackendUnavailable);
         assert!(err.message.contains("probe failed"));
         assert!(err.message.contains("host_close failed"));
-        assert_eq!(*client.calls.borrow(), ["validate", "probe", "close"]);
+        assert_eq!(
+            *client.calls.borrow(),
+            [
+                "capabilities",
+                "validate_provision",
+                "validate",
+                "probe",
+                "close"
+            ]
+        );
         assert!(!state_path.exists());
 
         // 2. Start failure suppresses AlreadyStopped on stop, deprovisions, closes host, removes state.
@@ -831,6 +1218,8 @@ mod tests {
         assert_eq!(
             *client.calls.borrow(),
             [
+                "capabilities",
+                "validate_provision",
                 "validate",
                 "probe",
                 "provision",
@@ -882,14 +1271,9 @@ mod tests {
             if cleanup_fails {
                 client.close_res = Err(MxcError::backend_error("close failed"));
             }
-            let error = run_with_client(
-                &mut client,
-                state_root,
-                &ExecutionRequest::default(),
-                &mut logger,
-                None,
-            )
-            .unwrap_err();
+            let error =
+                run_with_client(&mut client, state_root, &test_request(), &mut logger, None)
+                    .unwrap_err();
             assert_eq!(error.code, MxcErrorCode::PolicyValidation);
             if cleanup_fails {
                 assert!(error
@@ -899,7 +1283,10 @@ mod tests {
             } else {
                 assert_eq!(error.message, "native validation rejected");
             }
-            assert_eq!(*client.calls.borrow(), ["validate", "close"]);
+            assert_eq!(
+                *client.calls.borrow(),
+                ["capabilities", "validate_provision", "validate", "close"]
+            );
             assert!(!state_path.exists());
         }
     }
@@ -914,7 +1301,7 @@ mod tests {
                 working_directory: "/tmp".to_owned(),
                 env: environment,
                 inherit_default_env: true,
-                ..Default::default()
+                ..test_request()
             };
             let state_root = tempfile::tempdir().unwrap();
             let state_path = state_root.path().to_path_buf();
@@ -924,7 +1311,7 @@ mod tests {
             assert_eq!(result.outcome, CapturedOutcome::Exited(0));
             assert_eq!(
                 *client.validated_request.borrow(),
-                Some(exec_request(&request))
+                Some(super::super::policy::exec_request(&request, &test_capabilities()).unwrap())
             );
             assert_eq!(
                 *client.executed_request.borrow(),
@@ -933,6 +1320,8 @@ mod tests {
             assert_eq!(
                 *client.calls.borrow(),
                 [
+                    "capabilities",
+                    "validate_provision",
                     "validate",
                     "probe",
                     "provision",
@@ -960,14 +1349,9 @@ mod tests {
                 client.stop_res = Err(MxcError::backend_error("stop failed"));
                 client.close_res = Err(MxcError::backend_error("close failed"));
             }
-            let error = run_with_client(
-                &mut client,
-                state_root,
-                &ExecutionRequest::default(),
-                &mut logger,
-                None,
-            )
-            .unwrap_err();
+            let error =
+                run_with_client(&mut client, state_root, &test_request(), &mut logger, None)
+                    .unwrap_err();
             assert_eq!(error.code, MxcErrorCode::BackendError);
             if cleanup_fails {
                 assert!(error.message.starts_with(primary));
@@ -980,6 +1364,8 @@ mod tests {
             assert_eq!(
                 *client.calls.borrow(),
                 [
+                    "capabilities",
+                    "validate_provision",
                     "validate",
                     "probe",
                     "provision",
@@ -991,6 +1377,129 @@ mod tests {
                 ]
             );
             assert!(!state_path.exists());
+        }
+    }
+
+    #[test]
+    fn selected_image_and_policy_are_validated_and_provisioned_unchanged() {
+        let json = serde_json::json!({
+            "version": "1.1.0-alpha", "containment": "microvm",
+            "microvm": {"image": "docker.io/library/python:3.12-alpine"},
+            "process": {"commandLine": "printf ok"},
+            "filesystem": {
+                "readonlyPaths": [r"C:\ro"], "readwritePaths": [r"C:\rw"],
+                "deniedPaths": [r"C:\rw\secret"]
+            },
+            "network": {}
+        });
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        let crate::mxc_common::state_aware_request::MxcRequest::OneShot(request) =
+            crate::mxc_common::config_parser::load_mxc_request_from_json(
+                &json.to_string(),
+                &mut logger,
+            )
+            .unwrap()
+        else {
+            panic!("expected create-and-run request");
+        };
+        let mut client = MockClient::ok();
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        run_with_client(
+            &mut client,
+            tempfile::tempdir().unwrap(),
+            &request,
+            &mut logger,
+            None,
+        )
+        .unwrap();
+        let input = client.provisioned_input.borrow();
+        assert_eq!(*input, *client.validated_provision.borrow());
+        assert_eq!(
+            serde_json::to_value(input.as_ref().unwrap()).unwrap(),
+            serde_json::json!({
+                "request": {
+                    "filesystem": {
+                        "readonlyPaths": [r"C:\ro"],
+                        "readwritePaths": [r"C:\rw"],
+                        "deniedPaths": [r"C:\rw\secret"]
+                    },
+                    "network": {
+                        "egress": {"default": "deny"},
+                        "ingress": {"default": "deny", "hostLoopback": "deny"}
+                    }
+                },
+                "spec": {"image": {"reference": "docker.io/library/python:3.12-alpine"}}
+            })
+        );
+    }
+
+    #[test]
+    fn capability_and_provision_validation_failures_close_without_side_effects() {
+        for failure in [
+            "query",
+            "unsupported-image",
+            "unsupported-filesystem",
+            "validation",
+        ] {
+            let mut client = MockClient::ok();
+            let mut request = test_request();
+            let (expected_calls, expected_code, expected_message) = match failure {
+                "query" => {
+                    client.capabilities_res =
+                        Err(MxcError::backend_error("capability query failed"));
+                    (
+                        vec!["capabilities", "close"],
+                        MxcErrorCode::BackendError,
+                        "capability query failed",
+                    )
+                }
+                "unsupported-image" => {
+                    client
+                        .capabilities_res
+                        .as_mut()
+                        .unwrap()
+                        .spec
+                        .image_reference = false;
+                    (
+                        vec!["capabilities", "close"],
+                        MxcErrorCode::PolicyValidation,
+                        "the configured NVX runtime does not support microvm.image",
+                    )
+                }
+                "unsupported-filesystem" => {
+                    request.policy.denied_paths.push(r"C:\secret".to_owned());
+                    client
+                        .capabilities_res
+                        .as_mut()
+                        .unwrap()
+                        .filesystem
+                        .denied_paths = false;
+                    (
+                        vec!["capabilities", "close"],
+                        MxcErrorCode::PolicyValidation,
+                        "the configured NVX runtime does not support filesystem.deniedPaths",
+                    )
+                }
+                _ => {
+                    client.validate_provision_res =
+                        Err(MxcError::policy_validation("provision rejected"));
+                    (
+                        vec!["capabilities", "validate_provision", "close"],
+                        MxcErrorCode::PolicyValidation,
+                        "provision rejected",
+                    )
+                }
+            };
+            let state_root = tempfile::tempdir().unwrap();
+            let path = state_root.path().to_owned();
+            let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+            let error =
+                run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap_err();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.message, expected_message);
+            assert_eq!(*client.calls.borrow(), expected_calls);
+            assert!(client.provisioned_input.borrow().is_none());
+            assert!(!path.exists());
         }
     }
 }

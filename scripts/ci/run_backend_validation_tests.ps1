@@ -437,6 +437,7 @@ function Invoke-MicroVmTests {
     }
     $scenarios = [ordered]@{
         'facade' = 'VM_EXECUTED facade sequential '
+        'JSON image and policy' = 'VM_EXECUTED JSON selected-image filesystem '
         'executor' = 'VM_EXECUTED executor sequential '
         'executor configs' = 'VM_EXECUTED executor configs '
         'executor interruption' = 'VM_EXECUTED executor console interruption '
