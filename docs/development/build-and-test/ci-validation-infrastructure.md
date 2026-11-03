@@ -257,6 +257,11 @@ selection, file access rules, and network address and port rules. They also
 check that traffic through a proxy works while direct connections are blocked,
 and that interrupting startup or execution removes the VM and its temporary files.
 
+Rust JSON scenarios also check live output, persistent lifecycle operations,
+capture limits, cancellation with undrained streams, and 512/1024 MiB guest
+memory requests. Required completion markers and child-process watchdogs
+reject missing, skipped, failed, or hung scenarios.
+
 The network tests connect to servers controlled by the test. They check that
 the servers are reachable before and after testing the restrictions, so an
 unavailable server cannot be mistaken for a blocked connection. The host needs
