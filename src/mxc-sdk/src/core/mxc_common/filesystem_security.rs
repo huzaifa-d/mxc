@@ -635,9 +635,9 @@ pub fn set_owner_only_dacl(path: &Path, inheritable: bool) -> Result<(), Filesys
     Ok(())
 }
 
-/// Whether a directory has the exact protected owner-only DACL written by
-/// [`set_owner_only_dacl`].
-pub fn is_owner_only_directory(path: &Path) -> Result<bool, FilesystemSecurityError> {
+/// Whether a directory has the expected protected, inheritable owner-only DACL.
+#[cfg(test)]
+fn is_owner_only_directory(path: &Path) -> Result<bool, FilesystemSecurityError> {
     let path_wide = wide(path);
     let mut owner = PSID(ptr::null_mut());
     let mut dacl: *mut ACL = ptr::null_mut();
