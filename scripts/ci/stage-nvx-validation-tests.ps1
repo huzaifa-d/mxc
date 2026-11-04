@@ -65,6 +65,8 @@ foreach ($name in @(
     'windows_x64::signed_bundle_sdk_json_lifecycle',
     'windows_x64::signed_bundle_sdk_json_lifecycle_capture_limit',
     'windows_x64::signed_bundle_json_image_and_filesystem_policy',
+    'windows_network::bounded_child_drains_heavy_stdout_and_stderr',
+    'windows_network::bounded_child_timeout_reaps_descendants_with_inherited_output',
     'windows_network::signed_bundle_network_rules_enforce_allow_deny_and_port_selectors',
     'windows_network::signed_bundle_host_loopback_ingress',
     'windows_network::signed_bundle_deny_default_proxy_policy',

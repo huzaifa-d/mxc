@@ -22,7 +22,31 @@ const { stripVTControlCharacters } = require("node:util");
 const root = resolve(__dirname, "..", "..");
 const dispatcher = join(root, "scripts", "ci", "run_backend_validation_tests.ps1");
 const staging = join(root, "scripts", "ci", "stage-nvx-validation-tests.ps1");
+const boundary = join(root, "scripts", "ci", "test-microvm-json-boundary.ps1");
 const packaging = join(root, "scripts", "ci", "Invoke-CratePackage.ps1");
+const childTests = [
+  "windows_network::bounded_child_drains_heavy_stdout_and_stderr",
+  "windows_network::bounded_child_timeout_reaps_descendants_with_inherited_output",
+];
+const boundaryTests = [
+  "permitted_public_spawns_normalize_and_probe_each_surviving_path_once",
+  "wrong_entry_points_preserve_the_owning_phase_and_root_errors",
+  "pty_dimension_errors_keep_priority_over_json_and_authorization",
+  "invalid_lifecycle_pty_dimensions_never_normalize_or_probe",
+  "wrong_operation_delegates_normalization_exactly_once",
+  "malformed_or_ambiguous_selectors_cannot_bypass_authoritative_validation",
+  "escaped_phase_and_selector_keys_keep_the_rust_only_exclusion",
+  "lifecycle_pty_preserves_pointer_utf8_and_zero_dimension_precedence",
+  "one_shot_pipe_and_stdin_exports_reject_microvm",
+  "malformed_contract_version_and_phase_errors_are_preserved",
+  "filesystem_validation_preserves_malformed_request_errors",
+  "lifecycle_pipe_and_stdin_exports_reject_microvm",
+  "pty_exports_reject_microvm",
+  "lifecycle_envelope_export_rejects_all_microvm_phases_and_dry_runs",
+  "captured_and_attached_lifecycle_exports_reject_microvm",
+  "baseline_microvm_one_shot_capture_still_reaches_the_rust_backend",
+  "one_shot_capture_export_cannot_bypass_the_lifecycle_boundary",
+];
 const microvmFixtures = [
   "microvm_hello.json",
   "microvm_exit_code.json",
@@ -69,6 +93,7 @@ use std::{env, path::Path, process};
 fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let mode = env::var("MXC_CI_FIXTURE_MODE").unwrap_or_default();
+    let omitted = env::var("MXC_CI_OMITTED_TEST").unwrap_or_default();
     let exe = env::current_exe().unwrap();
     if exe.file_stem().unwrap() == "cargo" {
         if args.first().map(String::as_str) == Some("metadata") {
@@ -90,6 +115,26 @@ fn main() {
         assert!(args.contains(&"--locked".to_owned()));
         assert!(args.contains(&"--release".to_owned()));
         assert!(args.contains(&"--no-run".to_owned()));
+        if args.windows(2).any(|pair| pair == ["--test", "microvm_json_boundary"]) {
+            assert!(args.windows(2).any(|pair| pair == ["-p", "mxc_ffi"]));
+            assert!(args.contains(&"--no-default-features".to_owned()));
+            let target = &args[args.iter().position(|arg| arg == "--target").unwrap() + 1];
+            let microvm = args.windows(2).any(|pair| pair == ["--features", "mxc-sdk/microvm"]);
+            assert!(!microvm || target == "x86_64-pc-windows-msvc");
+            eprintln!("BOUNDARY_BUILD target={target} microvm={microvm}");
+            if mode == "boundary-cargo-failure" || (mode == "boundary-enabled-failure" && microvm) {
+                process::exit(19);
+            }
+            if mode != "boundary-no-artifact" {
+                let mut executable = std::path::PathBuf::from(env::var("MXC_CI_BOUNDARY_EXECUTABLE").unwrap());
+                if microvm {
+                    executable.set_file_name("microvm_json_boundary_enabled.exe");
+                }
+                let executable = executable.to_str().unwrap();
+                println!("{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"microvm_json_boundary\"}},\"profile\":{{\"test\":true}},\"executable\":{executable:?}}}");
+            }
+            return;
+        }
         assert!(args.windows(2).any(|pair| pair == ["--test", "nvx_e2e"]));
         assert!(args.windows(2).any(|pair| pair == ["--target", "x86_64-pc-windows-msvc"]));
         if let Some(index) = args.iter().position(|arg| arg == "--manifest-path") {
@@ -115,7 +160,51 @@ fn main() {
         }
         return;
     }
+    if exe.file_stem().unwrap().to_str().unwrap().starts_with("microvm_json_boundary") {
+        let feature_mode = if exe.file_stem().unwrap() == "microvm_json_boundary_enabled" { "enabled" } else { "disabled" };
+        let omit_here = env::var("MXC_CI_OMIT_FEATURE_MODE").unwrap_or_default() == feature_mode;
+        let tests = [
+${boundaryTests.map((name) => `            "${name}",`).join("\n")}
+        ];
+        if args == ["--list"] {
+            for name in tests {
+                if mode != "boundary-missing-discovery" || name != omitted || !omit_here {
+                    println!("{name}: test");
+                }
+            }
+            return;
+        }
+        assert_eq!(args, ["--test-threads=1"]);
+        if mode == "boundary-native-failure" {
+            process::exit(23);
+        }
+        if mode == "boundary-zero-tests" {
+            println!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
+            return;
+        }
+        for name in tests {
+            if name == omitted && omit_here {
+                if mode == "boundary-missing-completion" {
+                    continue;
+                }
+                if mode == "boundary-ignored" {
+                    println!("test {name} ... ignored");
+                    continue;
+                }
+            }
+            println!("test {name} ... ok");
+        }
+        println!("test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
+        return;
+    }
     if args == ["--list"] {
+        for name in [
+${childTests.map((name) => `            "${name}",`).join("\n")}
+        ] {
+            if mode != "child-missing-discovery" || name != omitted {
+                println!("{name}: test");
+            }
+        }
         if mode != "missing-partial-bundle-discovery" {
             println!("windows_x64::partial_bundle_is_not_reported_as_available: test");
         }
@@ -177,6 +266,20 @@ fn main() {
     if mode == "zero-tests" {
         println!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
         return;
+    }
+    for name in [
+${childTests.map((name) => `        "${name}",`).join("\n")}
+    ] {
+        if name == omitted {
+            if mode == "child-missing-completion" {
+                continue;
+            }
+            if mode == "child-ignored" {
+                println!("test {name} ... ignored");
+                continue;
+            }
+        }
+        println!("test {name} ... ok");
     }
     if mode != "missing-facade" {
         println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/capture-limit/cleanup");
@@ -253,6 +356,8 @@ fn main() {
   assert.ifError(build.error);
   assert.equal(build.status, 0, build.stdout + build.stderr);
   copyFileSync(fixture, join(tools, "cargo.exe"));
+  copyFileSync(fixture, join(tools, "microvm_json_boundary.exe"));
+  copyFileSync(fixture, join(tools, "microvm_json_boundary_enabled.exe"));
 });
 
 after(() => {
@@ -284,8 +389,8 @@ function nestedHelperMarker() {
   return value[1];
 }
 
-function dispatch(directory, mode = "", architecture = "x64") {
-  const env = { MXC_CI_FIXTURE_MODE: mode };
+function dispatch(directory, mode = "", architecture = "x64", omitted = "") {
+  const env = { MXC_CI_FIXTURE_MODE: mode, MXC_CI_OMITTED_TEST: omitted };
   if (mode === "helper-only-lifecycle-proxy") {
     env.MXC_CI_FIXTURE_HELPER_MARKER = nestedHelperMarker();
   }
@@ -676,7 +781,7 @@ test("artifact dispatcher rejects ARM64 instead of running the x64 suite", () =>
   assert.match(result.output, /MicroVM validation requires x64/);
 });
 
-function stage(mode = "") {
+function stage(mode = "", omitted = "") {
   const directory = artifact();
   rmSync(join(directory, "nvx-e2e-tests.exe"));
   const result = runScript(
@@ -686,6 +791,7 @@ function stage(mode = "") {
       PATH: tools + delimiter + process.env.PATH,
       MXC_CI_FIXTURE_MODE: mode,
       MXC_CI_FIXTURE_EXECUTABLE: fixture,
+      MXC_CI_OMITTED_TEST: omitted,
     }
   );
   return { ...result, directory };
@@ -742,5 +848,89 @@ for (const [mode, message] of [
     ].includes(mode)) {
       assert.equal(existsSync(join(result.directory, "nvx-e2e-tests.exe")), false);
     }
+  });
+}
+
+for (const name of childTests) {
+  test(`staging rejects missing child discovery: ${name}`, () => {
+    const result = stage("child-missing-discovery", name);
+    assert.notEqual(result.status, 0, result.output);
+    assert.ok(result.output.replace(/\r?\n\s*\|\s*/g, " ").includes(`did not discover ${name}`), result.output);
+  });
+  for (const mode of ["child-missing-completion", "child-ignored"]) {
+    test(`artifact dispatcher rejects ${mode}: ${name}`, () => {
+      const result = dispatch(artifact(), mode, "x64", name);
+      assert.notEqual(result.status, 0, result.output);
+      assert.ok(result.output.replace(/\r?\n\s*\|\s*/g, " ").includes(`'${name}' did not pass`), result.output);
+      assert.match(result.output, /test result: ok\. 7 passed; 0 failed; 0 ignored;/);
+    });
+  }
+}
+
+function runBoundary(mode = "", omitted = "", target = "x86_64-pc-windows-msvc", featureMode = "disabled") {
+  return runScript(
+    boundary,
+    ["-Target", target, "-LogDirectory", mkdtempSync(join(scratch, "boundary-"))],
+    {
+      PATH: tools + delimiter + process.env.PATH,
+      MXC_CI_FIXTURE_MODE: mode,
+      MXC_CI_OMITTED_TEST: omitted,
+      MXC_CI_OMIT_FEATURE_MODE: featureMode,
+      MXC_CI_BOUNDARY_EXECUTABLE: join(tools, "microvm_json_boundary.exe"),
+    }
+  );
+}
+
+test("C boundary gate checks feature-off and feature-on on native x64", () => {
+  const result = runBoundary();
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /BOUNDARY_BUILD target=x86_64-pc-windows-msvc microvm=false/);
+  assert.match(result.output, /BOUNDARY_BUILD target=x86_64-pc-windows-msvc microvm=true/);
+  for (const name of boundaryTests) {
+    assert.equal(result.output.split(`test ${name} ... ok`).length - 1, 2, name);
+  }
+  const workflow = readFileSync(join(root, ".github", "workflows", "Build.Windows.Job.yml"), "utf8");
+  assert.match(workflow, /test-microvm-json-boundary\.ps1 -Target '\$\{\{ matrix\.target \}\}'/);
+});
+
+test("C boundary gate checks feature-off only on native ARM64", () => {
+  const result = runBoundary("", "", "aarch64-pc-windows-msvc");
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /BOUNDARY_BUILD target=aarch64-pc-windows-msvc microvm=false/);
+  assert.doesNotMatch(result.output, /microvm=true/);
+});
+
+for (const name of boundaryTests) {
+  for (const featureMode of ["disabled", "enabled"]) {
+    for (const [mode, message] of [
+      ["boundary-missing-discovery", `did not discover ${name}`],
+      ["boundary-missing-completion", `'${name}' did not pass`],
+      ["boundary-ignored", `'${name}' did not pass`],
+    ]) {
+      test(`C boundary gate rejects ${mode} (${featureMode}): ${name}`, () => {
+        const result = runBoundary(mode, name, "x86_64-pc-windows-msvc", featureMode);
+        assert.notEqual(result.status, 0, result.output);
+        const output = result.output.replace(/\r?\n\s*\|\s*/g, " ");
+        assert.ok(output.includes(`MicroVM C boundary (${featureMode})`), result.output);
+        assert.ok(output.includes(message), result.output);
+        if (mode !== "boundary-missing-discovery") {
+          assert.match(result.output, /test result: ok\. 17 passed; 0 failed; 0 ignored;/);
+        }
+      });
+    }
+  }
+}
+
+for (const [mode, message] of [
+  ["boundary-cargo-failure", /compilation failed with exit code 19/],
+  ["boundary-enabled-failure", /compilation failed with exit code 19/],
+  ["boundary-no-artifact", /Expected one microvm_json_boundary test executable/],
+  ["boundary-native-failure", /exited 23/],
+  ["boundary-zero-tests", /executed no tests/],
+]) {
+  test(`C boundary gate propagates ${mode}`, () => {
+    const result = runBoundary(mode);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, message);
   });
 }

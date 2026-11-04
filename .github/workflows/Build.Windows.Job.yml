@@ -91,6 +91,10 @@ jobs:
              --no-default-features
              --features "${{ matrix.features }}"
 
+      - name: Require MicroVM direct-C boundary regressions
+        shell: pwsh
+        run: ..\scripts\ci\test-microvm-json-boundary.ps1 -Target '${{ matrix.target }}'
+
       - name: Test and stage filesystem probe request deadlines
         shell: pwsh
         run: |
