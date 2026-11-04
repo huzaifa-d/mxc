@@ -24,9 +24,10 @@ const dispatcher = join(root, "scripts", "ci", "run_backend_validation_tests.ps1
 const staging = join(root, "scripts", "ci", "stage-nvx-validation-tests.ps1");
 const boundary = join(root, "scripts", "ci", "test-microvm-json-boundary.ps1");
 const packaging = join(root, "scripts", "ci", "Invoke-CratePackage.ps1");
-const childTests = [
+const requiredHostTests = [
   "windows_network::bounded_child_drains_heavy_stdout_and_stderr",
   "windows_network::bounded_child_timeout_reaps_descendants_with_inherited_output",
+  "windows_network::host_only_proxy_stream_reads_delayed_fragmented_headers",
 ];
 const boundaryTests = [
   "permitted_public_spawns_normalize_and_probe_each_surviving_path_once",
@@ -199,7 +200,7 @@ ${boundaryTests.map((name) => `            "${name}",`).join("\n")}
     }
     if args == ["--list"] {
         for name in [
-${childTests.map((name) => `            "${name}",`).join("\n")}
+${requiredHostTests.map((name) => `            "${name}",`).join("\n")}
         ] {
             if mode != "child-missing-discovery" || name != omitted {
                 println!("{name}: test");
@@ -268,7 +269,7 @@ ${childTests.map((name) => `            "${name}",`).join("\n")}
         return;
     }
     for name in [
-${childTests.map((name) => `        "${name}",`).join("\n")}
+${requiredHostTests.map((name) => `        "${name}",`).join("\n")}
     ] {
         if name == omitted {
             if mode == "child-missing-completion" {
@@ -851,8 +852,8 @@ for (const [mode, message] of [
   });
 }
 
-for (const name of childTests) {
-  test(`staging rejects missing child discovery: ${name}`, () => {
+for (const name of requiredHostTests) {
+  test(`staging rejects missing required host discovery: ${name}`, () => {
     const result = stage("child-missing-discovery", name);
     assert.notEqual(result.status, 0, result.output);
     assert.ok(result.output.replace(/\r?\n\s*\|\s*/g, " ").includes(`did not discover ${name}`), result.output);

@@ -271,7 +271,7 @@ network, `10.0.0.0/24`.
 Regular Windows x64 PR builds run checks that do not need a VM. They also
 unpack the Rust crate package and check that its tests compile.
 
-The staged payload must discover both bounded-child output regressions, and
+The staged payload must discover the bounded-child and proxy-stream regressions, and
 nightly validation requires each to report a passing libtest result.
 `scripts/ci/test-microvm-json-boundary.ps1` requires discovery and passing results
 for the direct-C boundary cases in Windows PR builds: MicroVM feature-on and

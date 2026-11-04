@@ -319,6 +319,49 @@ fn allow_all() -> Value {
     json!({"default": "allow"})
 }
 
+fn configure_proxy_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(())
+}
+
+#[test]
+fn host_only_proxy_stream_reads_delayed_fragmented_headers() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let idle_client = TcpStream::connect(address).unwrap();
+    let (mut idle_stream, _) = listener.accept().unwrap();
+    configure_proxy_stream(&idle_stream).unwrap();
+    idle_stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let error = idle_stream.read_exact(&mut [0]).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::TimedOut,
+        "an accepted proxy stream must block until its read timeout, not return WouldBlock"
+    );
+    drop((idle_stream, idle_client));
+
+    let mut client = TcpStream::connect(address).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    configure_proxy_stream(&stream).unwrap();
+    let request =
+        b"GET http://mxc-policy.invalid/probe HTTP/1.1\r\nHost: mxc-policy.invalid\r\n\r\n";
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        client.write_all(&request[..12]).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        client.write_all(&request[12..]).unwrap();
+    });
+    let mut received = vec![0; request.len()];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(received, request);
+    sender.join().unwrap();
+}
+
 #[test]
 #[ignore = "VM: requires Windows x64, WHP, a host IPv4 route and the exact signed official bundle"]
 fn signed_bundle_network_rules_enforce_allow_deny_and_port_selectors() {
@@ -727,9 +770,7 @@ fn signed_bundle_deny_default_proxy_policy() {
                 }
                 Err(error) => return Err(error),
             };
-            stream.set_nonblocking(false)?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            configure_proxy_stream(&stream)?;
             let mut request = Vec::new();
             let mut byte = [0];
             while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
@@ -964,8 +1005,7 @@ fn signed_bundle_lifecycle_proxy_timeout_starts_after_vm_start() {
             while Instant::now() < deadline && !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                        configure_proxy_stream(&stream)?;
                         let mut request = Vec::new();
                         let mut byte = [0];
                         while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {

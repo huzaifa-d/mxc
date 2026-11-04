@@ -441,7 +441,8 @@ function Invoke-MicroVmTests {
     )
     $failure = Get-LibtestFailure -Run $run -RequiredTests @(
         'windows_network::bounded_child_drains_heavy_stdout_and_stderr',
-        'windows_network::bounded_child_timeout_reaps_descendants_with_inherited_output'
+        'windows_network::bounded_child_timeout_reaps_descendants_with_inherited_output',
+        'windows_network::host_only_proxy_stream_reads_delayed_fragmented_headers'
     )
     if ($failure) {
         throw "MicroVM SDK tests $failure."
