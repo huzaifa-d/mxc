@@ -682,7 +682,7 @@ mod windows_x64 {
         );
         assert_no_run_state(std::process::id());
 
-        let streaming = mxc_sdk::__ffi::spawn_container_json(&request, true)
+        let streaming = dev::spawn_json(&request, dev::JsonOptions { experimental: true })
             .err()
             .expect("missing bundle must reject streaming");
         assert_eq!(streaming.code, ErrorCode::BackendUnavailable);
@@ -729,7 +729,7 @@ mod windows_x64 {
         let state_root = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
             .join("Microsoft")
             .join("MXC")
-            .join("nvx-v1");
+            .join("nvx");
         let id = "microvm:0123456789abcdef0123456789abcdef";
 
         let memory = json!({
@@ -856,7 +856,7 @@ mod windows_x64 {
             "sandboxId": "microvm:0123456789abcdef0123456789abcdef",
             "process": {"commandLine": "printf MUST_NOT_RUN"}
         });
-        let error = __ffi::execute_lifecycle_with_stdin_json(&request.to_string(), true)
+        let error = mxc_sdk::mxc_engine::exec_state_aware_json(&request.to_string(), true, true)
             .err()
             .expect("MicroVM lifecycle stdin must be rejected");
         assert_eq!(error.code, ErrorCode::UnsupportedContainment, "{error}");
@@ -867,7 +867,7 @@ mod windows_x64 {
         let state_root = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
             .join("Microsoft")
             .join("MXC")
-            .join("nvx-v1");
+            .join("nvx");
         assert!(
             !state_root.exists(),
             "stdin rejection reached persistent backend setup"
@@ -994,7 +994,7 @@ mod windows_x64 {
         let state_root = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
             .join("Microsoft")
             .join("MXC")
-            .join("nvx-v1");
+            .join("nvx");
         assert!(
             state_root.is_dir(),
             "production path did not create state root"
@@ -1028,9 +1028,17 @@ mod windows_x64 {
     fn executor_output_with_mode(request: &Value, missing_bundle: bool, dry_run: bool) -> Output {
         let directory = tempfile::tempdir().expect("executor request directory");
         let path = directory.path().join("request.json");
-        std::fs::write(&path, request.to_string()).expect("write executor request");
         let mut command = Command::new(executor());
         command.arg("--experimental").arg(&path);
+        let mut request = request.clone();
+        let fields = request.as_object_mut().expect("executor request object");
+        if let Some(phase) = fields.remove("phase") {
+            command.args(["--operation", phase.as_str().expect("lifecycle phase")]);
+            if let Some(id) = fields.remove("sandboxId") {
+                command.args(["--container-id", id.as_str().expect("sandbox ID")]);
+            }
+        }
+        std::fs::write(&path, request.to_string()).expect("write executor request");
         if dry_run {
             command.arg("--dry-run");
         }
@@ -1804,6 +1812,22 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                     CAPTURE_LIMIT / 2,
                     stderr_bytes,
                 )?;
+                let result = mxc_sdk::__ffi::execute_lifecycle_capture_json(
+                    &request(stderr_bytes).to_string(),
+                    true,
+                )
+                .map_err(|error| error.to_string())?
+                .wait_with_output()
+                .map_err(|error| error.to_string())?;
+                if result.outcome != WaitResult::Exited(0) {
+                    return Err(format!("C adapter capture did not exit: {result:?}"));
+                }
+                validate_capture_boundary(
+                    &result.stdout,
+                    &result.stderr,
+                    CAPTURE_LIMIT / 2,
+                    stderr_bytes,
+                )?;
             }
 
             let error = match dev::run_in_container_json(
@@ -1819,6 +1843,23 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             };
             if error.code != ErrorCode::BackendError || !error.message.ends_with(CAPTURE_ERROR) {
                 return Err(format!("unexpected lifecycle capture error: {error}"));
+            }
+            let result = mxc_sdk::__ffi::execute_lifecycle_capture_json(
+                &request(CAPTURE_LIMIT / 2 + 1).to_string(),
+                true,
+            )
+            .map_err(|error| error.to_string())?
+            .wait_with_output();
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err("C adapter lifecycle capture limit was not enforced".to_owned())
+                }
+            };
+            if !error.to_string().ends_with(CAPTURE_ERROR) {
+                return Err(format!(
+                    "unexpected C adapter lifecycle capture error: {error}"
+                ));
             }
 
             let after = json!({
@@ -2361,6 +2402,11 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
     #[test]
     #[ignore = "VM: requires separately built wxc-exec.exe, WHP and exact signed official bundle"]
     fn signed_bundle_executor_create_and_run() {
+        if super::windows_network::bounded_streaming_scenario(
+            "windows_x64::signed_bundle_executor_create_and_run",
+        ) {
+            return;
+        }
         let profile = executor_output(&process_only_request("cat /proc/cpuinfo"), false);
         assert_eq!(profile.status.code(), Some(0));
         assert_host_cpu_profile(&profile.stdout);
@@ -2429,5 +2475,76 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         println!(
             "VM_EXECUTED executor sequential stdout/stderr/exit/timeout/capture-limit/cleanup"
         );
+
+        let provision = json!({
+            "version": "1.1.0-alpha", "phase": "provision", "containment": "microvm",
+            "microvm": {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"}
+        });
+        let output = executor_output(&provision, false);
+        assert!(output.status.success(), "{output:?}");
+        let provisioned: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let sandbox_id = provisioned["result"]["sandboxId"]
+            .as_str()
+            .expect("executor provision response sandboxId");
+        super::windows_network::publish_streaming_sandbox(sandbox_id);
+        let lifecycle = |phase: &str| json!({"version": "1.1.0-alpha", "phase": phase, "sandboxId": sandbox_id});
+        let mut started = false;
+        let primary = (|| -> Result<(), String> {
+            let output = executor_output(&lifecycle("start"), false);
+            if !output.status.success() {
+                return Err(format!("executor lifecycle start failed: {output:?}"));
+            }
+            started = true;
+            let mut exec = lifecycle("exec");
+            exec["process"] = json!({
+                "commandLine": "printf executor-life-out; printf executor-life-err >&2; exit 42",
+                "timeout": 30_000
+            });
+            let output = executor_output(&exec, false);
+            if output.status.code() != Some(42)
+                || output.stdout != b"executor-life-out"
+                || !output.stderr.ends_with(b"executor-life-err")
+            {
+                return Err(format!(
+                    "executor lifecycle output or exit mismatch: {output:?}"
+                ));
+            }
+            exec["process"] = json!({"commandLine": "sleep 120", "timeout": 200});
+            let output = executor_output(&exec, false);
+            if output.status.code() != Some(-1)
+                || !String::from_utf8_lossy(&output.stderr)
+                    .contains("NVX relayed exec timed out; workload deadline elapsed")
+            {
+                return Err(format!("executor lifecycle timeout mismatch: {output:?}"));
+            }
+            exec["process"] = json!({
+                "commandLine": "printf executor-life-reused", "timeout": 30_000
+            });
+            let output = executor_output(&exec, false);
+            if !output.status.success() || output.stdout != b"executor-life-reused" {
+                return Err(format!("executor lifecycle was not reusable: {output:?}"));
+            }
+            Ok(())
+        })();
+        let cleanup = |phase| {
+            let output = executor_output(&lifecycle(phase), false);
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!("executor lifecycle {phase} failed: {output:?}"))
+            }
+        };
+        finish_lifecycle_cleanup(
+            primary,
+            started,
+            || cleanup("stop"),
+            || {
+                cleanup("deprovision")?;
+                super::windows_network::retire_streaming_sandbox();
+                Ok(())
+            },
+        )
+        .unwrap();
+        println!("VM_EXECUTED executor persistent lifecycle output exit timeout reuse and cleanup");
     }
 }

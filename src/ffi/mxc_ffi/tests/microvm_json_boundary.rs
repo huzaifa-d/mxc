@@ -49,7 +49,27 @@ fn failure_detail(status: i32, detail: &mut MxcErrorDetail) -> (i32, String) {
     (status, message)
 }
 
+fn error_status(code: ErrorCode) -> i32 {
+    match code {
+        ErrorCode::MalformedRequest => MXC_STATUS_MALFORMED_REQUEST,
+        ErrorCode::UnsupportedContainment => MXC_STATUS_UNSUPPORTED_CONTAINMENT,
+        ErrorCode::UnsupportedPhase => MXC_STATUS_UNSUPPORTED_PHASE,
+        ErrorCode::BackendUnavailable => MXC_STATUS_BACKEND_UNAVAILABLE,
+        ErrorCode::MalformedId => MXC_STATUS_MALFORMED_ID,
+        ErrorCode::PolicyValidation => MXC_STATUS_POLICY_VALIDATION,
+        other => panic!("unexpected host-only error: {other:?}"),
+    }
+}
+
 fn call_failure(call: Call, json: &str, experimental: i32) -> (i32, String) {
+    static MISSING_RUNTIME: std::sync::Once = std::sync::Once::new();
+    MISSING_RUNTIME.call_once(|| {
+        let absent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("intentionally-absent-boundary-runtime");
+        assert!(!absent.exists());
+        // This suite must never provision a container or launch a VM.
+        std::env::set_var("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", absent);
+    });
     let request = CString::new(json).unwrap();
     // SAFETY: the C string and fresh output storage remain valid throughout each call.
     unsafe {
@@ -121,6 +141,60 @@ fn call_failure(call: Call, json: &str, experimental: i32) -> (i32, String) {
                 assert_eq!((outcome.timed_out, outcome.exit_code), (42, 43));
                 failure_detail(status, &mut detail.assume_init())
             }
+        }
+    }
+}
+
+#[test]
+fn microvm_requests_normalize_exactly_once_on_each_c_surface() {
+    use mxc_sdk::mxc_common::config_parser::filesystem_test_support::observe;
+
+    let path = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let one_shot = json!({
+        "version": "1.1.0-alpha", "containment": "microvm",
+        "microvm": {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"},
+        "process": {"commandLine": "true"},
+        "filesystem": {"readonlyPaths": [path.clone()]},
+    })
+    .to_string();
+    let provision = json!({
+        "version": "1.1.0-alpha", "phase": "provision", "containment": "microvm",
+        "microvm": {"image": "mcr.microsoft.com/azurelinux/base/core:3.0"},
+        "filesystem": {"readonlyPaths": [path]},
+    })
+    .to_string();
+    for experimental in [0, 1] {
+        for call in [
+            Call::Spawn(mxc_spawn_json),
+            Call::Spawn(mxc_spawn_with_stdin_json),
+            Call::Pty(mxc_spawn_pty_json, 24, 80),
+        ] {
+            let ((_, message), normalizations, metadata) =
+                observe(|| call_failure(call, &one_shot, experimental));
+            assert!(!message.contains("only through Rust"), "{message}");
+            assert_eq!((normalizations, metadata), (1, 1));
+        }
+
+        for dry_run in [false, true] {
+            let ((_, message), normalizations, metadata) =
+                observe(|| call_failure(Call::Envelope(dry_run), &provision, experimental));
+            assert!(!message.contains("only through Rust"), "{message}");
+            assert_eq!((normalizations, metadata), (1, 1));
+        }
+        for call in [
+            Call::Spawn(mxc_exec_state_aware_json),
+            Call::Spawn(mxc_exec_state_aware_with_stdin_json),
+            Call::Pty(mxc_state_aware_exec_pty, 24, 80),
+            Call::Capture,
+            Call::Attached,
+        ] {
+            let ((_, message), normalizations, metadata) =
+                observe(|| call_failure(call, EXEC, experimental));
+            assert!(!message.contains("only through Rust"), "{message}");
+            assert_eq!((normalizations, metadata), (1, 0));
         }
     }
 }
@@ -243,7 +317,9 @@ fn pty_dimension_errors_keep_priority_over_json_and_authorization() {
                     if valid {
                         assert_eq!(
                             status,
-                            if experimental == 0 {
+                            if experimental == 0
+                                && authorized_status == MXC_STATUS_UNSUPPORTED_PHASE
+                            {
                                 MXC_STATUS_BACKEND_UNAVAILABLE
                             } else {
                                 authorized_status
@@ -408,7 +484,7 @@ fn malformed_or_ambiguous_selectors_cannot_bypass_authoritative_validation() {
 }
 
 #[test]
-fn escaped_phase_and_selector_keys_keep_the_rust_only_exclusion() {
+fn escaped_phase_and_selector_keys_reach_backend_validation() {
     let request = EXEC
         .replace("sandboxId", "sandbox\\u0049d")
         .replace(r#""exec""#, r#""e\u0078ec""#)
@@ -420,25 +496,16 @@ fn escaped_phase_and_selector_keys_keep_the_rust_only_exclusion() {
     for experimental in [0, 1] {
         for call in [
             Call::Spawn(mxc_exec_state_aware_json),
-            Call::Spawn(mxc_exec_state_aware_with_stdin_json),
-            Call::Pty(mxc_state_aware_exec_pty, 24, 80),
             Call::Envelope(true),
             Call::Capture,
-            Call::Attached,
         ] {
             let (status, message) = call_failure(call, &request, experimental);
-            assert_eq!(
-                status,
-                if experimental == 0 {
-                    MXC_STATUS_BACKEND_UNAVAILABLE
-                } else {
-                    MXC_STATUS_UNSUPPORTED_PHASE
-                },
-                "{message}"
-            );
-            if experimental != 0 {
-                assert!(message.contains("only through Rust mxc_sdk::v1::dev JSON APIs"));
-            }
+            let expected =
+                mxc_sdk::mxc_engine::exec_state_aware_json(&request, experimental != 0, false)
+                    .err()
+                    .expect("backend-invalid timeout must not execute");
+            assert_eq!(status, error_status(expected.code), "{message}");
+            assert!(!message.contains("only through Rust"), "{message}");
         }
     }
     let request = ONE_SHOT
@@ -448,8 +515,14 @@ fn escaped_phase_and_selector_keys_keep_the_rust_only_exclusion() {
             r#""commandLine":"true""#,
             r#""commandLine":"true","timeout":3600001"#,
         );
-    for spawn in [mxc_spawn_json as Spawn, mxc_spawn_with_stdin_json] {
-        assert_spawn_rejected(spawn, &request, MXC_STATUS_UNSUPPORTED_CONTAINMENT);
+    for (spawn, stdin) in [
+        (mxc_spawn_json as Spawn, false),
+        (mxc_spawn_with_stdin_json as Spawn, true),
+    ] {
+        let expected = mxc_sdk::mxc_engine::spawn_one_shot_json(&request, true, stdin)
+            .err()
+            .expect("backend-invalid request must not execute");
+        assert_spawn_failure(spawn, &request, error_status(expected.code));
     }
 }
 
@@ -505,7 +578,7 @@ fn lifecycle_pty_preserves_pointer_utf8_and_zero_dimension_precedence() {
     }
 }
 
-fn assert_rejected_detail(
+fn assert_backend_error_detail(
     status: i32,
     authorized_status: i32,
     experimental: i32,
@@ -523,7 +596,7 @@ fn assert_rejected_detail(
     assert!(detail.native_code_utf8.is_null());
     // SAFETY: detail owns only allocations returned by this library.
     unsafe { mxc_error_detail_free(detail) };
-    if experimental == 0 {
+    if experimental == 0 && authorized_status == MXC_STATUS_UNSUPPORTED_PHASE {
         assert_eq!(status, MXC_STATUS_BACKEND_UNAVAILABLE, "{message}");
         assert_eq!(
             message,
@@ -531,39 +604,44 @@ fn assert_rejected_detail(
         );
     } else {
         assert_eq!(status, authorized_status, "{message}");
-        assert!(message.contains("only through Rust mxc_sdk::v1::dev JSON APIs"));
+        assert!(!message.contains("only through Rust"), "{message}");
     }
 }
 
-fn assert_spawn_rejected(spawn: Spawn, json: &str, expected: i32) {
-    let request = CString::new(json).unwrap();
+fn assert_spawn_failure(spawn: Spawn, json: &str, expected: i32) {
     for experimental in [0, 1] {
-        let mut handle = ptr::dangling_mut();
-        let mut detail = MaybeUninit::uninit();
-        // SAFETY: request and both output locations are valid; no live handle is overwritten.
-        let status = unsafe {
-            spawn(
-                request.as_ptr(),
-                experimental,
-                &mut handle,
-                detail.as_mut_ptr(),
-            )
-        };
-        assert!(handle.is_null());
-        // SAFETY: the entry point initialized detail.
-        let mut detail = unsafe { detail.assume_init() };
-        assert_rejected_detail(status, expected, experimental, &mut detail);
+        let (status, message) = call_failure(Call::Spawn(spawn), json, experimental);
+        assert_eq!(
+            status,
+            if experimental == 0 {
+                MXC_STATUS_BACKEND_UNAVAILABLE
+            } else {
+                expected
+            },
+            "{message}"
+        );
+        assert!(!message.contains("only through Rust"), "{message}");
     }
 }
 
 #[test]
-fn one_shot_pipe_and_stdin_exports_reject_microvm() {
-    for spawn in [mxc_spawn_json as Spawn, mxc_spawn_with_stdin_json] {
-        assert_spawn_rejected(spawn, ONE_SHOT, MXC_STATUS_UNSUPPORTED_CONTAINMENT);
-        assert_spawn_rejected(
+fn one_shot_pipe_and_stdin_exports_reach_microvm_validation() {
+    let request = ONE_SHOT.replace(
+        r#""commandLine":"true""#,
+        r#""commandLine":"true","timeout":3600001"#,
+    );
+    for (spawn, stdin) in [
+        (mxc_spawn_json as Spawn, false),
+        (mxc_spawn_with_stdin_json as Spawn, true),
+    ] {
+        let expected = mxc_sdk::mxc_engine::spawn_one_shot_json(&request, true, stdin)
+            .err()
+            .expect("backend-invalid request must not execute");
+        assert_spawn_failure(spawn, &request, error_status(expected.code));
+        assert_spawn_failure(
             spawn,
-            &ONE_SHOT.replace("microvm", "micro\\u0076m"),
-            MXC_STATUS_UNSUPPORTED_CONTAINMENT,
+            &request.replace("microvm", "micro\\u0076m"),
+            error_status(expected.code),
         );
     }
 }
@@ -661,16 +739,23 @@ fn filesystem_validation_preserves_malformed_request_errors() {
 }
 
 #[test]
-fn lifecycle_pipe_and_stdin_exports_reject_microvm() {
-    for spawn in [
-        mxc_exec_state_aware_json as Spawn,
-        mxc_exec_state_aware_with_stdin_json,
+fn lifecycle_pipe_and_stdin_exports_reach_microvm_validation() {
+    let request = EXEC.replace(
+        r#""commandLine":"true""#,
+        r#""commandLine":"true","timeout":3600001"#,
+    );
+    for (spawn, stdin) in [
+        (mxc_exec_state_aware_json as Spawn, false),
+        (mxc_exec_state_aware_with_stdin_json as Spawn, true),
     ] {
-        assert_spawn_rejected(spawn, EXEC, MXC_STATUS_UNSUPPORTED_PHASE);
-        assert_spawn_rejected(
+        let expected = mxc_sdk::mxc_engine::exec_state_aware_json(&request, true, stdin)
+            .err()
+            .expect("backend-invalid request must not execute");
+        assert_spawn_failure(spawn, &request, error_status(expected.code));
+        assert_spawn_failure(
             spawn,
-            &EXEC.replace("microvm", "micro\\u0076m"),
-            MXC_STATUS_UNSUPPORTED_PHASE,
+            &request.replace("microvm", "micro\\u0076m"),
+            error_status(expected.code),
         );
     }
 }
@@ -703,13 +788,13 @@ fn pty_exports_reject_microvm() {
             assert!(handle.is_null());
             // SAFETY: the entry point initialized detail.
             let mut detail = unsafe { detail.assume_init() };
-            assert_rejected_detail(status, expected, experimental, &mut detail);
+            assert_backend_error_detail(status, expected, experimental, &mut detail);
         }
     }
 }
 
 #[test]
-fn lifecycle_envelope_export_rejects_all_microvm_phases_and_dry_runs() {
+fn lifecycle_envelope_export_routes_microvm_phases_and_dry_runs() {
     for phase in ["provision", "start", "exec", "stop", "deprovision"] {
         let request = match phase {
             "provision" => json!({
@@ -724,87 +809,37 @@ fn lifecycle_envelope_export_rejects_all_microvm_phases_and_dry_runs() {
             })
             .to_string(),
         };
-        let request = CString::new(request).unwrap();
         for (dry_run, experimental) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-            let mut result = MaybeUninit::<MxcStateAwareResult>::uninit();
-            // SAFETY: request is valid and result is writable storage.
-            let status = unsafe {
-                mxc_run_state_aware_json(
-                    request.as_ptr(),
-                    dry_run,
-                    experimental,
-                    result.as_mut_ptr(),
-                )
-            };
-            // SAFETY: the entry point initialized result.
-            let mut result = unsafe { result.assume_init() };
-            assert_eq!(status, result.status);
-            assert!(result.response_json_utf8.is_null());
-            if phase == "exec" && dry_run == 0 {
-                let (status, message) = failure_detail(status, &mut result.error);
-                assert_eq!(status, MXC_STATUS_MALFORMED_REQUEST);
-                assert!(message.starts_with("the exec phase does not return an envelope;"));
-                // SAFETY: the error strings were already freed.
-                unsafe { mxc_state_aware_result_free(&mut result) };
-                continue;
-            }
-            assert_rejected_detail(
-                status,
-                MXC_STATUS_UNSUPPORTED_PHASE,
-                experimental,
-                &mut result.error,
-            );
-            // SAFETY: the result was populated; its error strings were already freed.
-            unsafe { mxc_state_aware_result_free(&mut result) };
+            let actual = call_failure(Call::Envelope(dry_run != 0), &request, experimental);
+            let expected = mxc_sdk::mxc_engine::run_state_aware_json(
+                &request,
+                dry_run != 0,
+                experimental != 0,
+            )
+            .expect_err("missing runtime must prevent native setup");
+            assert_eq!(actual, (error_status(expected.code), expected.message));
         }
     }
 }
 
 #[test]
-fn captured_and_attached_lifecycle_exports_reject_microvm() {
-    let request = CString::new(EXEC).unwrap();
+fn captured_and_attached_lifecycle_exports_match_engine_validation() {
+    let request = EXEC.replace(
+        r#""commandLine":"true""#,
+        r#""commandLine":"true","timeout":3600001"#,
+    );
     for experimental in [0, 1] {
-        let mut result = MaybeUninit::<MxcRunResult>::uninit();
-        // SAFETY: request is valid and result is writable storage.
-        let status = unsafe {
-            mxc_run_state_aware_exec_json(request.as_ptr(), experimental, result.as_mut_ptr())
-        };
-        // SAFETY: the entry point initialized result.
-        let mut result = unsafe { result.assume_init() };
-        assert!(result.stdout_utf8.is_null());
-        assert!(result.stderr_utf8.is_null());
-        assert_rejected_detail(
-            status,
-            MXC_STATUS_UNSUPPORTED_PHASE,
-            experimental,
-            &mut result.error,
-        );
-        // SAFETY: the result was populated; its error strings were already freed.
-        unsafe { mxc_run_result_free(&mut result) };
+        let actual = call_failure(Call::Capture, &request, experimental);
+        let expected =
+            mxc_sdk::mxc_engine::exec_state_aware_json(&request, experimental != 0, false)
+                .err()
+                .expect("backend-invalid timeout must not execute");
+        assert_eq!(actual, (error_status(expected.code), expected.message));
 
-        let mut outcome = MxcExecOutcome {
-            timed_out: 42,
-            exit_code: 43,
-        };
-        let mut detail = MaybeUninit::uninit();
-        // SAFETY: request, outcome, and detail are valid for this call.
-        let status = unsafe {
-            mxc_exec_state_aware_attached_json(
-                request.as_ptr(),
-                experimental,
-                &mut outcome,
-                detail.as_mut_ptr(),
-            )
-        };
-        assert_eq!((outcome.timed_out, outcome.exit_code), (42, 43));
-        // SAFETY: the entry point initialized detail.
-        let mut detail = unsafe { detail.assume_init() };
-        assert_rejected_detail(
-            status,
-            MXC_STATUS_UNSUPPORTED_PHASE,
-            experimental,
-            &mut detail,
-        );
+        let actual = call_failure(Call::Attached, &request, experimental);
+        let expected = mxc_sdk::mxc_engine::exec_state_aware_attached(&request, experimental != 0)
+            .expect_err("backend-invalid timeout must not execute");
+        assert_eq!(actual, (error_status(expected.code), expected.message));
     }
 }
 
@@ -820,7 +855,10 @@ fn baseline_microvm_one_shot_capture_still_reaches_the_rust_backend() {
         ErrorCode::BackendUnavailable => MXC_STATUS_BACKEND_UNAVAILABLE,
         other => panic!("unexpected baseline Rust capture error: {other:?}"),
     };
-    assert_spawn_rejected(mxc_spawn_json, &request, MXC_STATUS_UNSUPPORTED_CONTAINMENT);
+    let spawn_error = dev::spawn_json(&request, dev::JsonOptions { experimental: true })
+        .err()
+        .expect("backend-invalid timeout must not execute");
+    assert_spawn_failure(mxc_spawn_json, &request, error_status(spawn_error.code));
     let request = CString::new(request).unwrap();
     let mut result = MaybeUninit::<MxcRunResult>::uninit();
     // SAFETY: request is valid and result is writable storage.

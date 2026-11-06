@@ -23,21 +23,22 @@ if (-not $LogDirectory) {
 New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
 $LogDirectory = (Resolve-Path -LiteralPath $LogDirectory).Path
 $required = @(
+    'microvm_requests_normalize_exactly_once_on_each_c_surface',
     'permitted_public_spawns_normalize_and_probe_each_surviving_path_once',
     'wrong_entry_points_preserve_the_owning_phase_and_root_errors',
     'pty_dimension_errors_keep_priority_over_json_and_authorization',
     'invalid_lifecycle_pty_dimensions_never_normalize_or_probe',
     'wrong_operation_delegates_normalization_exactly_once',
     'malformed_or_ambiguous_selectors_cannot_bypass_authoritative_validation',
-    'escaped_phase_and_selector_keys_keep_the_rust_only_exclusion',
+    'escaped_phase_and_selector_keys_reach_backend_validation',
     'lifecycle_pty_preserves_pointer_utf8_and_zero_dimension_precedence',
-    'one_shot_pipe_and_stdin_exports_reject_microvm',
+    'one_shot_pipe_and_stdin_exports_reach_microvm_validation',
     'malformed_contract_version_and_phase_errors_are_preserved',
     'filesystem_validation_preserves_malformed_request_errors',
-    'lifecycle_pipe_and_stdin_exports_reject_microvm',
+    'lifecycle_pipe_and_stdin_exports_reach_microvm_validation',
     'pty_exports_reject_microvm',
-    'lifecycle_envelope_export_rejects_all_microvm_phases_and_dry_runs',
-    'captured_and_attached_lifecycle_exports_reject_microvm',
+    'lifecycle_envelope_export_routes_microvm_phases_and_dry_runs',
+    'captured_and_attached_lifecycle_exports_match_engine_validation',
     'baseline_microvm_one_shot_capture_still_reaches_the_rust_backend',
     'one_shot_capture_export_cannot_bypass_the_lifecycle_boundary'
 )

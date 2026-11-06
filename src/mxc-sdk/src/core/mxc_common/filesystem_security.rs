@@ -1082,13 +1082,13 @@ mod tests {
             [
                 std::ffi::OsStr::new("Microsoft"),
                 std::ffi::OsStr::new("MXC"),
-                std::ffi::OsStr::new("nvx-v1"),
+                std::ffi::OsStr::new("nvx"),
             ]
             .as_slice(),
             2,
         )
         .expect("admit private NVX root below shared MXC directory");
-        assert_eq!(guard.path(), mxc.join("nvx-v1"));
+        assert_eq!(guard.path(), mxc.join("nvx"));
         assert!(is_owner_only_directory(guard.path()).expect("inspect NVX root"));
 
         let replacement = mxc.join("replacement");

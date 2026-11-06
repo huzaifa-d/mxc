@@ -67,7 +67,7 @@ fn provision() -> Value {
 }
 
 #[test]
-fn executor_rejects_microvm_lifecycle_including_dry_run() {
+fn executor_routes_microvm_lifecycle_to_backend_validation() {
     for phase in ["provision", "start", "exec", "stop", "deprovision"] {
         let request = match phase {
             "provision" => provision(),
@@ -80,18 +80,25 @@ fn executor_rejects_microvm_lifecycle_including_dry_run() {
         for dry_run in [false, true] {
             let error = assert_error(
                 invoke(&request, Some(phase), id, true, dry_run),
-                "unsupported_phase",
+                if cfg!(all(feature = "microvm", target_arch = "x86_64")) {
+                    "backend_unavailable"
+                } else {
+                    "unsupported_phase"
+                },
             );
-            assert!(error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("only through Rust mxc_sdk::v1::dev JSON APIs"));
+            assert!(error["error"]["message"].as_str().unwrap().contains(
+                if cfg!(all(feature = "microvm", target_arch = "x86_64")) {
+                    "holds no agent bundle"
+                } else {
+                    "lifecycle"
+                }
+            ));
         }
     }
 }
 
 #[test]
-fn executor_exec_rejection_precedes_native_id_lookup() {
+fn executor_checks_microvm_id_before_runtime_setup() {
     let request = json!({
         "version": "1.1.0-alpha", "process": {"commandLine": "true"}
     });
@@ -104,13 +111,17 @@ fn executor_exec_rejection_precedes_native_id_lookup() {
                 true,
                 dry_run,
             ),
-            "unsupported_phase",
+            if cfg!(all(feature = "microvm", target_arch = "x86_64")) {
+                "malformed_id"
+            } else {
+                "unsupported_phase"
+            },
         );
     }
 }
 
 #[test]
-fn executor_keeps_parsing_and_opt_in_before_surface_authorization() {
+fn executor_keeps_parsing_and_opt_in_before_backend_setup() {
     let mut invalid = provision();
     invalid["microvm"]["provision"] = json!({"memoryMib": 0});
     for dry_run in [false, true] {
