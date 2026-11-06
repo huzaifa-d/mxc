@@ -287,7 +287,8 @@ fn prepare_and_provision(
     }
     let sandbox_id = client
         .provision(&input)
-        .map_err(|error| protect_native_error(error, "provision", sensitive_proxy))?;
+        .map_err(|error| protect_native_error(error, "provision", sensitive_proxy))?
+        .sandbox_id;
     Ok((sandbox_id, exec))
 }
 
@@ -947,7 +948,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::super::abi::SandboxDiagnostics;
-    use super::super::runtime::{ExecOutput, SandboxId};
+    use super::super::runtime::{ExecOutput, ProvisionOutput, SandboxId};
     use super::*;
 
     fn test_capabilities() -> Capabilities {
@@ -1209,6 +1210,7 @@ mod tests {
         validate_res: Result<(), MxcError>,
         probe_res: Result<(), MxcError>,
         provision_res: Result<SandboxId, MxcError>,
+        provision_metadata: Option<serde_json::Map<String, serde_json::Value>>,
         start_res: Result<(), MxcError>,
         diagnostics_res: Result<SandboxDiagnostics, MxcError>,
         exec_res: Result<ExecOutput, MxcError>,
@@ -1231,6 +1233,7 @@ mod tests {
                 validate_res: Ok(()),
                 probe_res: Ok(()),
                 provision_res: SandboxId::from_token("0123456789abcdef0123456789abcdef"),
+                provision_metadata: None,
                 start_res: Ok(()),
                 diagnostics_res: Err(MxcError::backend_error("diagnostics unavailable")),
                 exec_res: Ok(ExecOutput {
@@ -1278,10 +1281,15 @@ mod tests {
             self.probe_res.clone()
         }
 
-        fn provision(&self, input: &ProvisionInput) -> Result<SandboxId, MxcError> {
+        fn provision(&self, input: &ProvisionInput) -> Result<ProvisionOutput, MxcError> {
             self.record("provision");
             *self.provisioned_input.borrow_mut() = Some(input.clone());
-            self.provision_res.clone()
+            self.provision_res
+                .clone()
+                .map(|sandbox_id| ProvisionOutput {
+                    sandbox_id,
+                    metadata: self.provision_metadata.clone(),
+                })
         }
 
         fn start(&self, _sandbox_id: &SandboxId) -> Result<(), MxcError> {
@@ -2062,9 +2070,14 @@ mod tests {
             let state_root = tempfile::tempdir().unwrap();
             let state_path = state_root.path().to_path_buf();
             let mut client = MockClient::ok();
+            client.provision_metadata = Some(serde_json::Map::from_iter([(
+                "origin".to_owned(),
+                serde_json::json!("agent"),
+            )]));
             let result =
                 run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap();
             assert_eq!(result.outcome, CapturedOutcome::Exited(0));
+            assert_eq!(result.stdout, b"ok");
             assert_eq!(
                 *client.validated_request.borrow(),
                 Some(super::super::policy::exec_request(&request, &test_capabilities()).unwrap())

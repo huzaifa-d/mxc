@@ -30,9 +30,9 @@ impl NvxStateAwareRunner {
         }
     }
 
-    pub(crate) fn with_capture_limit(limit: usize) -> Self {
+    pub(crate) fn for_capture() -> Self {
         let mut runner = Self::new();
-        runner.capture_limit = Some(limit);
+        runner.capture_limit = Some(super::runtime::CAPTURE_LIMIT_BYTES);
         runner
     }
 
@@ -147,13 +147,13 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
             .validate_provision(&input)
             .map_err(|error| protect("validate_provision", error))?;
         client.probe().map_err(|error| protect("probe", error))?;
-        let (sandbox_id, metadata) = client
-            .provision_with_metadata(&input)
+        let provisioned = client
+            .provision(&input)
             .map_err(|error| protect("provision", error))?;
-        *self.provisioned_id.borrow_mut() = Some(sandbox_id.clone());
+        *self.provisioned_id.borrow_mut() = Some(provisioned.sandbox_id.clone());
         Ok(ProvisionResult {
-            sandbox_id: sandbox_id.to_mxc_string(),
-            metadata: metadata.map(Value::Object),
+            sandbox_id: provisioned.sandbox_id.to_mxc_string(),
+            metadata: provisioned.metadata.map(Value::Object),
         })
     }
 
@@ -322,6 +322,7 @@ mod tests {
         fail: Option<&'static str>,
         close_fails: bool,
         provisioned: bool,
+        provision_metadata: bool,
         buffers: usize,
     }
 
@@ -345,7 +346,11 @@ mod tests {
             } else {
                 if operation == "provision" { state.provisioned = true; }
                 if operation == "deprovision" { state.provisioned = false; }
-                body
+                if operation == "provision" && state.provision_metadata {
+                    br#"{"token":"0123456789abcdef0123456789abcdef","metadata":{"origin":"agent","value":7}}"#.as_slice()
+                } else {
+                    body
+                }
             };
             if body.is_empty() {
                 unsafe { *len = 0; *out = std::ptr::null_mut(); }
@@ -583,13 +588,42 @@ mod tests {
                 let result = invoke(phase, dry_run, false).unwrap();
                 let result: Value = serde_json::from_str(&result).unwrap();
                 if phase == "provision" && !dry_run {
-                    assert_eq!(result["result"]["sandboxId"], ID);
+                    assert_eq!(result, serde_json::json!({"result":{"sandboxId":ID}}));
                 } else {
                     assert_eq!(result, serde_json::json!({"result":{}}));
                 }
                 assert_closed_once();
             }
         }
+    }
+
+    #[test]
+    fn public_provision_preserves_native_metadata() {
+        install(None, false);
+        NATIVE.with(|state| state.borrow_mut().provision_metadata = true);
+        let result: Value =
+            serde_json::from_str(&invoke("provision", false, false).unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "result": {
+                    "sandboxId": ID,
+                    "metadata": {"origin": "agent", "value": 7}
+                }
+            })
+        );
+        NATIVE.with(|state| {
+            assert_eq!(
+                state
+                    .borrow()
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "provision")
+                    .count(),
+                1
+            );
+        });
+        assert_closed_once();
     }
 
     #[test]
