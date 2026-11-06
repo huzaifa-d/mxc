@@ -272,6 +272,11 @@ and that interrupting startup or execution removes the VM and its temporary file
 The executor and captured JSON execution scenarios also check that the guest
 uses the host CPU profile.
 
+Rust JSON scenarios also check live output, persistent lifecycle operations,
+capture limits, cancellation with undrained streams, and 512/1024 MiB guest
+memory requests. Required completion markers and child-process watchdogs
+reject missing, skipped, failed, or hung scenarios.
+
 The network tests connect to servers controlled by the test. They check that
 the servers are reachable before and after testing the restrictions, so an
 unavailable server cannot be mistaken for a blocked connection. The host needs
@@ -280,6 +285,13 @@ network, `10.0.0.0/24`.
 
 Regular Windows x64 PR builds run checks that do not need a VM. They also
 unpack the Rust crate package and check that its tests compile.
+
+The staged payload must discover the bounded-child and proxy-stream regressions, and
+nightly validation requires each to report a passing libtest result.
+`scripts/ci/test-microvm-json-boundary.ps1` requires discovery and passing results
+for the direct-C boundary cases in Windows PR builds: MicroVM feature-on and
+feature-off on native x64, and feature-off on native ARM64. Keep these required
+names in sync with intentional test renames; empty or skipped cases are failures.
 
 ### ProcessContainer SDK streaming
 

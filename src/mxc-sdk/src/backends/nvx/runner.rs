@@ -974,6 +974,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_capture_limit_counts_binary_bytes_across_both_streams() {
+        let mut captured = 0;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_captured_stream(&mut stdout, b"\xff\0\xfe", &mut captured, Some(7)).unwrap();
+        write_captured_stream(&mut stderr, b"\x80\0\x81x", &mut captured, Some(7)).unwrap();
+        assert_eq!(captured, 7);
+        assert_eq!(stdout, b"\xff\0\xfe");
+        assert_eq!(stderr, b"\x80\0\x81x");
+
+        let error = write_captured_stream(&mut stdout, b"z", &mut captured, Some(7)).unwrap_err();
+        assert_eq!(error.code, MxcErrorCode::BackendError);
+        assert_eq!(
+            error.message,
+            "NVX signed bundled agent: combined stdout/stderr capture limit of 7 bytes exceeded"
+        );
+        assert_eq!(captured, 7);
+        assert_eq!(stdout, b"\xff\0\xfe");
+
+        let mut unbounded = 0;
+        write_captured_stream(&mut stdout, &[0; 8], &mut unbounded, None).unwrap();
+        assert_eq!(unbounded, 0);
+    }
+
+    #[test]
     fn maps_exit_signal_and_timeout_outcomes() {
         assert_eq!(
             map_outcome(ExecOutcome::Exited(42)).unwrap(),
@@ -1185,6 +1210,7 @@ mod tests {
         validate_res: Result<(), MxcError>,
         probe_res: Result<(), MxcError>,
         provision_res: Result<SandboxId, MxcError>,
+        provision_metadata: Option<serde_json::Map<String, serde_json::Value>>,
         start_res: Result<(), MxcError>,
         diagnostics_res: Result<SandboxDiagnostics, MxcError>,
         exec_res: Result<ExecOutput, MxcError>,
@@ -1207,6 +1233,7 @@ mod tests {
                 validate_res: Ok(()),
                 probe_res: Ok(()),
                 provision_res: SandboxId::from_token("0123456789abcdef0123456789abcdef"),
+                provision_metadata: None,
                 start_res: Ok(()),
                 diagnostics_res: Err(MxcError::backend_error("diagnostics unavailable")),
                 exec_res: Ok(ExecOutput {
@@ -1261,7 +1288,7 @@ mod tests {
                 .clone()
                 .map(|sandbox_id| ProvisionOutput {
                     sandbox_id,
-                    metadata: None,
+                    metadata: self.provision_metadata.clone(),
                 })
         }
 
@@ -1517,11 +1544,17 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code, MxcErrorCode::PolicyValidation, "{phase}");
             assert!(error.message.contains(phase), "{phase}: {}", error.message);
-            assert!(
-                error.message.contains("withheld"),
-                "{phase}: {}",
-                error.message
+            let expected = format!(
+                "NVX {phase} failed; native error detail withheld to protect potentially sensitive proxy configuration"
             );
+            if phase == "start" {
+                assert_eq!(
+                    error.message,
+                    format!("{expected}; startup diagnostics withheld")
+                );
+            } else {
+                assert_eq!(error.message, expected);
+            }
             assert!(
                 !error.message.contains("synthetic"),
                 "{phase}: {}",
@@ -1622,7 +1655,12 @@ mod tests {
                 assert!(error.message.starts_with(message), "{}", error.message);
                 assert!(!error.message.contains("synthetic"), "{}", error.message);
                 if cleanup_failure {
-                    assert!(error.message.contains("withheld"), "{}", error.message);
+                    assert_eq!(
+                        error.message,
+                        format!(
+                            "{message}; execution cleanup failed; native error detail withheld to protect potentially sensitive proxy configuration"
+                        )
+                    );
                 } else {
                     assert_eq!(error.message, message);
                 }
@@ -2032,9 +2070,14 @@ mod tests {
             let state_root = tempfile::tempdir().unwrap();
             let state_path = state_root.path().to_path_buf();
             let mut client = MockClient::ok();
+            client.provision_metadata = Some(serde_json::Map::from_iter([(
+                "origin".to_owned(),
+                serde_json::json!("agent"),
+            )]));
             let result =
                 run_with_client(&mut client, state_root, &request, &mut logger, None).unwrap();
             assert_eq!(result.outcome, CapturedOutcome::Exited(0));
+            assert_eq!(result.stdout, b"ok");
             assert_eq!(
                 *client.validated_request.borrow(),
                 Some(super::super::policy::exec_request(&request, &test_capabilities()).unwrap())

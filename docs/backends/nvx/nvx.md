@@ -240,6 +240,8 @@ image selection, filesystem enforcement, directional network and proxy
 enforcement against controlled reachable host endpoints, binary
 stdout/stderr, exit codes, environment and working-directory settings,
 timeouts, capture limits, cleanup, and the seven MicroVM config fixtures.
+Rust JSON scenarios also cover live output and persistent container lifecycle
+operations.
 An isolated-console scenario interrupts both startup and running execution,
 then verifies that the owned OpenVMM process has terminated and run storage
 has been removed.

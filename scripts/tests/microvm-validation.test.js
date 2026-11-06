@@ -13,7 +13,6 @@ const {
   rmSync,
   writeFileSync,
 } = require("node:fs");
-const { tmpdir } = require("node:os");
 const { delimiter, join, resolve } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { createHash } = require("node:crypto");
@@ -23,7 +22,33 @@ const { stripVTControlCharacters } = require("node:util");
 const root = resolve(__dirname, "..", "..");
 const dispatcher = join(root, "scripts", "ci", "run_backend_validation_tests.ps1");
 const staging = join(root, "scripts", "ci", "stage-nvx-validation-tests.ps1");
+const boundary = join(root, "scripts", "ci", "test-microvm-json-boundary.ps1");
 const packaging = join(root, "scripts", "ci", "Invoke-CratePackage.ps1");
+const requiredHostTests = [
+  "windows_network::bounded_child_drains_heavy_stdout_and_stderr",
+  "windows_network::bounded_child_timeout_reaps_descendants_with_inherited_output",
+  "windows_network::host_only_proxy_stream_reads_delayed_fragmented_headers",
+];
+const boundaryTests = [
+  "microvm_requests_normalize_exactly_once_on_each_c_surface",
+  "permitted_public_spawns_normalize_and_probe_each_surviving_path_once",
+  "wrong_entry_points_preserve_the_owning_phase_and_root_errors",
+  "pty_dimension_errors_keep_priority_over_json_and_authorization",
+  "invalid_lifecycle_pty_dimensions_never_normalize_or_probe",
+  "wrong_operation_delegates_normalization_exactly_once",
+  "malformed_or_ambiguous_selectors_cannot_bypass_authoritative_validation",
+  "escaped_phase_and_selector_keys_reach_backend_validation",
+  "lifecycle_pty_preserves_pointer_utf8_and_zero_dimension_precedence",
+  "one_shot_pipe_and_stdin_exports_reach_microvm_validation",
+  "malformed_contract_version_and_phase_errors_are_preserved",
+  "filesystem_validation_preserves_malformed_request_errors",
+  "lifecycle_pipe_and_stdin_exports_reach_microvm_validation",
+  "pty_exports_reject_microvm",
+  "lifecycle_envelope_export_routes_microvm_phases_and_dry_runs",
+  "captured_and_attached_lifecycle_exports_match_engine_validation",
+  "baseline_microvm_one_shot_capture_still_reaches_the_rust_backend",
+  "one_shot_capture_export_cannot_bypass_the_lifecycle_boundary",
+];
 const microvmFixtures = [
   "microvm_hello.json",
   "microvm_exit_code.json",
@@ -56,7 +81,9 @@ function runScript(script, args, env) {
 }
 
 before(() => {
-  scratch = mkdtempSync(join(tmpdir(), "mxc-microvm-validation-"));
+  const target = join(root, "src", "target");
+  mkdirSync(target, { recursive: true });
+  scratch = mkdtempSync(join(target, "mxc-microvm-validation-"));
   tools = join(scratch, "tools");
   mkdirSync(tools);
   fixture = join(scratch, "fixture.exe");
@@ -68,6 +95,7 @@ use std::{env, path::Path, process};
 fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let mode = env::var("MXC_CI_FIXTURE_MODE").unwrap_or_default();
+    let omitted = env::var("MXC_CI_OMITTED_TEST").unwrap_or_default();
     let exe = env::current_exe().unwrap();
     if exe.file_stem().unwrap() == "cargo" {
         if args.first().map(String::as_str) == Some("metadata") {
@@ -89,6 +117,26 @@ fn main() {
         assert!(args.contains(&"--locked".to_owned()));
         assert!(args.contains(&"--release".to_owned()));
         assert!(args.contains(&"--no-run".to_owned()));
+        if args.windows(2).any(|pair| pair == ["--test", "microvm_json_boundary"]) {
+            assert!(args.windows(2).any(|pair| pair == ["-p", "mxc_ffi"]));
+            assert!(args.contains(&"--no-default-features".to_owned()));
+            let target = &args[args.iter().position(|arg| arg == "--target").unwrap() + 1];
+            let microvm = args.windows(2).any(|pair| pair == ["--features", "mxc-sdk/microvm"]);
+            assert!(!microvm || target == "x86_64-pc-windows-msvc");
+            eprintln!("BOUNDARY_BUILD target={target} microvm={microvm}");
+            if mode == "boundary-cargo-failure" || (mode == "boundary-enabled-failure" && microvm) {
+                process::exit(19);
+            }
+            if mode != "boundary-no-artifact" {
+                let mut executable = std::path::PathBuf::from(env::var("MXC_CI_BOUNDARY_EXECUTABLE").unwrap());
+                if microvm {
+                    executable.set_file_name("microvm_json_boundary_enabled.exe");
+                }
+                let executable = executable.to_str().unwrap();
+                println!("{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"microvm_json_boundary\"}},\"profile\":{{\"test\":true}},\"executable\":{executable:?}}}");
+            }
+            return;
+        }
         assert!(args.windows(2).any(|pair| pair == ["--test", "nvx_e2e"]));
         assert!(args.windows(2).any(|pair| pair == ["--target", "x86_64-pc-windows-msvc"]));
         if let Some(index) = args.iter().position(|arg| arg == "--manifest-path") {
@@ -114,7 +162,66 @@ fn main() {
         }
         return;
     }
+    if exe.file_stem().unwrap().to_str().unwrap().starts_with("microvm_json_boundary") {
+        let feature_mode = if exe.file_stem().unwrap() == "microvm_json_boundary_enabled" { "enabled" } else { "disabled" };
+        let omit_here = env::var("MXC_CI_OMIT_FEATURE_MODE").unwrap_or_default() == feature_mode;
+        let tests = [
+${boundaryTests.map((name) => `            "${name}",`).join("\n")}
+        ];
+        if args == ["--list"] {
+            for name in tests {
+                if mode != "boundary-missing-discovery" || name != omitted || !omit_here {
+                    println!("{name}: test");
+                }
+            }
+            return;
+        }
+        assert_eq!(args, ["--test-threads=1"]);
+        if mode == "boundary-native-failure" {
+            process::exit(23);
+        }
+        if mode == "boundary-zero-tests" {
+            println!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
+            return;
+        }
+        for name in tests {
+            if name == omitted && omit_here {
+                if mode == "boundary-missing-completion" {
+                    continue;
+                }
+                if mode == "boundary-ignored" {
+                    println!("test {name} ... ignored");
+                    continue;
+                }
+            }
+            println!("test {name} ... ok");
+        }
+        println!("test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
+        return;
+    }
     if args == ["--list"] {
+        for name in [
+${requiredHostTests.map((name) => `            "${name}",`).join("\n")}
+        ] {
+            if mode != "child-missing-discovery" || name != omitted {
+                println!("{name}: test");
+            }
+        }
+        if mode != "missing-partial-bundle-discovery" {
+            println!("windows_x64::partial_bundle_is_not_reported_as_available: test");
+        }
+        if mode != "missing-private-lifecycle-discovery" {
+            println!("windows_x64::signed_bundle_validates_memory_and_private_lifecycle_state: test");
+        }
+        if mode != "missing-sdk-streaming-discovery" {
+            println!("windows_x64::signed_bundle_sdk_json_streaming: test");
+        }
+        if mode != "missing-sdk-lifecycle-discovery" {
+            println!("windows_x64::signed_bundle_sdk_json_lifecycle: test");
+        }
+        if mode != "missing-sdk-lifecycle-capture-discovery" {
+            println!("windows_x64::signed_bundle_sdk_json_lifecycle_capture_limit: test");
+        }
         if mode != "missing-proxy-discovery" {
             println!("windows_x64::signed_agent_proxy_validation_withholds_credentials: test");
         }
@@ -124,6 +231,7 @@ fn main() {
         if mode != "missing-executor-proxy-discovery" {
             println!("windows_x64::signed_executor_proxy_validation_withholds_credentials: test");
         }
+        println!("windows_x64::host_only_executor_request_matrix: test");
         println!("windows_x64::signed_bundle_executor_configs: test");
         println!("windows_x64::signed_bundle_executor_create_and_run: test");
         println!("windows_x64::signed_bundle_json_image_and_filesystem_policy: test");
@@ -145,6 +253,9 @@ fn main() {
         if mode != "missing-network-proxy-discovery" {
             println!("windows_network::signed_bundle_deny_default_proxy_policy: test");
         }
+        if mode != "missing-lifecycle-proxy-discovery" {
+            println!("windows_network::signed_bundle_lifecycle_proxy_timeout_starts_after_vm_start: test");
+        }
         return;
     }
     assert!(args.contains(&"--include-ignored".to_owned()));
@@ -158,11 +269,46 @@ fn main() {
         println!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
         return;
     }
+    for name in [
+${requiredHostTests.map((name) => `        "${name}",`).join("\n")}
+    ] {
+        if name == omitted {
+            if mode == "child-missing-completion" {
+                continue;
+            }
+            if mode == "child-ignored" {
+                println!("test {name} ... ignored");
+                continue;
+            }
+        }
+        println!("test {name} ... ok");
+    }
     if mode != "missing-facade" {
         println!("VM_EXECUTED facade sequential stdout/stderr/exit/env/cwd/timeout/capture-limit/cleanup");
     }
     if mode != "missing-sdk-json" {
         println!("VM_EXECUTED SDK JSON binary capture timeout limit and cleanup");
+    }
+    if mode != "missing-sdk-streaming" {
+        println!("VM_EXECUTED SDK JSON live output and cleanup");
+    }
+    if mode != "missing-sdk-streaming-cancellation" {
+        println!("VM_EXECUTED SDK JSON streaming kill drop undrained output and cleanup");
+    }
+    if mode != "missing-sdk-lifecycle" {
+        println!("VM_EXECUTED SDK JSON persistent lifecycle live output timeout and cleanup");
+    }
+    if mode != "missing-sdk-lifecycle-cancellation" {
+        println!("VM_EXECUTED SDK JSON lifecycle kill drop undrained output and container reuse");
+    }
+    if mode != "missing-memory-512" {
+        println!("VM_EXECUTED guest memory 512 MiB MemTotal 512000 KiB and cleanup");
+    }
+    if mode != "missing-memory-1024" {
+        println!("VM_EXECUTED guest memory 1024 MiB MemTotal 1024000 KiB and cleanup");
+    }
+    if mode != "missing-sdk-lifecycle-capture" {
+        println!("VM_EXECUTED SDK JSON lifecycle capture limit boundary cleanup and container reuse");
     }
     if mode != "missing-json-image" {
         println!("VM_EXECUTED JSON selected-image filesystem read/write/deny and cleanup");
@@ -188,6 +334,15 @@ fn main() {
     if mode != "missing-network-proxy" {
         println!("VM_EXECUTED reachable controls, blocked direct egress and successful proxy traffic");
     }
+    if mode == "helper-only-lifecycle-proxy" {
+        println!("{}", env::var("MXC_CI_FIXTURE_HELPER_MARKER").unwrap());
+    }
+    if mode != "missing-lifecycle-proxy" && mode != "helper-only-lifecycle-proxy" {
+        println!("VM_EXECUTED lifecycle proxy deadline after VM startup with ordered cleanup");
+    }
+    if mode != "missing-private-lifecycle-completion" {
+        println!("HOST_VALIDATED memory and private lifecycle state six path cases");
+    }
     if mode == "skipped" {
         println!("SKIPPED: fixture VM unavailable");
     }
@@ -203,6 +358,8 @@ fn main() {
   assert.ifError(build.error);
   assert.equal(build.status, 0, build.stdout + build.stderr);
   copyFileSync(fixture, join(tools, "cargo.exe"));
+  copyFileSync(fixture, join(tools, "microvm_json_boundary.exe"));
+  copyFileSync(fixture, join(tools, "microvm_json_boundary_enabled.exe"));
 });
 
 after(() => {
@@ -221,16 +378,31 @@ function artifact() {
   return directory;
 }
 
-function dispatch(directory, mode = "", architecture = "x64") {
+function nestedHelperMarker() {
+  const source = readFileSync(
+    join(root, "src", "mxc-sdk", "tests", "nvx_e2e", "network.rs"), "utf8"
+  );
+  const marker = source.match(
+    /fn parent_forwards_nested_child_marker\(\) \{\s*if[^{]+\{\s*println!\("\{([A-Z_]+)\}"\);/
+  );
+  assert.ok(marker, "must identify the marker emitted by the actual forwarding helper");
+  const value = source.match(new RegExp(`const ${marker[1]}: &str =\\s*"([^"]+)";`));
+  assert.ok(value, "must resolve the forwarding helper's actual marker");
+  return value[1];
+}
+
+function dispatch(directory, mode = "", architecture = "x64", omitted = "") {
+  const env = { MXC_CI_FIXTURE_MODE: mode, MXC_CI_OMITTED_TEST: omitted };
+  if (mode === "helper-only-lifecycle-proxy") {
+    env.MXC_CI_FIXTURE_HELPER_MARKER = nestedHelperMarker();
+  }
   return runScript(
     dispatcher,
     [
       "-Backend", "microvm", "-BinaryDirectory", directory, "-Architecture", architecture,
       "-TempDirectory", join(directory, "logs"),
     ],
-    {
-      MXC_CI_FIXTURE_MODE: mode,
-    }
+    env
   );
 }
 
@@ -513,6 +685,11 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   const log = readFileSync(join(directory, "logs", "microvm-nvx.log"), "utf8");
   assert.match(log, /VM_EXECUTED facade /);
   assert.match(log, /VM_EXECUTED SDK JSON binary capture /);
+  assert.match(log, /VM_EXECUTED SDK JSON live output /);
+  assert.match(log, /VM_EXECUTED SDK JSON persistent lifecycle /);
+  assert.match(log, /VM_EXECUTED guest memory 512 MiB MemTotal /);
+  assert.match(log, /VM_EXECUTED guest memory 1024 MiB MemTotal /);
+  assert.match(log, /VM_EXECUTED SDK JSON lifecycle capture limit boundary cleanup and container reuse/);
   assert.match(log, /VM_EXECUTED JSON selected-image filesystem /);
   assert.match(log, /VM_EXECUTED executor /);
   assert.match(log, /VM_EXECUTED executor console interruption /);
@@ -520,6 +697,26 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   assert.match(log, /VM_EXECUTED UDP datagrams replies delivery counts protocol separation and inclusive ranges/);
   assert.match(log, /VM_EXECUTED host-loopback ingress TCP\/UDP allow deny ready listeners and reply controls/);
   assert.match(log, /VM_EXECUTED reachable controls, blocked direct egress and successful proxy traffic/);
+  assert.match(log, /VM_EXECUTED lifecycle proxy deadline after VM startup with ordered cleanup/);
+  assert.match(log, /HOST_VALIDATED memory and private lifecycle state six path cases/);
+});
+
+test("private lifecycle host completion matches the real parent test and CI wiring", () => {
+  const name = "windows_x64::signed_bundle_validates_memory_and_private_lifecycle_state";
+  const marker = "HOST_VALIDATED memory and private lifecycle state six path cases";
+  const source = readFileSync(join(root, "src", "mxc-sdk", "tests", "nvx_e2e.rs"), "utf8");
+  const body = source.match(
+    /fn signed_bundle_validates_memory_and_private_lifecycle_state\(\) \{([\s\S]*?)\n    fn executor\(/
+  );
+  assert.ok(body, "must find the real host-only regression test");
+  assert.ok(body[1].includes(`"${name}"`), "child must run the same exact test");
+  assert.equal(body[1].split(marker).length - 1, 1, "only the parent emits completion");
+  assert.match(
+    body[1],
+    /"\{case\}: unexpected private or native artifacts in \{candidate:\?\}"\s*\);\s*\}\s*\}\s*println!\("HOST_VALIDATED memory and private lifecycle state six path cases"\);\s*return;\s*\}/
+  );
+  assert.ok(readFileSync(staging, "utf8").includes(`'${name}'`));
+  assert.ok(readFileSync(dispatcher, "utf8").includes(`$output.Contains('${marker}')`));
 });
 
 for (const [mode, message] of [
@@ -527,6 +724,13 @@ for (const [mode, message] of [
   ["zero-tests", /executed no tests/],
   ["missing-facade", /did not execute the facade VM scenario/],
   ["missing-sdk-json", /did not execute the SDK JSON capture VM scenario/],
+  ["missing-sdk-streaming", /did not execute the SDK JSON streaming VM scenario/],
+  ["missing-sdk-streaming-cancellation", /did not execute the SDK JSON streaming cancellation VM scenario/],
+  ["missing-sdk-lifecycle", /did not execute the SDK JSON lifecycle VM scenario/],
+  ["missing-sdk-lifecycle-cancellation", /did not execute the SDK JSON lifecycle cancellation VM scenario/],
+  ["missing-memory-512", /did not execute the 512 MiB guest memory VM scenario/],
+  ["missing-memory-1024", /did not execute the 1024 MiB guest memory VM scenario/],
+  ["missing-sdk-lifecycle-capture", /did not execute the SDK JSON lifecycle capture VM scenario/],
   ["missing-json-image", /did not execute the JSON image and policy VM scenario/],
   ["missing-executor", /did not execute the executor VM scenario/],
   ["missing-configs", /did not execute the executor configs VM scenario/],
@@ -535,6 +739,9 @@ for (const [mode, message] of [
   ["missing-network-udp", /did not execute the UDP network rules VM scenario/],
   ["missing-host-loopback", /did not execute the host-loopback ingress VM scenario/],
   ["missing-network-proxy", /did not execute the network proxy VM scenario/],
+  ["missing-lifecycle-proxy", /did not execute the lifecycle network proxy VM scenario/],
+  ["helper-only-lifecycle-proxy", /did not execute the lifecycle network proxy VM scenario/],
+  ["missing-private-lifecycle-completion", /did not complete the memory and private lifecycle state host-only scenario/],
   ["skipped", /skipped or filtered tests/],
   ["ignored", /skipped or filtered tests/],
 ]) {
@@ -542,6 +749,23 @@ for (const [mode, message] of [
     const result = dispatch(artifact(), mode);
     assert.notEqual(result.status, 0, result.output);
     assert.match(result.output, message);
+    if (mode === "helper-only-lifecycle-proxy") {
+      assert.ok(result.output.includes(nestedHelperMarker()), result.output);
+    }
+    if (mode === "missing-private-lifecycle-completion") {
+      assert.match(result.output, /test result: ok\. 7 passed; 0 failed; 0 ignored;/);
+      assert.equal((result.output.match(/VM_EXECUTED /g) || []).length, 18);
+      assert.match(result.output, /VM_EXECUTED guest memory 512 MiB MemTotal /);
+      assert.match(result.output, /VM_EXECUTED guest memory 1024 MiB MemTotal /);
+      assert.match(result.output, /VM_EXECUTED lifecycle proxy deadline after VM startup with ordered cleanup/);
+      assert.doesNotMatch(result.output, /HOST_VALIDATED /);
+    }
+    if (mode === "missing-memory-512" || mode === "missing-memory-1024") {
+      assert.match(result.output, /VM_EXECUTED JSON selected-image filesystem /);
+      assert.match(result.output, /VM_EXECUTED SDK JSON persistent lifecycle /);
+      const other = mode === "missing-memory-512" ? 1024 : 512;
+      assert.ok(result.output.includes(`VM_EXECUTED guest memory ${other} MiB MemTotal `));
+    }
   });
 }
 
@@ -559,7 +783,7 @@ test("artifact dispatcher rejects ARM64 instead of running the x64 suite", () =>
   assert.match(result.output, /MicroVM validation requires x64/);
 });
 
-function stage(mode = "") {
+function stage(mode = "", omitted = "") {
   const directory = artifact();
   rmSync(join(directory, "nvx-e2e-tests.exe"));
   const result = runScript(
@@ -569,6 +793,7 @@ function stage(mode = "") {
       PATH: tools + delimiter + process.env.PATH,
       MXC_CI_FIXTURE_MODE: mode,
       MXC_CI_FIXTURE_EXECUTABLE: fixture,
+      MXC_CI_OMITTED_TEST: omitted,
     }
   );
   return { ...result, directory };
@@ -586,6 +811,11 @@ test("staging uses Cargo's reported executable and checks VM test discovery", ()
 for (const [mode, message] of [
   ["cargo-failure", /cargo test --no-run failed with exit code 17/],
   ["cargo-no-artifact", /Expected one nvx_e2e test executable/],
+  ["missing-partial-bundle-discovery", /did not discover windows_x64::partial_bundle_is_not_reported_as_available/],
+  ["missing-private-lifecycle-discovery", /did not discover windows_x64::signed_bundle_validates_memory_and_private_lifecycle_state/],
+  ["missing-sdk-streaming-discovery", /did not discover windows_x64::signed_bundle_sdk_json_streaming/],
+  ["missing-sdk-lifecycle-discovery", /did not discover windows_x64::signed_bundle_sdk_json_lifecycle/],
+  ["missing-sdk-lifecycle-capture-discovery", /did not discover windows_x64::signed_bundle_sdk_json_lifecycle_capture_limit/],
   ["missing-proxy-discovery", /did not discover windows_x64::signed_agent_proxy_validation_withholds_credentials/],
   ["missing-alias-discovery", /did not discover windows_x64::guest_path_resolves_windows_case_alias/],
   ["missing-executor-proxy-discovery", /did not discover windows_x64::signed_executor_proxy_validation_withholds_credentials/],
@@ -595,12 +825,18 @@ for (const [mode, message] of [
   ["missing-network-discovery", /did not discover[\s\S]*windows_network::signed_bundle_network_rules_enforce_allow_deny_and_port_selectors/],
   ["missing-host-loopback-discovery", /did not discover[\s\S]*windows_network::signed_bundle_host_loopback_ingress/],
   ["missing-network-proxy-discovery", /did not discover[\s\S]*windows_network::signed_bundle_deny_default_proxy_policy/],
+  ["missing-lifecycle-proxy-discovery", /did not discover[\s\S]*windows_network::signed_bundle_lifecycle_proxy_timeout_starts_after_vm_start/],
 ]) {
   test(`staging rejects ${mode}`, () => {
     const result = stage(mode);
     assert.notEqual(result.status, 0, result.output);
     assert.match(result.output, message);
     if (![
+      "missing-partial-bundle-discovery",
+      "missing-private-lifecycle-discovery",
+      "missing-sdk-streaming-discovery",
+      "missing-sdk-lifecycle-discovery",
+      "missing-sdk-lifecycle-capture-discovery",
       "missing-proxy-discovery",
       "missing-alias-discovery",
       "missing-executor-proxy-discovery",
@@ -610,8 +846,93 @@ for (const [mode, message] of [
       "missing-network-discovery",
       "missing-host-loopback-discovery",
       "missing-network-proxy-discovery",
+      "missing-lifecycle-proxy-discovery",
     ].includes(mode)) {
       assert.equal(existsSync(join(result.directory, "nvx-e2e-tests.exe")), false);
     }
+  });
+}
+
+for (const name of requiredHostTests) {
+  test(`staging rejects missing required host discovery: ${name}`, () => {
+    const result = stage("child-missing-discovery", name);
+    assert.notEqual(result.status, 0, result.output);
+    assert.ok(result.output.replace(/\r?\n\s*\|\s*/g, " ").includes(`did not discover ${name}`), result.output);
+  });
+  for (const mode of ["child-missing-completion", "child-ignored"]) {
+    test(`artifact dispatcher rejects ${mode}: ${name}`, () => {
+      const result = dispatch(artifact(), mode, "x64", name);
+      assert.notEqual(result.status, 0, result.output);
+      assert.ok(result.output.replace(/\r?\n\s*\|\s*/g, " ").includes(`'${name}' did not pass`), result.output);
+      assert.match(result.output, /test result: ok\. 7 passed; 0 failed; 0 ignored;/);
+    });
+  }
+}
+
+function runBoundary(mode = "", omitted = "", target = "x86_64-pc-windows-msvc", featureMode = "disabled") {
+  return runScript(
+    boundary,
+    ["-Target", target, "-LogDirectory", mkdtempSync(join(scratch, "boundary-"))],
+    {
+      PATH: tools + delimiter + process.env.PATH,
+      MXC_CI_FIXTURE_MODE: mode,
+      MXC_CI_OMITTED_TEST: omitted,
+      MXC_CI_OMIT_FEATURE_MODE: featureMode,
+      MXC_CI_BOUNDARY_EXECUTABLE: join(tools, "microvm_json_boundary.exe"),
+    }
+  );
+}
+
+test("C boundary gate checks feature-off and feature-on on native x64", () => {
+  const result = runBoundary();
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /BOUNDARY_BUILD target=x86_64-pc-windows-msvc microvm=false/);
+  assert.match(result.output, /BOUNDARY_BUILD target=x86_64-pc-windows-msvc microvm=true/);
+  for (const name of boundaryTests) {
+    assert.equal(result.output.split(`test ${name} ... ok`).length - 1, 2, name);
+  }
+  const workflow = readFileSync(join(root, ".github", "workflows", "Build.Windows.Job.yml"), "utf8");
+  assert.match(workflow, /test-microvm-json-boundary\.ps1 -Target '\$\{\{ matrix\.target \}\}'/);
+});
+
+test("C boundary gate checks feature-off only on native ARM64", () => {
+  const result = runBoundary("", "", "aarch64-pc-windows-msvc");
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /BOUNDARY_BUILD target=aarch64-pc-windows-msvc microvm=false/);
+  assert.doesNotMatch(result.output, /microvm=true/);
+});
+
+for (const name of boundaryTests) {
+  for (const featureMode of ["disabled", "enabled"]) {
+    for (const [mode, message] of [
+      ["boundary-missing-discovery", `did not discover ${name}`],
+      ["boundary-missing-completion", `'${name}' did not pass`],
+      ["boundary-ignored", `'${name}' did not pass`],
+    ]) {
+      test(`C boundary gate rejects ${mode} (${featureMode}): ${name}`, () => {
+        const result = runBoundary(mode, name, "x86_64-pc-windows-msvc", featureMode);
+        assert.notEqual(result.status, 0, result.output);
+        const output = result.output.replace(/\r?\n\s*\|\s*/g, " ");
+        assert.ok(output.includes(`MicroVM C boundary (${featureMode})`), result.output);
+        assert.ok(output.includes(message), result.output);
+        if (mode !== "boundary-missing-discovery") {
+          assert.match(result.output, /test result: ok\. 18 passed; 0 failed; 0 ignored;/);
+        }
+      });
+    }
+  }
+}
+
+for (const [mode, message] of [
+  ["boundary-cargo-failure", /compilation failed with exit code 19/],
+  ["boundary-enabled-failure", /compilation failed with exit code 19/],
+  ["boundary-no-artifact", /Expected one microvm_json_boundary test executable/],
+  ["boundary-native-failure", /exited 23/],
+  ["boundary-zero-tests", /executed no tests/],
+]) {
+  test(`C boundary gate propagates ${mode}`, () => {
+    const result = runBoundary(mode);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, message);
   });
 }
