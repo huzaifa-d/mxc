@@ -285,26 +285,31 @@ class FakeStreams implements NativeStreamFactory {
 
 describe('native streaming binding ownership', () => {
   it('awaits native state-aware spawn without using synchronous dispatch', async () => {
-    const native = new FakeNative();
-    native.deferSpawn = true;
-    const requestJson = '{"phase":"exec","sandboxId":"iso:abc"}';
-    const pending = createStateAwareStreamingDriverAsync(
-      requestJson,
-      true,
-      native,
-      new FakeStreams(),
-    );
+    for (const output of ['stream', 'capture'] as const) {
+      const native = new FakeNative();
+      native.deferSpawn = true;
+      const requestJson = '{"phase":"exec","sandboxId":"iso:abc"}';
+      const pending = createStateAwareStreamingDriverAsync(
+        requestJson,
+        true,
+        native,
+        new FakeStreams(),
+        false,
+        output,
+      );
 
-    assert.strictEqual(native.pendingSpawns.length, 1);
-    assert.strictEqual(native.stateAwareRequest, requestJson);
-    assert.strictEqual(native.stateAwareExperimental, 1);
-    native.completeSpawn();
+      assert.strictEqual(native.pendingSpawns.length, 1);
+      assert.strictEqual(native.stateAwareRequest, requestJson);
+      assert.strictEqual(native.stateAwareExperimental, 1);
+      native.completeSpawn();
 
-    const driver = await pending;
-    assert.strictEqual(driver.id, 23);
-    assert.strictEqual(native.stateAwareWithStdin, false);
-    await driver.free();
-    assert.strictEqual(native.freeCount, 1);
+      const driver = await pending;
+      assert.strictEqual(driver.id, 23);
+      assert.strictEqual(native.stateAwareWithStdin, false);
+      assert.strictEqual(native.stateAwareCapture, output === 'capture');
+      await driver.free();
+      assert.strictEqual(native.freeCount, 1);
+    }
   });
 
   it('dispatches a state-aware exec with stdin through its own native entry point', async () => {

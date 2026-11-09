@@ -480,6 +480,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "microvm",
+                WindowsHostAvailability {
+                    microvm: true,
+                    ..Default::default()
+                },
+            ),
         ];
         for (expected, hosts) in cases {
             for base_container_usable in [false, true] {
@@ -567,6 +574,10 @@ mod tests {
             (
                 ContainmentBackend::Hyperlight.wire_name(),
                 hyperlight_host_available(),
+            ),
+            (
+                ContainmentBackend::MicroVm.wire_name(),
+                microvm_host_available(),
             ),
         ]);
     }
