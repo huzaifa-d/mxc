@@ -186,6 +186,7 @@ fn microvm_requests_normalize_exactly_once_on_each_c_surface() {
         }
         for call in [
             Call::Spawn(mxc_exec_state_aware_json),
+            Call::Spawn(mxc_exec_state_aware_capture_json),
             Call::Spawn(mxc_exec_state_aware_with_stdin_json),
             Call::Pty(mxc_state_aware_exec_pty, 24, 80),
             Call::Capture,
@@ -746,6 +747,7 @@ fn lifecycle_pipe_and_stdin_exports_reach_microvm_validation() {
     );
     for (spawn, stdin) in [
         (mxc_exec_state_aware_json as Spawn, false),
+        (mxc_exec_state_aware_capture_json as Spawn, false),
         (mxc_exec_state_aware_with_stdin_json as Spawn, true),
     ] {
         let expected = mxc_sdk::mxc_engine::exec_state_aware_json(&request, true, stdin)
