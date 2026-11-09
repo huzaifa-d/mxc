@@ -232,6 +232,33 @@ pub unsafe extern "C" fn mxc_exec_state_aware_json(
     }
 }
 
+/// Execute for captured output while retaining a cancellable process handle.
+///
+/// Applies the backend's capture limits without changing live-streaming calls.
+/// Drive and release the returned handle as for [`mxc_exec_state_aware_json`].
+///
+/// # Safety
+/// As for [`mxc_exec_state_aware_json`].
+#[no_mangle]
+pub unsafe extern "C" fn mxc_exec_state_aware_capture_json(
+    request_json_utf8: *const c_char,
+    experimental: i32,
+    out_handle: *mut *mut MxcSandbox,
+    out_error: *mut MxcErrorDetail,
+) -> i32 {
+    // SAFETY: forwarded under this function's own contract.
+    unsafe {
+        exec_streaming(
+            "mxc_exec_state_aware_capture_json",
+            request_json_utf8,
+            experimental,
+            execute_lifecycle_capture_json,
+            out_handle,
+            out_error,
+        )
+    }
+}
+
 /// [`mxc_exec_state_aware_json`] with a writable stdin, which a WSLC process
 /// started there does not get.
 ///
