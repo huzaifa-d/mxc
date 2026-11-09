@@ -318,8 +318,13 @@ public enum ContainmentBackend
     IsolationSession,
     Bubblewrap,
     Hyperlight,
+    MicroVm,
 }
 ```
+
+`MicroVm` identifies NVX in host discovery. Typed V1 request APIs do not expose
+MicroVM selection; the `V1.Dev` JSON APIs support MicroVM streaming and container
+lifecycle operations with experimental authorization.
 
 
 ## `Microsoft.Mxc.Sdk.V1.DeprovisionOptions`

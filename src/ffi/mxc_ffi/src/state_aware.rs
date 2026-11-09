@@ -38,7 +38,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use mxc_sdk::__ffi::{
-    execute_lifecycle_json, execute_lifecycle_with_stdin_json,
+    execute_lifecycle_capture_json, execute_lifecycle_json, execute_lifecycle_with_stdin_json,
     run_lifecycle_json as run_state_aware_json, spawn_in_container_with_pty_json,
 };
 use mxc_sdk::v1::MxcPtySize;
@@ -232,6 +232,33 @@ pub unsafe extern "C" fn mxc_exec_state_aware_json(
     }
 }
 
+/// Execute for captured output while retaining a cancellable process handle.
+///
+/// Applies the backend's capture limits without changing live-streaming calls.
+/// Drive and release the returned handle as for [`mxc_exec_state_aware_json`].
+///
+/// # Safety
+/// As for [`mxc_exec_state_aware_json`].
+#[no_mangle]
+pub unsafe extern "C" fn mxc_exec_state_aware_capture_json(
+    request_json_utf8: *const c_char,
+    experimental: i32,
+    out_handle: *mut *mut MxcSandbox,
+    out_error: *mut MxcErrorDetail,
+) -> i32 {
+    // SAFETY: forwarded under this function's own contract.
+    unsafe {
+        exec_streaming(
+            "mxc_exec_state_aware_capture_json",
+            request_json_utf8,
+            experimental,
+            execute_lifecycle_capture_json,
+            out_handle,
+            out_error,
+        )
+    }
+}
+
 /// [`mxc_exec_state_aware_json`] with a writable stdin, which a WSLC process
 /// started there does not get.
 ///
@@ -357,7 +384,7 @@ pub unsafe extern "C" fn mxc_run_state_aware_exec_json(
             }
         };
         crate::execute_output(
-            execute_lifecycle_json(request_json, experimental != 0).and_then(|process| {
+            execute_lifecycle_capture_json(request_json, experimental != 0).and_then(|process| {
                 process.wait_with_output().map_err(|error| {
                     mxc_sdk::v1::Error::new(
                         crate::ErrorCode::BackendError,
@@ -423,23 +450,26 @@ pub unsafe extern "C" fn mxc_state_aware_exec_pty(
                 ))
             }
         };
-        spawn_in_container_with_pty_json(
-            request_json,
-            MxcPtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            experimental != 0,
-        )
-        .map(MxcSandbox::new_pty)
-        .map_err(|error| {
+        let size = MxcPtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        size.validate().map_err(|error| {
             (
                 status_from_error_code(error.code),
                 MxcErrorDetail::from_error(&error),
             )
-        })
+        })?;
+        spawn_in_container_with_pty_json(request_json, size, experimental != 0)
+            .map(MxcSandbox::new_pty)
+            .map_err(|error| {
+                (
+                    status_from_error_code(error.code),
+                    MxcErrorDetail::from_error(&error),
+                )
+            })
     }))
     .unwrap_or_else(|panic| {
         crate::report_panic("mxc_state_aware_exec_pty", &*panic);
