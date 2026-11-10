@@ -111,6 +111,33 @@ public unsafe class NativeErrorTests
         }
     }
 
+    [Theory]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123\"}} trailing")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-\\u003123\"}} trailing")]
+    public void MalformedLifecycleDetailsRedactRecoveryIdFromOriginalFailure(string detailsJson)
+    {
+        var detail = Detail("cleanup failed for nvx:secret-123", "operation nvx:secret-123",
+            "code nvx:secret-123", "remedy nvx:secret-123");
+        var json = Utf8(detailsJson);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", json);
+            Assert.Equal(ErrorCode.BackendError, ex.Code);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Equal(ErrorCode.NotProvisioned, original.Code);
+            Assert.Contains("cleanup failed", original.Message);
+            Assert.DoesNotContain("nvx:secret-123", ex.Message);
+            Assert.DoesNotContain("nvx:secret-123", ex.ToString());
+            Assert.DoesNotContain("nvx:secret-123", original.Message);
+            Assert.DoesNotContain("nvx:secret-123", original.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
     [Fact]
     public void NullLifecycleDetailsLeaveTheOriginalFailureUnchanged()
     {

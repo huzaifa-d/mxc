@@ -120,6 +120,32 @@ describe('state-aware native binding ownership', () => {
     assert.strictEqual(native.freeCount, 1);
   });
 
+  for (const detailsJson of [
+    '{"nvxRecovery":{"sandboxId":"nvx:secret-123"}} trailing',
+    '{"nvxRecovery":{"sandboxId":"nvx:secret-\\u003123"}} trailing',
+  ]) {
+    it('redacts the recovery ID from a preserved cause when details are malformed', async () => {
+      const native = new FakeStateAwareNative();
+      native.resultStatus = 7;
+      native.errorMessage = 'cleanup failed for nvx:secret-123';
+      native.detailsJson = detailsJson;
+      await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
+        assert.ok(error instanceof MxcError);
+        assert.strictEqual(error.code, 'backend_error');
+        const cause = error.details?.cause;
+        assert.ok(cause instanceof MxcError);
+        assert.strictEqual(cause.code, 'not_provisioned');
+        assert.ok(cause.message.includes('cleanup failed'));
+        assert.ok(!error.message.includes('nvx:secret-123'));
+        assert.ok(!String(error).includes('nvx:secret-123'));
+        assert.ok(!cause.message.includes('nvx:secret-123'));
+        assert.ok(!String(cause).includes('nvx:secret-123'));
+        return true;
+      });
+      assert.strictEqual(native.freeCount, 1);
+    });
+  }
+
   for (const json of ['{', '[]', 'null']) {
     it(`rejects invalid error details ${json} and preserves the original error`, async () => {
       const native = new FakeStateAwareNative();
