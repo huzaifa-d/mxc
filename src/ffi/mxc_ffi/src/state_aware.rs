@@ -69,6 +69,15 @@ pub struct MxcStateAwareResult {
     pub error: MxcErrorDetail,
 }
 
+/// A lifecycle result with per-invocation structured error details.
+#[repr(C)]
+pub struct MxcStateAwareResultV2 {
+    /// Original lifecycle result, unchanged for ABI compatibility.
+    pub result: MxcStateAwareResult,
+    /// Owned UTF-8 JSON object containing backend details, or null.
+    pub error_details_json_utf8: *mut c_char,
+}
+
 impl MxcStateAwareResult {
     #[cfg(test)]
     fn empty() -> Self {
@@ -122,7 +131,7 @@ pub unsafe extern "C" fn mxc_run_state_aware_json(
     }
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0)
+        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0, false).result
     }))
     .unwrap_or_else(|panic| {
         crate::report_panic("mxc_run_state_aware_json", &*panic);
@@ -140,29 +149,111 @@ fn state_aware_inner(
     request_json_utf8: *const c_char,
     dry_run: bool,
     experimental: bool,
-) -> MxcStateAwareResult {
+    include_details: bool,
+) -> MxcStateAwareResultV2 {
     // SAFETY: caller contract on `mxc_run_state_aware_json`; borrowed only
     // within scope.
     let request_json = match unsafe { cstr_to_str(request_json_utf8) } {
         Some(s) => s,
         None if request_json_utf8.is_null() => {
-            return MxcStateAwareResult::error(
-                MXC_STATUS_NULL_ARGUMENT,
-                "request JSON pointer is null",
-            )
+            return MxcStateAwareResultV2 {
+                result: MxcStateAwareResult::error(
+                    MXC_STATUS_NULL_ARGUMENT,
+                    "request JSON pointer is null",
+                ),
+                error_details_json_utf8: ptr::null_mut(),
+            }
         }
         None => {
-            return MxcStateAwareResult::error(MXC_STATUS_INVALID_UTF8, "request JSON is not UTF-8")
+            return MxcStateAwareResultV2 {
+                result: MxcStateAwareResult::error(
+                    MXC_STATUS_INVALID_UTF8,
+                    "request JSON is not UTF-8",
+                ),
+                error_details_json_utf8: ptr::null_mut(),
+            }
         }
     };
 
     match run_state_aware_json(request_json, dry_run, experimental) {
-        Ok(response_json) => MxcStateAwareResult {
-            status: MXC_STATUS_SUCCESS,
-            response_json_utf8: alloc_cstring(response_json.as_bytes()),
-            error: MxcErrorDetail::none(),
+        Ok(response_json) => MxcStateAwareResultV2 {
+            result: MxcStateAwareResult {
+                status: MXC_STATUS_SUCCESS,
+                response_json_utf8: alloc_cstring(response_json.as_bytes()),
+                error: MxcErrorDetail::none(),
+            },
+            error_details_json_utf8: ptr::null_mut(),
         },
-        Err(e) => MxcStateAwareResult::from_sdk_error(&e),
+        Err(e) => result_v2_from_sdk_error(&e, include_details),
+    }
+}
+
+fn result_v2_from_sdk_error(
+    error: &mxc_sdk::v1::Error,
+    include_details: bool,
+) -> MxcStateAwareResultV2 {
+    let error_details_json_utf8 = error
+        .details
+        .as_ref()
+        .filter(|_| include_details)
+        .map(|details| {
+            serde_json::to_string(details).expect("JSON value serialization must succeed")
+        })
+        .map_or(ptr::null_mut(), |json| alloc_cstring(json.as_bytes()));
+    MxcStateAwareResultV2 {
+        result: MxcStateAwareResult::from_sdk_error(error),
+        error_details_json_utf8,
+    }
+}
+
+/// Run a lifecycle request, preserving structured backend error details.
+///
+/// # Safety
+/// The pointer requirements match [`mxc_run_state_aware_json`], except `out`
+/// points to [`MxcStateAwareResultV2`] and must be freed with its matching free.
+#[no_mangle]
+pub unsafe extern "C" fn mxc_run_state_aware_json_v2(
+    request_json_utf8: *const c_char,
+    dry_run: i32,
+    experimental: i32,
+    out: *mut MxcStateAwareResultV2,
+) -> i32 {
+    if out.is_null() {
+        return MXC_STATUS_NULL_ARGUMENT;
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0, true)
+    }))
+    .unwrap_or_else(|panic| {
+        crate::report_panic("mxc_run_state_aware_json_v2", &*panic);
+        MxcStateAwareResultV2 {
+            result: MxcStateAwareResult::error(MXC_STATUS_PANIC, "the mxc engine panicked"),
+            error_details_json_utf8: ptr::null_mut(),
+        }
+    });
+    let status = result.result.status;
+    // SAFETY: the caller provides writable result storage.
+    unsafe { ptr::write(out, result) };
+    status
+}
+
+/// Free all owned strings in a V2 result. Repeated calls are safe.
+///
+/// # Safety
+/// `result` must be null or point to a result filled by the V2 entry point.
+#[no_mangle]
+pub unsafe extern "C" fn mxc_state_aware_result_v2_free(result: *mut MxcStateAwareResultV2) {
+    if result.is_null() {
+        return;
+    }
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller guarantees a valid result pointer.
+        unsafe {
+            (*result).result.free_strings();
+            free_cstr(&mut (*result).error_details_json_utf8);
+        }
+    })) {
+        crate::report_panic("mxc_state_aware_result_v2_free", &*panic);
     }
 }
 
@@ -226,6 +317,33 @@ pub unsafe extern "C" fn mxc_exec_state_aware_json(
             request_json_utf8,
             experimental,
             execute_lifecycle_json,
+            out_handle,
+            out_error,
+        )
+    }
+}
+
+/// Execute for captured output while retaining a cancellable process handle.
+///
+/// Applies the backend's capture limits without changing live-streaming calls.
+/// Drive and release the returned handle as for [`mxc_exec_state_aware_json`].
+///
+/// # Safety
+/// As for [`mxc_exec_state_aware_json`].
+#[no_mangle]
+pub unsafe extern "C" fn mxc_exec_state_aware_capture_json(
+    request_json_utf8: *const c_char,
+    experimental: i32,
+    out_handle: *mut *mut MxcSandbox,
+    out_error: *mut MxcErrorDetail,
+) -> i32 {
+    // SAFETY: forwarded under this function's own contract.
+    unsafe {
+        exec_streaming(
+            "mxc_exec_state_aware_capture_json",
+            request_json_utf8,
+            experimental,
+            execute_lifecycle_capture_json,
             out_handle,
             out_error,
         )
@@ -641,6 +759,42 @@ mod tests {
         };
         assert_eq!(status, out.status);
         out
+    }
+
+    #[test]
+    fn structured_recovery_results_are_independent_and_survive_until_freed() {
+        let mut first_error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "first");
+        let mut second_error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "second");
+        first_error.details = Some(Box::new(
+            serde_json::json!({"nvxRecovery": {"sandboxId": "id-one", "state": "provisioned"}}),
+        ));
+        second_error.details = Some(Box::new(
+            serde_json::json!({"nvxRecovery": {"sandboxId": "id-two", "state": "provisioned"}, "other": 2}),
+        ));
+        let mut first = result_v2_from_sdk_error(&first_error, true);
+        let mut second = result_v2_from_sdk_error(&second_error, true);
+        let read = |result: &MxcStateAwareResultV2| -> serde_json::Value {
+            // SAFETY: the live result owns a NUL-terminated UTF-8 string.
+            let json = unsafe { std::ffi::CStr::from_ptr(result.error_details_json_utf8) }
+                .to_str()
+                .unwrap();
+            serde_json::from_str(json).unwrap()
+        };
+        assert_eq!(read(&first), *first_error.details.unwrap());
+        assert_eq!(read(&second), *second_error.details.unwrap());
+        // SAFETY: both results were constructed by the same allocator.
+        unsafe {
+            mxc_state_aware_result_v2_free(&mut second);
+        }
+        assert_eq!(read(&first)["nvxRecovery"]["sandboxId"], "id-one");
+        // SAFETY: both result structs remain live and freeing twice is supported.
+        unsafe {
+            mxc_state_aware_result_v2_free(&mut first);
+            mxc_state_aware_result_v2_free(&mut second);
+            mxc_state_aware_result_v2_free(&mut first);
+        }
+        assert!(first.error_details_json_utf8.is_null());
+        assert!(second.error_details_json_utf8.is_null());
     }
 
     /// The state-aware result carries the same API detail as the

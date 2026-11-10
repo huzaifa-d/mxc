@@ -3,6 +3,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Microsoft.Mxc.Sdk;
 using Microsoft.Mxc.Sdk.V1;
 using Microsoft.Mxc.Sdk.Native;
@@ -64,6 +65,155 @@ public unsafe class NativeErrorTests
         Marshal.FreeCoTaskMem((IntPtr)detail.operation_utf8);
         Marshal.FreeCoTaskMem((IntPtr)detail.native_code_utf8);
         Marshal.FreeCoTaskMem((IntPtr)detail.remediation_utf8);
+    }
+
+    [Fact]
+    public void LifecycleDetailsAreDetachedAndNotIncludedInExceptionText()
+    {
+        var detail = Detail("cleanup failed for private-id", "operation private-id", "code private-id", "fix private-id");
+        var json = Utf8("{\"nvxRecovery\":{\"sandboxId\":\"private-id\",\"state\":\"provisioned\"}}");
+        MxcException ex;
+        try
+        {
+            ex = NativeError.ToExceptionWithDetails((int)ErrorCode.BackendError, detail, "fallback", json);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+        var details = Assert.IsType<JsonElement>(ex.Data["details"]);
+        Assert.Equal("private-id", details.GetProperty("nvxRecovery").GetProperty("sandboxId").GetString());
+        Assert.DoesNotContain("private-id", ex.Message);
+        Assert.DoesNotContain("private-id", ex.ToString());
+        Assert.DoesNotContain("private-id", ex.Operation);
+        Assert.DoesNotContain("private-id", ex.NativeCode);
+        Assert.DoesNotContain("private-id", ex.Remediation);
+    }
+
+    [Theory]
+    [InlineData("{")]
+    [InlineData("[]")]
+    [InlineData("null")]
+    public void InvalidLifecycleDetailsPreserveTheOriginalException(string jsonText)
+    {
+        var detail = Detail("original failure");
+        var json = Utf8(jsonText);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", json);
+            Assert.Equal(ErrorCode.BackendError, ex.Code);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Equal(ErrorCode.NotProvisioned, original.Code);
+            Assert.Equal("original error message withheld because native error details were malformed", original.Message);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123\"}} trailing")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-\\u003123\"}} trailing")]
+    [InlineData("{\"nvxRecovery\":{\"\\u0073andboxId\":\"nvx:secret-123\"}} trailing")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123")]
+    public void MalformedLifecycleDetailsRedactRecoveryIdFromOriginalFailure(string detailsJson)
+    {
+        var detail = Detail("cleanup failed for nvx:secret-123", "Nvx.Close", "0x1234", "Retry cleanup");
+        var json = Utf8(detailsJson);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", json);
+            Assert.Equal(ErrorCode.BackendError, ex.Code);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Equal(ErrorCode.NotProvisioned, original.Code);
+            Assert.Equal("original error message withheld because native error details were malformed", original.Message);
+            Assert.Equal("Nvx.Close", original.Operation);
+            Assert.Equal("0x1234", original.NativeCode);
+            Assert.Equal("Retry cleanup", original.Remediation);
+            Assert.Empty(ex.Data);
+            Assert.Empty(original.Data);
+            Assert.DoesNotContain("nvx:secret-123", ex.Message);
+            Assert.DoesNotContain("nvx:secret-123", ex.ToString());
+            Assert.DoesNotContain("nvx:secret-123", original.Message);
+            Assert.DoesNotContain("nvx:secret-123", original.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123", "nvx:secret-123")]
+    [InlineData("[]", "nvx:secret-123")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"microvm:0123456789abcdef0123456789abcdef", "microvm:0123456789abcdef0123456789abcdef")]
+    [InlineData("[]", "microvm:0123456789abcdef0123456789abcdef")]
+    [InlineData("[]", "MICROVM:0123456789abcdef0123456789abcdef")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"private-id", "private-id")]
+    [InlineData("{\"nvxRecovery\":{\"\\u0073andboxId\":\"private-id\"}} trailing", "private-id")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"private-\\u0069d\"}} trailing", "private-id")]
+    public void MalformedLifecycleDetailsRedactRecoveryIdFromMetadata(string detailsJson, string id)
+    {
+        var detail = Detail($"message {id}", $"op {id}", $"code {id}", $"fix {id}");
+        var json = Utf8(detailsJson);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", json);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Equal(ErrorCode.NotProvisioned, original.Code);
+            Assert.DoesNotContain(id, ex.ToString());
+            Assert.Null(original.Operation);
+            Assert.Null(original.NativeCode);
+            Assert.DoesNotContain(id, original.Remediation);
+            Assert.Contains("[redacted]", original.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Theory]
+    [InlineData("op:arbitrary", "normalcode")]
+    [InlineData("operation with space", "code:arbitrary")]
+    [InlineData("op\targs", "code\nargs")]
+    [InlineData("op\u0085args", "code\u0085args")]
+    public void MalformedDetailsWithholdParameterizedOperationAndNativeCode(string operation, string nativeCode)
+    {
+        var detail = Detail("failure", operation, nativeCode, "safe remediation");
+        var json = Utf8("[]");
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.BackendError, detail, "fallback", json);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Null(original.Operation);
+            if (nativeCode.Contains(':') || nativeCode.Any(char.IsWhiteSpace)) Assert.Null(original.NativeCode);
+            else Assert.Equal(nativeCode, original.NativeCode);
+            Assert.Equal("safe remediation", original.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Fact]
+    public void NullLifecycleDetailsLeaveTheOriginalFailureUnchanged()
+    {
+        var detail = Detail("original failure");
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", null);
+            Assert.Equal(ErrorCode.NotProvisioned, ex.Code);
+            Assert.False(ex.Data.Contains("details"));
+        }
+        finally { Free(detail); }
     }
 
     [Fact]
