@@ -123,16 +123,14 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
                     if ((Get-FileHash $actual).Hash -ne (Get-FileHash (Join-Path $nvx $file)).Hash) { throw "Content mismatch: $actual" }
                 }
             }
-            foreach ($rid in @('win-x64', 'win10-x64')) {
-                dotnet restore $project --source $feed --packages (Join-Path $root 'nvx-cache') --nologo -p:NuGetAudit=false -p:RuntimeIdentifier=$rid
-                if ($LASTEXITCODE -ne 0) { throw "$framework $rid NVX restore failed." }
-                dotnet build $project -c Release --no-restore --nologo -p:RuntimeIdentifier=$rid
-                if ($LASTEXITCODE -ne 0) { throw "$framework $rid NVX build failed." }
-                $nested = Join-Path $consumer "bin/Release/$framework/$rid/aci-edge-sandboxes/guest/deep/provenance.txt"
-                if (-not (Test-Path -LiteralPath $nested -PathType Leaf)) { throw "Missing RID output: $nested" }
-            }
+            dotnet restore $project --source $feed --packages (Join-Path $root 'nvx-cache') --nologo -p:NuGetAudit=false -p:RuntimeIdentifier=win-x64
+            if ($LASTEXITCODE -ne 0) { throw "$framework win-x64 NVX restore failed." }
+            dotnet build $project -c Release --no-restore --nologo -p:RuntimeIdentifier=win-x64
+            if ($LASTEXITCODE -ne 0) { throw "$framework win-x64 NVX build failed." }
+            $nested = Join-Path $consumer "bin/Release/$framework/win-x64/aci-edge-sandboxes/guest/deep/provenance.txt"
+            if (-not (Test-Path -LiteralPath $nested -PathType Leaf)) { throw "Missing RID output: $nested" }
             $errorOutput = & dotnet build $project -c Release --no-restore --nologo -p:RuntimeIdentifier=win-arm64 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0 -or $errorOutput -notmatch 'supports only the win-x64 or win10-x64 RuntimeIdentifier') { throw "Unsupported RID was not rejected by NVX target: $errorOutput" }
+            if ($LASTEXITCODE -eq 0 -or $errorOutput -notmatch 'supports only the win-x64 RuntimeIdentifier') { throw "Unsupported RID was not rejected by NVX target: $errorOutput" }
             $errorOutput = & dotnet build $project -c Release --no-restore --nologo -p:PlatformTarget=x86 2>&1 | Out-String
             if ($LASTEXITCODE -eq 0 -or $errorOutput -notmatch 'requires an x64 or AnyCPU PlatformTarget') { throw "Unsupported platform was not rejected by NVX target: $errorOutput" }
             Write-Host "$framework NVX package build, publish and negative platform checks passed."
