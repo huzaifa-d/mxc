@@ -10,6 +10,7 @@ const {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } = require("node:fs");
@@ -448,6 +449,7 @@ test("npm pack excludes NVX runtime and validation payloads without removing sup
   writeFileSync(script, [
     "$ErrorActionPreference = 'Stop'",
     `Copy-Item -LiteralPath ${quote(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes"))} -Destination ${quote(x64)} -Recurse`,
+    `Copy-Item -LiteralPath ${quote(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes"))} -Destination ${quote(join(binaryRoot, "arm64"))} -Recurse`,
   ].join("\n"));
   const copied = runScript(script, [], {});
   assert.equal(copied.status, 0, copied.output);
@@ -459,10 +461,18 @@ test("npm pack excludes NVX runtime and validation payloads without removing sup
   });
   assert.ifError(packed.error);
   assert.equal(packed.status, 0, packed.stdout + packed.stderr);
-  const files = JSON.parse(packed.stdout)[0].files.map(({ path }) => path).sort();
+  const packedInfo = JSON.parse(packed.stdout)[0];
+  const files = packedInfo.files.map(({ path }) => path).sort();
   assert.deepEqual(files, ["bin/x64/mxc_ffi.dll", "bin/x64/wxc-exec.exe", "package.json"]);
+  const archive = spawnSync("tar", ["-tzf", join(packageRoot, packedInfo.filename)], {
+    encoding: "utf8", timeout: 30_000,
+  });
+  assert.ifError(archive.error);
+  assert.equal(archive.status, 0, archive.stdout + archive.stderr);
+  assert.doesNotMatch(archive.stdout, /aci-edge-sandboxes/);
   const expected = fileDigests(result.bundle);
   assert.deepEqual(fileDigests(join(x64, "aci-edge-sandboxes")), expected);
+  assert.deepEqual(fileDigests(join(binaryRoot, "arm64", "aci-edge-sandboxes")), expected);
   assert.deepEqual(fileDigests(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes")), expected);
   assert.deepEqual(readFileSync(artifactSuite), validationSuite);
   assert.deepEqual(readFileSync(join(x64, "nvx-e2e-tests.exe")), validationSuite);
@@ -484,12 +494,42 @@ test("npm pack excludes NVX runtime and validation payloads without removing sup
   for (const { arch, name } of probeSuites) {
     assert.ok(unfilteredFiles.includes(`bin/${arch}/${name}`));
   }
-  assert.deepEqual(
-    unfilteredFiles
-      .filter((path) => path.startsWith("bin/x64/aci-edge-sandboxes/"))
-      .sort(),
-    result.inventory.map((path) => `bin/x64/aci-edge-sandboxes/${path}`).sort()
-  );
+  assert.deepEqual(unfilteredFiles.filter((path) => path.includes("aci-edge-sandboxes")), []);
+  assert.ok(unfilteredFiles.includes("bin/x64/mxc_ffi.dll"));
+  assert.ok(unfilteredFiles.includes("bin/x64/wxc-exec.exe"));
+
+  const runtimeRoot = join(result.directory, "node-nvx-runtime");
+  mkdirSync(runtimeRoot);
+  copyFileSync(join(root, "sdk", "node-nvx-runtime", "package.json"), join(runtimeRoot, "package.json"));
+  copyFileSync(join(root, "sdk", "node-nvx-runtime", "README.md"), join(runtimeRoot, "README.md"));
+  renameSync(join(x64, "aci-edge-sandboxes"), join(runtimeRoot, "aci-edge-sandboxes"));
+  assert.deepEqual(fileDigests(join(runtimeRoot, "aci-edge-sandboxes")), expected);
+  const runtimePack = spawnSync("npm pack --ignore-scripts --offline --json", {
+    cwd: runtimeRoot, shell: true, encoding: "utf8", timeout: 30_000,
+  });
+  assert.ifError(runtimePack.error);
+  assert.equal(runtimePack.status, 0, runtimePack.stdout + runtimePack.stderr);
+  const runtimeFiles = JSON.parse(runtimePack.stdout)[0].files.map(({ path }) => path);
+  assert.deepEqual(runtimeFiles.filter((path) => path.startsWith("aci-edge-sandboxes/")).sort(),
+    result.inventory.map((path) => `aci-edge-sandboxes/${path}`).sort());
+});
+
+test("npm pipelines stage NVX separately and inspect the base tarball before publishing", () => {
+  for (const file of [
+    [".github", "workflows", "Package.NpmSdk.Job.yml"],
+    [".azure-pipelines", "templates", "Package.NpmSdk.Job.yml"],
+  ]) {
+    const pipeline = readFileSync(join(root, ...file), "utf8");
+    const move = pipeline.indexOf("mv ");
+    const cleanup = pipeline.indexOf("rm -rf ", move);
+    const pack = pipeline.indexOf("npm pack --silent", cleanup);
+    const inspect = pipeline.indexOf("tar -tzf", pack);
+    assert.ok(move >= 0 && move < cleanup && cleanup < pack && pack < inspect, file.join("/"));
+    assert.match(pipeline.slice(move, cleanup), /bin\/x64\/aci-edge-sandboxes/);
+    assert.match(pipeline.slice(cleanup, pack), /bin\/\*\/aci-edge-sandboxes/);
+    assert.match(pipeline.slice(cleanup, pack), /bin\/\*\/symbols/);
+    assert.match(pipeline.slice(inspect), /\*aci-edge-sandboxes\*/);
+  }
 });
 
 for (const mode of ["absent", "empty", "missing-manifest"]) {

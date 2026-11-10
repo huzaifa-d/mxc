@@ -34,6 +34,7 @@
   },
   "files": [
     "bin/",
+    "!bin/**/aci-edge-sandboxes/**",
     "dist/",
     "LICENSE.md",
     "README.md"

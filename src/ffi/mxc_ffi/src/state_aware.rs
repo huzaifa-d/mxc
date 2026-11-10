@@ -78,12 +78,6 @@ pub struct MxcStateAwareResultV2 {
     pub error_details_json_utf8: *mut c_char,
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_LIFECYCLE_ERROR: std::cell::RefCell<Option<mxc_sdk::v1::Error>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 impl MxcStateAwareResult {
     #[cfg(test)]
     fn empty() -> Self {
@@ -180,11 +174,6 @@ fn state_aware_inner(
             }
         }
     };
-
-    #[cfg(test)]
-    if let Some(error) = TEST_LIFECYCLE_ERROR.with(|slot| slot.borrow_mut().take()) {
-        return result_v2_from_sdk_error(&error, include_details);
-    }
 
     match run_state_aware_json(request_json, dry_run, experimental) {
         Ok(response_json) => MxcStateAwareResultV2 {
@@ -790,7 +779,12 @@ mod tests {
         for (detail, out) in details.iter().zip([&mut first, &mut second]) {
             let mut error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "close failed");
             error.details = Some(Box::new(detail.clone()));
-            TEST_LIFECYCLE_ERROR.with(|slot| assert!(slot.replace(Some(error)).is_none()));
+            mxc_sdk::__ffi::set_lifecycle_error_for_test(
+                WINDOWS_SANDBOX_PROVISION_REQUEST,
+                false,
+                true,
+                error,
+            );
             // SAFETY: the request is a live C string and out is writable.
             let status = unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 1, out) };
             assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);

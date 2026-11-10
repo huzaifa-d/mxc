@@ -60,13 +60,29 @@ jobs:
 
       - run: npm ci
       - run: npm run build
-      - run: npm pack
+
+      - name: Stage optional NVX runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv bin/x64/aci-edge-sandboxes ../node-nvx-runtime/aci-edge-sandboxes
+          rm -rf bin/*/aci-edge-sandboxes bin/*/symbols
+
+      - name: Pack base SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(npm pack --silent)"
+          contents="$(tar -tzf "$package")"
+          if [[ "$contents" == *aci-edge-sandboxes* ]]; then
+            echo "Base SDK package unexpectedly contains NVX runtime assets" >&2
+            exit 1
+          fi
 
       - name: Pack optional NVX runtime
         shell: bash
         run: |
           set -euo pipefail
-          cp -R bin/x64/aci-edge-sandboxes ../node-nvx-runtime/
           cp ../../LICENSE.md ../node-nvx-runtime/
           (cd ../node-nvx-runtime && npm pack)
 
