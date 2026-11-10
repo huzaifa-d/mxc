@@ -238,8 +238,6 @@ fn module_candidates(directory: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-
 fn selected_bundle_with(
     directory: &Path,
     is_file: &impl Fn(&Path) -> bool,
@@ -248,6 +246,7 @@ fn selected_bundle_with(
     for path in [
         bundle.library().to_path_buf(),
         directory.join("bundle-manifest.json"),
+        directory.join("SOURCE-MANIFEST.json"),
         directory.join("SHA256SUMS"),
         directory.join(r"bin\openvmm.exe"),
         directory.join(r"bin\direct-images.exe"),
@@ -265,16 +264,31 @@ fn selected_bundle_with(
     Ok(bundle)
 }
 
-fn module_candidate_attributes(candidate: &Path) -> Result<Option<u32>, MxcError> {
-    use std::os::windows::fs::MetadataExt;
+fn module_candidate_exists(candidate: &Path) -> Result<bool, MxcError> {
     match std::fs::symlink_metadata(candidate) {
-        Ok(metadata) => Ok(Some(metadata.file_attributes())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(MxcError::backend_unavailable(format!(
             "cannot inspect NVX runtime directory {}: {error}",
             candidate.display()
         ))),
     }
+}
+
+fn require_module_directory(candidate: &Path) -> Result<(), MxcError> {
+    let metadata = std::fs::metadata(candidate).map_err(|error| {
+        MxcError::backend_unavailable(format!(
+            "cannot resolve NVX runtime directory {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(MxcError::backend_unavailable(format!(
+            "NVX runtime path {} is not a directory",
+            candidate.display()
+        )));
+    }
+    Ok(())
 }
 
 fn discover_bundle_from(
@@ -286,7 +300,8 @@ fn discover_bundle_from(
         configured,
         registered,
         module_path,
-        &module_candidate_attributes,
+        &module_candidate_exists,
+        &require_module_directory,
         &Path::is_file,
     )
 }
@@ -295,7 +310,8 @@ fn discover_bundle_from_with(
     configured: Option<&Path>,
     registered: Option<&Path>,
     module_path: impl FnOnce() -> Result<PathBuf, MxcError>,
-    candidate_attributes: &impl Fn(&Path) -> Result<Option<u32>, MxcError>,
+    candidate_exists: &impl Fn(&Path) -> Result<bool, MxcError>,
+    require_directory: &impl Fn(&Path) -> Result<(), MxcError>,
     is_file: &impl Fn(&Path) -> bool,
 ) -> Result<BundledAgent, MxcError> {
     if let Some(directory) = configured.or(registered) {
@@ -306,13 +322,8 @@ fn discover_bundle_from_with(
         MxcError::backend_unavailable("the native module has no parent directory")
     })?;
     for candidate in module_candidates(directory) {
-        if let Some(attributes) = candidate_attributes(&candidate)? {
-            if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(MxcError::backend_unavailable(format!(
-                    "NVX runtime directory {} is a reparse point",
-                    candidate.display()
-                )));
-            }
+        if candidate_exists(&candidate)? {
+            require_directory(&candidate)?;
             return selected_bundle_with(&candidate, is_file);
         }
     }
@@ -1043,7 +1054,7 @@ mod tests {
         })
         .is_ok());
         let files = files.into_inner();
-        assert_eq!(files.len(), 8);
+        assert_eq!(files.len(), 9);
         for missing in &files {
             let error = selected_bundle_with(directory, &|path| path != missing)
                 .err()
@@ -1063,6 +1074,7 @@ mod tests {
             None,
             || panic!("module lookup must not run"),
             &|_| panic!("module candidates must not be inspected"),
+            &|_| panic!("module candidates must not be resolved"),
             &|path| path.ends_with("aci_edge_agent.dll"),
         );
         let error = result.err().unwrap();
@@ -1071,7 +1083,18 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rejects_dangling_module_reparse_point_without_fallback() {
+    fn discovery_rejects_missing_source_manifest() {
+        let directory = Path::new(r"C:\incomplete-nvx-bundle");
+        let error =
+            selected_bundle_with(directory, &|path| !path.ends_with("SOURCE-MANIFEST.json"))
+                .err()
+                .unwrap();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("SOURCE-MANIFEST.json"));
+    }
+
+    #[test]
+    fn discovery_rejects_dangling_module_link_without_fallback() {
         let candidates_seen = std::cell::Cell::new(0);
         let result = discover_bundle_from_with(
             None,
@@ -1079,14 +1102,53 @@ mod tests {
             || Ok(PathBuf::from(r"C:\app\runtimes\win-x64\native\mxc_ffi.dll")),
             &|_| {
                 candidates_seen.set(candidates_seen.get() + 1);
-                Ok(Some(FILE_ATTRIBUTE_REPARSE_POINT))
+                Ok(true)
             },
-            &|_| panic!("reparse point must not be followed"),
+            &|_| Err(MxcError::backend_unavailable("dangling module link")),
+            &|_| panic!("invalid candidate must not be selected"),
         );
         let error = result.err().unwrap();
         assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
-        assert!(error.message.contains("reparse point"));
+        assert!(error.message.contains("dangling module link"));
         assert_eq!(candidates_seen.get(), 1);
+    }
+
+    #[test]
+    fn discovery_accepts_valid_module_link() {
+        let candidate = PathBuf::from(r"C:\app\runtimes\win-x64\native\aci-edge-sandboxes");
+        let candidates_seen = std::cell::Cell::new(0);
+        let bundle = discover_bundle_from_with(
+            None,
+            None,
+            || Ok(PathBuf::from(r"C:\app\runtimes\win-x64\native\mxc_ffi.dll")),
+            &|path| {
+                candidates_seen.set(candidates_seen.get() + 1);
+                assert_eq!(path, candidate);
+                Ok(true)
+            },
+            &|path| {
+                assert_eq!(path, candidate);
+                Ok(())
+            },
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(bundle.directory(), candidate);
+        assert_eq!(candidates_seen.get(), 1);
+    }
+
+    #[test]
+    fn module_candidate_metadata_distinguishes_directory_file_and_absence() {
+        let current = std::env::current_dir().unwrap();
+        let file = std::env::current_exe().unwrap();
+        assert!(module_candidate_exists(&current).unwrap());
+        assert!(require_module_directory(&current).is_ok());
+        assert!(module_candidate_exists(&file).unwrap());
+        assert_eq!(
+            require_module_directory(&file).unwrap_err().code,
+            MxcErrorCode::BackendUnavailable
+        );
+        assert!(!module_candidate_exists(&current.join("missing-nvx-candidate-for-test")).unwrap());
     }
 
     #[test]
