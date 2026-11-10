@@ -4,6 +4,10 @@
 import { afterEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { AbiErrorDetailType, type AbiErrorDetail } from '../../src/bindings/native-error.js';
+import { runBindingStateAwareRequestAsync } from '../../src/bindings/state-aware.js';
+import { MxcError } from '../../src/v1/errors.js';
 import koffi from 'koffi';
 import { _bootstrapNvxRuntimeForTest, _mxcFfiCandidates, loadMxcFfi } from '../../src/native-library.js';
 
@@ -141,4 +145,26 @@ describe('NVX optional runtime bootstrap', () => {
     missing.realpath = () => { throw new Error('missing aci-edge-sandboxes'); };
     assert.throws(() => _bootstrapNvxRuntimeForTest(native, missing, packageRoot), /missing aci-edge-sandboxes/);
   });
+});
+
+it('calls registration and lifecycle v2 through a real Windows DLL', {
+  skip: process.platform !== 'win32' || process.arch !== 'x64' ||
+    !_mxcFfiCandidates().some(candidate => fs.existsSync(candidate)),
+}, async () => {
+  const library = loadMxcFfi();
+  const register = library.handle.func('mxc_register_runtime_directory', 'int32_t', [
+    'const char *', 'const char *', koffi.out(koffi.pointer(AbiErrorDetailType)),
+  ]);
+  const free = library.handle.func('mxc_error_detail_free', 'void', [koffi.pointer(AbiErrorDetailType)]);
+  const error = {} as AbiErrorDetail;
+  try {
+    assert.notStrictEqual(register('unsupported-backend', process.cwd(), error), 0);
+  } finally {
+    free(error);
+    library.handle.unload();
+  }
+  await assert.rejects(runBindingStateAwareRequestAsync({
+    requestJson: '{"version":"1.0.0","phase":"start","sandboxId":"nosuchbackend:abc123"}',
+    dryRun: true, experimental: true,
+  }), (error: unknown) => error instanceof MxcError && error.code === 'unsupported_containment');
 });

@@ -66,3 +66,8 @@ Captured output is lossy UTF-8 text. Callers own and dispose live handles;
 existing-container execution leaves the container caller-owned.
 A descendant holding an output pipe open can delay captured execution
 completion after a workload timeout.
+
+MicroVM lifecycle capture limits stdout and stderr together to 64 MiB
+(67,108,864 bytes). Overflow returns `BackendError` and preserves the container.
+A provision failure after creation can include recovery information in
+`MxcException.Data["details"]` as a `JsonElement` for that call.

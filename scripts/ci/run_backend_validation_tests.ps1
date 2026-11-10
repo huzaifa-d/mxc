@@ -473,6 +473,33 @@ function Invoke-MicroVmTests {
             throw "MicroVM SDK validation did not execute the $scenario VM scenario."
         }
     }
+    $bundle = Join-Path $binaryDirectoryPath 'windows-sdk-bundle'
+    if (Test-Path -LiteralPath $bundle -PathType Container) {
+        foreach ($file in 'dotnet\Microsoft.Mxc.Sdk.Tests.exe', 'node\node.exe', 'sdk-integration\dist\nvx-json.test.js') {
+            Assert-File (Join-Path $bundle $file)
+        }
+        $previousNvx = $env:MXC_ENABLE_NVX_TESTS
+        try {
+            $env:MXC_ENABLE_NVX_TESTS = '1'
+            $failure = Invoke-XunitClasses -Bundle $bundle -Name 'microvm-json' -Classes 'MxcLifecycleNvxE2ETests' -RequiredMethods 'DevJson_NvxLifecycleCaptureAndLiveStreams'
+            if ($failure) { throw ".NET NVX JSON: $failure" }
+            # Explicit Node reporters can crash native NVX execution when the image is cached.
+            Push-Location (Join-Path $bundle 'sdk-integration')
+            try {
+                $nodeRun = Invoke-LoggedNative -FilePath (Join-Path $bundle 'node\node.exe') -LogName 'microvm-json-node.log' -ArgumentList @('--test', '--test-force-exit', 'dist\nvx-json.test.js')
+            } finally { Pop-Location }
+            $nodeOutput = Get-Content -LiteralPath $nodeRun.Log -Raw
+            if ($nodeRun.ExitCode -ne 0 -or
+                $nodeOutput -notmatch '(?m)^\s*✔ V1\.Dev NVX JSON lifecycle capture, live streams and overflow recovery \(' -or
+                $nodeOutput -notmatch '(?m)^\s*ℹ pass 1\s*$' -or
+                $nodeOutput -notmatch '(?m)^\s*ℹ fail 0\s*$' -or
+                $nodeOutput -notmatch '(?m)^\s*ℹ skipped 0\s*$') {
+                throw 'Node NVX JSON test did not pass without skips.'
+            }
+        } finally {
+            [Environment]::SetEnvironmentVariable('MXC_ENABLE_NVX_TESTS', $previousNvx)
+        }
+    }
 }
 
 Redirect-Temp

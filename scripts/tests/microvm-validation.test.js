@@ -142,6 +142,21 @@ fn main() {
         }
         return;
     }
+    if exe.file_name().unwrap() == "Microsoft.Mxc.Sdk.Tests.exe" {
+        assert_eq!(env::var("MXC_ENABLE_NVX_TESTS").unwrap(), "1");
+        let index = args.iter().position(|arg| arg == "-result-xml").unwrap();
+        let result = if mode == "managed-dotnet-skipped" { "Skip" } else { "Pass" };
+        std::fs::write(&args[index + 1], format!(r#"<assemblies><test type="Microsoft.Mxc.Sdk.Tests.V1.MxcLifecycleNvxE2ETests" method="DevJson_NvxLifecycleCaptureAndLiveStreams" result="{result}" /></assemblies>"#)).unwrap();
+        return;
+    }
+    if exe.file_name().unwrap() == "node.exe" {
+        assert_eq!(env::var("MXC_ENABLE_NVX_TESTS").unwrap(), "1");
+        assert!(args.contains(&"--test".to_owned()));
+        assert!(!args.iter().any(|arg| arg.starts_with("--test-reporter")));
+        println!("✔ V1.Dev NVX JSON lifecycle capture, live streams and overflow recovery (1ms)");
+        println!("ℹ pass 1\nℹ fail 0\nℹ skipped {}", if mode == "managed-node-skipped" { 1 } else { 0 });
+        return;
+    }
     if args.iter().any(|arg| arg == "crate_staged_bundle_opens_and_rejects_an_unverified_library") {
         if mode == "signature-failure" {
             eprintln!("fixture NVX signature validation failed");
@@ -597,6 +612,44 @@ for (const [mode, message] of [
     assert.match(result.output, message);
   });
 }
+
+function managedArtifact() {
+  const directory = artifact();
+  const bundle = join(directory, "windows-sdk-bundle");
+  mkdirSync(join(bundle, "dotnet"), { recursive: true });
+  mkdirSync(join(bundle, "node"), { recursive: true });
+  mkdirSync(join(bundle, "sdk-integration", "dist"), { recursive: true });
+  copyFileSync(fixture, join(bundle, "dotnet", "Microsoft.Mxc.Sdk.Tests.exe"));
+  copyFileSync(fixture, join(bundle, "node", "node.exe"));
+  writeFileSync(join(bundle, "sdk-integration", "dist", "nvx-json.test.js"), "");
+  return directory;
+}
+
+test("artifact dispatcher runs both managed NVX scenarios", () => {
+  const result = dispatch(managedArtifact());
+  assert.equal(result.status, 0, result.output);
+});
+
+for (const mode of ["managed-dotnet-skipped", "managed-node-skipped"]) {
+  test(`artifact dispatcher rejects ${mode}`, () => {
+    const result = dispatch(managedArtifact(), mode);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, /NVX JSON/);
+  });
+}
+
+test("artifact dispatcher rejects an incomplete managed SDK bundle", () => {
+  const directory = artifact();
+  mkdirSync(join(directory, "windows-sdk-bundle"));
+  const result = dispatch(directory);
+  assert.notEqual(result.status, 0, result.output);
+  assert.match(result.output, /Required CI artifact file is missing:[\s\S]*Microsoft\.Mxc\.Sdk\.Tests\.exe/);
+});
+
+test("scheduled MicroVM lane downloads the Windows SDK bundle", () => {
+  const workflow = readFileSync(join(root, ".github", "workflows", "Validation.Tests.Matrix.Job.yml"), "utf8");
+  assert.match(workflow, /matrix\.backend == 'microvm'/);
+});
 
 test("artifact dispatcher rejects a missing test payload", () => {
   const directory = artifact();

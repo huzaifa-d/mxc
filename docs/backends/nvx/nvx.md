@@ -39,8 +39,9 @@ guest images, and provenance files. Do not substitute a standalone OpenVMM
 executable or a partial bundle.
 
 Windows x64 Azure build artifacts, release ZIPs, and VPack artifacts include
-this complete directory beside the executor. The Node SDK package excludes
-it because typed V1 does not support MicroVM targeting. The bundle retains the
+this complete directory beside the executor. Node and .NET callers can install
+the optional `@microsoft/mxc-sdk-nvx-runtime-win32-x64` or
+`Microsoft.Mxc.Sdk.Nvx.Runtime` package respectively for JSON requests. The bundle retains the
 NVX release's signatures and pinned hashes; MXC's executable-signing step does
 not modify it.
 
@@ -221,15 +222,15 @@ credentials. The error code and failed operation are still reported.
 If provision succeeds but close fails, MXC retains the provisioned container
 and returns its ID in Rust `Error.details.nvxRecovery.sandboxId`, with
 `details.nvxRecovery.state` recording the last-known state, `"provisioned"`.
-Use that ID to continue or deprovision through Rust `v1::dev` JSON; do not retry
-provision. Treat the ID as sensitive; ordinary error formatting omits it.
+Use that ID to continue or deprovision through the development JSON APIs; do
+not retry provision. Treat the ID as sensitive; ordinary error formatting omits it.
 Pre-existing error details are retained under `details.primaryDetails`.
 These fields are part of the experimental Rust `v1::dev` behaviour and may
 change as the development API evolves.
 
-The existing C ABI does not expose structured `Error.details`. C-backed Node
-and .NET callers therefore do not receive this recovery ID when provision
-succeeds but close fails, even though the container remains provisioned.
+Node callers receive recovery information in `MxcError.details.nvxRecovery`;
+.NET callers receive it as a `JsonElement` in `MxcException.Data["details"]`. These details belong
+to the failing call.
 
 A workload timeout preserves captured partial output and tears down the
 create-and-run container. Live execution starts its workload deadline only

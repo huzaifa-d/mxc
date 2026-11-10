@@ -26,6 +26,20 @@ require the runtime for their application target; self-contained applications
 include their runtime.
 Backend-specific operating-system requirements still apply.
 
+## MicroVM JSON requests
+
+On Windows x64 with Windows Hypervisor Platform enabled, install the optional
+`Microsoft.Mxc.Sdk.Nvx.Runtime` package at the same version as the SDK. Then:
+
+```csharp
+using Microsoft.Mxc.Sdk.V1.Dev;
+
+var result = await MxcContainer.RunJsonAsync(
+    """{"version":"1.1.0-alpha","containment":"microvm","microvm":{"image":"mcr.microsoft.com/azurelinux/base/core:3.0"},"process":{"commandLine":"echo hello","timeout":30000}}""",
+    new JsonOptions { Experimental = true });
+Console.WriteLine(result.Stdout);
+```
+
 ## Run to completion
 
 ```csharp

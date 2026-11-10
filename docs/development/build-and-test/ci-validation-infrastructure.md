@@ -777,3 +777,7 @@ jobs:
 - **All OS build jobs must pass** before validation testing happens. 
 - **Artifacts live one day.** Re-running a test job long after the build has
   expired fails at download; re-run the whole workflow instead.
+
+The Windows x64 MicroVM scheduled lane also runs Node and .NET development
+JSON creation and lifecycle scenarios from the Windows SDK bundle, including
+live streams and Node capture overflow followed by container reuse.
