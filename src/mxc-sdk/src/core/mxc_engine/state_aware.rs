@@ -142,6 +142,15 @@ pub fn run_state_aware(
         crate::mxc_common::models::ContainmentBackend::MicroVm => {
             let bound = crate::mxc_common::state_aware_binding::bind_microvm(parsed)?;
             let mut runner = crate::backend_modules::nvx::state_aware::NvxStateAwareRunner::new();
+            #[cfg(feature = "test-support")]
+            if let Some((sandbox_id, primary_details)) =
+                crate::backend_modules::nvx::state_aware::take_recovery_for_test()
+            {
+                runner.configure_recovery_for_test(&sandbox_id)?;
+                let mut error = MxcError::backend_error("injected primary failure");
+                error.details = Some(primary_details);
+                return runner.finish(Err(error));
+            }
             let outcome = crate::mxc_common::state_aware_dispatch::dispatch_state_aware(
                 &mut runner,
                 bound,

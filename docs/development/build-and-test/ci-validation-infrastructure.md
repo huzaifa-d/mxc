@@ -780,4 +780,6 @@ jobs:
 
 The Windows x64 MicroVM scheduled lane also runs Node and .NET development
 JSON creation and lifecycle scenarios from the Windows SDK bundle, including
-live streams and Node capture overflow followed by container reuse.
+live streams and Node capture overflow followed by container reuse. These
+managed scenarios discover their packaged NVX runtimes with `MXC_FFI_DIR` and
+`ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR` cleared.

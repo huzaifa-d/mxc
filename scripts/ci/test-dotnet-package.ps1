@@ -13,10 +13,12 @@ $root = Join-Path $tempRoot "dotnet-package-smoke-$([guid]::NewGuid())"
 $feed = Join-Path $root 'feed'
 $version = '0.0.0-package-smoke'
 $originalFfiDir = $env:MXC_FFI_DIR
+$originalAgentDir = $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR
 
 Push-Location (Join-Path $repoRoot 'sdk\dotnet')
 try {
     $env:MXC_FFI_DIR = ''
+    $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = ''
     if (-not $NvxOnly) {
         dotnet pack Microsoft.Mxc.Sdk -c $Configuration --no-restore -o $feed --nologo -p:PackageVersion=$version -p:MxcPackSingleRid=true
         if ($LASTEXITCODE -ne 0) { throw "Packing the SDK exited $LASTEXITCODE" }
@@ -163,10 +165,83 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
         $nested = Join-Path $application 'bin/Release/net10.0/aci-edge-sandboxes/guest/deep/provenance.txt'
         if (-not (Test-Path -LiteralPath $nested -PathType Leaf)) { throw "Missing transitive NVX output: $nested" }
         Write-Host 'Transitive NVX package copy passed.'
+
+        # Use real packages and a fresh process to prove module-relative discovery.
+        $realFeed = Join-Path $root 'real-feed'
+        New-Item -ItemType Directory -Force -Path $realFeed | Out-Null
+        $nativeTarget = Join-Path $repoRoot 'src\target'
+        $nativeDir = Join-Path $nativeTarget 'x86_64-pc-windows-msvc\debug'
+        Push-Location (Join-Path $repoRoot 'src')
+        try {
+            cargo build -p mxc_ffi --features 'dotnetsdk,mxc-sdk/microvm' --target x86_64-pc-windows-msvc --target-dir $nativeTarget
+            if ($LASTEXITCODE -ne 0) { throw 'Building the real NVX-enabled mxc_ffi.dll failed.' }
+        } finally { Pop-Location }
+        $realRuntime = Join-Path $nativeDir 'aci-edge-sandboxes'
+        foreach ($file in (Join-Path $nativeDir 'mxc_ffi.dll'), (Join-Path $realRuntime 'bundle-manifest.json'), (Join-Path $realRuntime 'bin\aci_edge_agent.dll')) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing real NVX test asset: $file" }
+        }
+        dotnet pack Microsoft.Mxc.Sdk -c $Configuration --no-restore -o $realFeed --nologo "-p:PackageVersion=$version" -p:MxcPackSingleRid=true "-p:MxcPrebuiltNativeDir=$nativeDir"
+        if ($LASTEXITCODE -ne 0) { throw 'Packing the real base SDK failed.' }
+        nuget pack $nuspec -OutputDirectory $realFeed -NonInteractive -Properties "version=$version;nvxRuntime=$realRuntime;repositoryRoot=$repoRoot"
+        if ($LASTEXITCODE -ne 0) { throw 'Packing the real NVX runtime failed.' }
+        $realConsumer = Join-Path $root 'real-nvx-consumer'
+        New-Item -ItemType Directory -Force -Path $realConsumer | Out-Null
+        @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup><PackageReference Include="Microsoft.Mxc.Sdk.Nvx.Runtime" Version="$version" /></ItemGroup>
+</Project>
+"@ | Set-Content (Join-Path $realConsumer 'Consumer.csproj')
+        @'
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Microsoft.Mxc.Sdk.V1;
+
+if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MXC_FFI_DIR")) ||
+    !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR")))
+    throw new Exception("Native discovery overrides must be empty.");
+var support = MxcPlatform.GetPlatformSupport();
+var backends = MxcPlatform.GetAvailableBackends();
+var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
+    .Single(module => string.Equals(module.ModuleName, "mxc_ffi.dll", StringComparison.OrdinalIgnoreCase));
+if (!Path.GetFullPath(native.FileName).StartsWith(Path.GetFullPath(AppContext.BaseDirectory), StringComparison.OrdinalIgnoreCase))
+    throw new Exception("The consumer did not load its packaged mxc_ffi.dll.");
+var whp = false;
+try { whp = Hypervisor.Present(); } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
+var found = backends.Any(backend => backend.Backend == ContainmentBackend.MicroVm);
+if (whp && found != (args[0] == "present"))
+    throw new Exception($"Module-relative NVX discovery mismatch: expected {args[0]}, found={found}");
+Console.WriteLine($"Native discovery passed: supported={support.IsSupported}, hypervisor={whp}, microvm={found}, expected={args[0]}");
+
+static class Hypervisor
+{
+    [DllImport("WinHvPlatform.dll", ExactSpelling = true)]
+    private static extern int WHvGetCapability(uint code, out int value, uint size, out uint written);
+    internal static bool Present() => WHvGetCapability(0, out var value, sizeof(int), out var written) >= 0 && written == sizeof(int) && value != 0;
+}
+'@ | Set-Content (Join-Path $realConsumer 'Program.cs')
+        $realProject = Join-Path $realConsumer 'Consumer.csproj'
+        dotnet restore $realProject --source $realFeed --packages (Join-Path $root 'real-cache') --nologo -p:NuGetAudit=false
+        if ($LASTEXITCODE -ne 0) { throw 'Restoring the real packaged NVX consumer failed.' }
+        $realPublish = Join-Path $realConsumer 'publish'
+        dotnet publish $realProject -c Release --no-restore --self-contained false --nologo -o $realPublish
+        if ($LASTEXITCODE -ne 0) { throw 'Publishing the real packaged NVX consumer failed.' }
+        $realExe = Join-Path $realPublish 'Consumer.exe'
+        $publishedRuntime = Join-Path $realPublish 'aci-edge-sandboxes'
+        if (-not (Test-Path -LiteralPath (Join-Path $publishedRuntime 'bundle-manifest.json') -PathType Leaf)) { throw 'Real NVX runtime was not copied into the published consumer.' }
+        & $realExe present
+        if ($LASTEXITCODE -ne 0) { throw 'Real packaged NVX discovery failed.' }
+        Rename-Item -LiteralPath $publishedRuntime -NewName 'aci-edge-sandboxes-disabled'
+        try {
+            & $realExe absent
+            if ($LASTEXITCODE -ne 0) { throw 'Missing packaged NVX runtime was not detected.' }
+        } finally { Rename-Item -LiteralPath (Join-Path $realPublish 'aci-edge-sandboxes-disabled') -NewName 'aci-edge-sandboxes' }
+        Write-Host 'Real packaged .NET NVX discovery passed with overrides cleared.'
     } elseif ($NvxOnly) { throw 'NVX package consumer test requires a Windows x64 host.' }
 }
 finally {
     $env:MXC_FFI_DIR = $originalFfiDir
+    $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = $originalAgentDir
     Pop-Location
     if (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force

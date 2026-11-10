@@ -5,6 +5,8 @@ import { afterEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { AbiErrorDetailType, type AbiErrorDetail } from '../../src/bindings/native-error.js';
 import { runBindingStateAwareRequestAsync } from '../../src/bindings/state-aware.js';
 import { MxcError } from '../../src/v1/errors.js';
@@ -167,4 +169,73 @@ it('calls registration and lifecycle v2 through a real Windows DLL', {
     requestJson: '{"version":"1.0.0","phase":"start","sandboxId":"nosuchbackend:abc123"}',
     dryRun: true, experimental: true,
   }), (error: unknown) => error instanceof MxcError && error.code === 'unsupported_containment');
+});
+
+const packagedTestCandidates = process.platform === 'win32' && process.arch === 'x64'
+  ? (process.env.MXC_NVX_TEST_DLL ? [path.resolve(process.env.MXC_NVX_TEST_DLL)] : _mxcFfiCandidates())
+  : [];
+const packagedTestLibrary = packagedTestCandidates.find(candidate => fs.existsSync(candidate)
+  && fs.existsSync(path.join(path.dirname(candidate), 'aci-edge-sandboxes', 'bundle-manifest.json')));
+
+it('discovers the installed NVX package through the real native DLL without overrides', {
+  skip: process.platform !== 'win32' || process.arch !== 'x64' ||
+    (!packagedTestLibrary && !process.env.MXC_NVX_TEST_DLL),
+}, (t) => {
+  assert.ok(packagedTestLibrary, 'the selected NVX test DLL and runtime bundle must exist');
+  const sdkRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const library = packagedTestLibrary;
+  const fixture = fs.mkdtempSync(path.join(sdkRoot, '.nvx-packaged-discovery-'));
+  try {
+    fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
+    const modules = path.join(fixture, 'node_modules', '@microsoft');
+    const sdk = path.join(modules, 'mxc-sdk');
+    const runtime = path.join(modules, 'mxc-sdk-nvx-runtime-win32-x64');
+    fs.mkdirSync(path.join(sdk, 'bin', 'x64'), { recursive: true });
+    fs.mkdirSync(runtime, { recursive: true });
+    fs.cpSync(path.join(sdkRoot, 'dist-tests', 'src'), path.join(sdk, 'dist'), { recursive: true });
+    fs.copyFileSync(path.join(sdkRoot, 'package.json'), path.join(sdk, 'package.json'));
+    fs.copyFileSync(library, path.join(sdk, 'bin', 'x64', 'mxc_ffi.dll'));
+    fs.copyFileSync(path.join(sdkRoot, '..', 'node-nvx-runtime', 'package.json'), path.join(runtime, 'package.json'));
+    fs.cpSync(path.join(path.dirname(library), 'aci-edge-sandboxes'), path.join(runtime, 'aci-edge-sandboxes'), { recursive: true });
+    const script = `
+      import assert from 'node:assert/strict';
+      import path from 'node:path';
+      import fs from 'node:fs';
+      import { createRequire } from 'node:module';
+      import koffi from 'koffi';
+      import { getPlatformSupport, getAvailableBackends } from '@microsoft/mxc-sdk/v1';
+      assert.ok(!process.env.MXC_FFI_DIR && !process.env.ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR);
+      const require = createRequire(import.meta.url);
+      for (const name of ['mxc-sdk', 'mxc-sdk-nvx-runtime-win32-x64']) {
+        assert.equal(fs.realpathSync(require.resolve('@microsoft/' + name + '/package.json')),
+          fs.realpathSync(path.resolve('node_modules/@microsoft', name, 'package.json')));
+      }
+      assert.equal(typeof getPlatformSupport().isSupported, 'boolean');
+      assert.ok(Array.isArray(getAvailableBackends()));
+      const native = koffi.load(path.resolve('node_modules/@microsoft/mxc-sdk/bin/x64/mxc_ffi.dll'));
+      const detailType = koffi.struct('NvxPackageSmokeError', {
+        message: 'void *', operation: 'void *', nativeCode: 'void *', remediation: 'void *',
+      });
+      const register = native.func('mxc_register_runtime_directory', 'int32_t',
+        ['const char *', 'const char *', koffi.out(koffi.pointer(detailType))]);
+      const free = native.func('mxc_error_detail_free', 'void', [koffi.pointer(detailType)]);
+      const detail = {};
+      try { assert.equal(register('microvm', process.cwd(), detail), 11); }
+      finally { free(detail); native.unload(); }
+    `;
+    const env: NodeJS.ProcessEnv = { ...process.env, MXC_FFI_DIR: '', ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR: '' };
+    delete env.MXC_NVX_TEST_DLL;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: fixture, env, encoding: 'utf8', timeout: 60_000,
+    });
+    assert.ifError(child.error);
+    if (!process.env.MXC_NVX_TEST_DLL && child.status !== 0 &&
+      child.stderr.includes('MicroVM runtime is unavailable on this platform')) {
+      t.skip('the discovered native DLL was built without MicroVM');
+      return;
+    }
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
 });

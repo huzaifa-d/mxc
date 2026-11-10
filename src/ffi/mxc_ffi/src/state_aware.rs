@@ -762,8 +762,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     fn v2_entrypoint_keeps_populated_recovery_results_independently_owned() {
-        let request = CString::new(WINDOWS_SANDBOX_PROVISION_REQUEST).unwrap();
+        let request = CString::new(
+            r#"{"version":"1.1.0-alpha","phase":"provision","containment":"microvm","microvm":{"image":"mcr.microsoft.com/azurelinux/base/core:3.0"}}"#,
+        ).unwrap();
         let details = [
             serde_json::json!({"nvxRecovery": {"sandboxId": "microvm:0123456789abcdef0123456789abcdef", "state": "provisioned"}, "primaryDetails": {"reason": "first"}}),
             serde_json::json!({"nvxRecovery": {"sandboxId": "microvm:fedcba9876543210fedcba9876543210", "state": "provisioned"}, "primaryDetails": {"reason": "second"}}),
@@ -777,18 +780,27 @@ mod tests {
             error_details_json_utf8: ptr::null_mut(),
         };
         for (detail, out) in details.iter().zip([&mut first, &mut second]) {
-            let mut error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "close failed");
-            error.details = Some(Box::new(detail.clone()));
-            mxc_sdk::__ffi::set_lifecycle_error_for_test(
-                WINDOWS_SANDBOX_PROVISION_REQUEST,
-                false,
-                true,
-                error,
+            mxc_sdk::__ffi::set_nvx_recovery_for_test(
+                detail["nvxRecovery"]["sandboxId"].as_str().unwrap(),
+                detail["primaryDetails"].clone(),
             );
             // SAFETY: the request is a live C string and out is writable.
             let status = unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 1, out) };
             assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
             assert_eq!(out.result.status, status);
+            assert!(!out.result.error.message_utf8.is_null());
+            assert!(!out.result.error.remediation_utf8.is_null());
+            // SAFETY: the live V2 result owns these NUL-terminated strings.
+            let message = unsafe { std::ffi::CStr::from_ptr(out.result.error.message_utf8) }
+                .to_str()
+                .unwrap();
+            let remediation =
+                unsafe { std::ffi::CStr::from_ptr(out.result.error.remediation_utf8) }
+                    .to_str()
+                    .unwrap();
+            assert!(message.contains("cleanup failure: "));
+            assert!(message.contains("NVX close failed"));
+            assert!(remediation.contains("container is retained"));
         }
         let read = |result: &MxcStateAwareResultV2| -> serde_json::Value {
             assert!(!result.error_details_json_utf8.is_null());

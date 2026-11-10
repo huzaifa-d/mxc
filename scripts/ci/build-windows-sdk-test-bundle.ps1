@@ -198,6 +198,20 @@ foreach ($name in 'bin', 'dist', 'node_modules', 'package.json', 'LICENSE.md') {
     }
 }
 
+if ($Architecture -eq 'x64') {
+    $nvxRuntime = Join-Path (Split-Path -Parent $nativeLibrary) 'aci-edge-sandboxes'
+    if (-not (Test-Path -LiteralPath (Join-Path $nvxRuntime 'bundle-manifest.json') -PathType Leaf)) {
+        throw "The MicroVM build did not stage its runtime at $nvxRuntime."
+    }
+    Copy-Item -LiteralPath $nvxRuntime -Destination $dotnetOut -Recurse -Force
+    $nestedRuntime = Join-Path $sdkOut 'node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64'
+    if (Test-Path -LiteralPath $nestedRuntime) { Remove-Item -LiteralPath $nestedRuntime -Recurse -Force }
+    $runtimePackage = New-Directory (Join-Path $modulesOut '@microsoft\mxc-sdk-nvx-runtime-win32-x64')
+    $runtimeSource = Join-Path $repoRoot 'sdk\node-nvx-runtime'
+    Copy-Item -LiteralPath (Join-Path $runtimeSource 'package.json'), (Join-Path $runtimeSource 'README.md') -Destination $runtimePackage
+    Copy-Item -LiteralPath $nvxRuntime -Destination $runtimePackage -Recurse -Force
+}
+
 $manifest = [ordered]@{
     format_version = 1
     produced_at    = [DateTime]::UtcNow.ToString('o')
@@ -243,6 +257,15 @@ $required = @(
     'test_scripts\run_isolation_session_state_aware_tests.ps1',
     'test_scripts\run_isolation_session_resize_smoke.ps1'
 )
+if ($Architecture -eq 'x64') {
+    $required += @(
+        'dotnet\aci-edge-sandboxes\bundle-manifest.json',
+        'dotnet\aci-edge-sandboxes\bin\aci_edge_agent.dll',
+        'sdk-integration\node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64\package.json',
+        'sdk-integration\node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64\aci-edge-sandboxes\bundle-manifest.json',
+        'sdk-integration\node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64\aci-edge-sandboxes\bin\aci_edge_agent.dll'
+    )
+}
 $required += @($helperPaths | ForEach-Object { Join-Path 'test_scripts' $_ })
 foreach ($relativePath in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory $relativePath) -PathType Leaf)) {

@@ -477,31 +477,19 @@ pub mod __ffi {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    thread_local! {
-        static TEST_LIFECYCLE_ERROR: std::cell::RefCell<Option<(String, bool, bool, Error)>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Inject an SDK lifecycle error for a single call on the current thread.
+    /// Configure one synthetic NVX cleanup failure on the current thread.
     #[doc(hidden)]
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_lifecycle_error_for_test(
-        request_json: &str,
-        dry_run: bool,
-        experimental: bool,
-        error: Error,
-    ) {
-        TEST_LIFECYCLE_ERROR.with(|slot| {
-            assert!(slot
-                .replace(Some((
-                    request_json.to_owned(),
-                    dry_run,
-                    experimental,
-                    error
-                )))
-                .is_none());
-        });
+    #[cfg(all(
+        feature = "test-support",
+        target_os = "windows",
+        target_arch = "x86_64",
+        feature = "microvm"
+    ))]
+    pub fn set_nvx_recovery_for_test(sandbox_id: &str, primary_details: serde_json::Value) {
+        crate::backend_modules::nvx::state_aware::set_recovery_for_test(
+            sandbox_id,
+            primary_details,
+        );
     }
 
     /// Run an [MXC lifecycle JSON request](https://github.com/microsoft/mxc/blob/main/docs/development/architecture/container-lifecycle.md#raw-json-entry-points) and return its JSON response envelope.
@@ -510,15 +498,6 @@ pub mod __ffi {
         dry_run: bool,
         experimental: bool,
     ) -> Result<String, Error> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some((expected_json, expected_dry_run, expected_experimental, error)) =
-            TEST_LIFECYCLE_ERROR.with(|slot| slot.borrow_mut().take())
-        {
-            assert_eq!(request_json, expected_json);
-            assert_eq!(dry_run, expected_dry_run);
-            assert_eq!(experimental, expected_experimental);
-            return Err(error);
-        }
         crate::mxc_engine::run_state_aware_json(request_json, dry_run, experimental)
     }
 

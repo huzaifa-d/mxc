@@ -145,6 +145,8 @@ fn main() {
     }
     if exe.file_name().unwrap() == "Microsoft.Mxc.Sdk.Tests.exe" {
         assert_eq!(env::var("MXC_ENABLE_NVX_TESTS").unwrap(), "1");
+        assert!(env::var("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR").unwrap_or_default().is_empty());
+        assert!(env::var("MXC_FFI_DIR").unwrap_or_default().is_empty());
         let index = args.iter().position(|arg| arg == "-result-xml").unwrap();
         let result = if mode == "managed-dotnet-skipped" { "Skip" } else { "Pass" };
         std::fs::write(&args[index + 1], format!(r#"<assemblies><test type="Microsoft.Mxc.Sdk.Tests.V1.MxcLifecycleNvxE2ETests" method="DevJson_NvxLifecycleCaptureAndLiveStreams" result="{result}" /></assemblies>"#)).unwrap();
@@ -152,6 +154,8 @@ fn main() {
     }
     if exe.file_name().unwrap() == "node.exe" {
         assert_eq!(env::var("MXC_ENABLE_NVX_TESTS").unwrap(), "1");
+        assert!(env::var("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR").unwrap_or_default().is_empty());
+        assert!(env::var("MXC_FFI_DIR").unwrap_or_default().is_empty());
         assert!(args.contains(&"--test".to_owned()));
         assert!(!args.iter().any(|arg| arg.starts_with("--test-reporter")));
         println!("✔ V1.Dev NVX JSON lifecycle capture, live streams and overflow recovery (1ms)");
@@ -202,6 +206,10 @@ fn main() {
             println!("windows_network::signed_bundle_deny_default_proxy_policy: test");
         }
         return;
+    }
+    if exe.file_name().unwrap() == "nvx-e2e-tests.exe" {
+        let expected = exe.parent().unwrap().join("aci-edge-sandboxes");
+        assert_eq!(Path::new(&env::var("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR").unwrap()), expected);
     }
     assert!(args.contains(&"--include-ignored".to_owned()));
     assert!(args.contains(&"--nocapture".to_owned()));
@@ -289,6 +297,8 @@ function dispatch(directory, mode = "", architecture = "x64") {
     ],
     {
       MXC_CI_FIXTURE_MODE: mode,
+      ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR: "poisoned-runtime-override",
+      MXC_FFI_DIR: "poisoned-ffi-override",
     }
   );
 }
@@ -662,6 +672,16 @@ function managedArtifact() {
   copyFileSync(fixture, join(bundle, "dotnet", "Microsoft.Mxc.Sdk.Tests.exe"));
   copyFileSync(fixture, join(bundle, "node", "node.exe"));
   writeFileSync(join(bundle, "sdk-integration", "dist", "nvx-json.test.js"), "");
+  for (const relative of [
+    ["dotnet", "aci-edge-sandboxes"],
+    ["sdk-integration", "node_modules", "@microsoft", "mxc-sdk-nvx-runtime-win32-x64", "aci-edge-sandboxes"],
+  ]) {
+    const runtime = join(bundle, ...relative);
+    mkdirSync(join(runtime, "bin"), { recursive: true });
+    writeFileSync(join(runtime, "bundle-manifest.json"), "{}");
+    writeFileSync(join(runtime, "bin", "aci_edge_agent.dll"), "fixture");
+  }
+  writeFileSync(join(bundle, "sdk-integration", "node_modules", "@microsoft", "mxc-sdk-nvx-runtime-win32-x64", "package.json"), "{}");
   return directory;
 }
 

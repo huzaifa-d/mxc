@@ -13,11 +13,33 @@ use crate::mxc_common::state_aware_backend::{
 use super::runtime::PreparedProvision;
 use super::runtime::{NvxClient, SandboxClient, SandboxId};
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static TEST_RECOVERY: std::cell::RefCell<Option<(String, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn set_recovery_for_test(sandbox_id: &str, primary_details: Value) {
+    TEST_RECOVERY.with(|slot| {
+        assert!(slot
+            .replace(Some((sandbox_id.to_owned(), primary_details)))
+            .is_none());
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn take_recovery_for_test() -> Option<(String, Value)> {
+    TEST_RECOVERY.with(|slot| slot.borrow_mut().take())
+}
+
 pub(crate) struct NvxStateAwareRunner {
     client: std::cell::RefCell<Option<NvxClient>>,
     capture_limit: Option<usize>,
     provisioned_id: std::cell::RefCell<Option<SandboxId>>,
     sensitive_proxy: std::cell::Cell<bool>,
+    #[cfg(feature = "test-support")]
+    test_close_error: Option<MxcError>,
 }
 
 impl NvxStateAwareRunner {
@@ -27,6 +49,8 @@ impl NvxStateAwareRunner {
             capture_limit: None,
             provisioned_id: std::cell::RefCell::new(None),
             sensitive_proxy: std::cell::Cell::new(true),
+            #[cfg(feature = "test-support")]
+            test_close_error: None,
         }
     }
 
@@ -57,6 +81,13 @@ impl NvxStateAwareRunner {
             .ok_or_else(|| MxcError::backend_error("NVX lifecycle client was already consumed"))
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) fn configure_recovery_for_test(&mut self, sandbox_id: &str) -> Result<(), MxcError> {
+        *self.provisioned_id.get_mut() = Some(SandboxId::from_mxc(sandbox_id)?);
+        self.test_close_error = Some(MxcError::backend_error("injected NVX close failure"));
+        Ok(())
+    }
+
     pub(crate) fn finish<T>(&mut self, primary: Result<T, MxcError>) -> Result<T, MxcError> {
         let cleanup = self
             .client
@@ -68,6 +99,18 @@ impl NvxStateAwareRunner {
             })
             .into_iter()
             .collect();
+        #[cfg(feature = "test-support")]
+        let cleanup = {
+            let mut cleanup: Vec<MxcError> = cleanup;
+            if let Some(error) = self.test_close_error.take() {
+                cleanup.push(super::runner::protect_native_error(
+                    error,
+                    "close",
+                    self.sensitive_proxy.get(),
+                ));
+            }
+            cleanup
+        };
         let mut result = super::runner::finish_run(
             primary,
             cleanup,

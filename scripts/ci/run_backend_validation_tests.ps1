@@ -443,13 +443,22 @@ function Invoke-MicroVmTests {
     $tests = Join-Path $binaryDirectoryPath 'nvx-e2e-tests.exe'
     Assert-File -Path $tests
     $bundle = Join-Path $binaryDirectoryPath 'windows-sdk-bundle'
-    foreach ($file in 'dotnet\Microsoft.Mxc.Sdk.Tests.exe', 'node\node.exe', 'sdk-integration\dist\nvx-json.test.js') {
+    foreach ($file in 'dotnet\Microsoft.Mxc.Sdk.Tests.exe', 'node\node.exe', 'sdk-integration\dist\nvx-json.test.js',
+        'dotnet\aci-edge-sandboxes\bundle-manifest.json', 'dotnet\aci-edge-sandboxes\bin\aci_edge_agent.dll',
+        'sdk-integration\node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64\package.json',
+        'sdk-integration\node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64\aci-edge-sandboxes\bundle-manifest.json',
+        'sdk-integration\node_modules\@microsoft\mxc-sdk-nvx-runtime-win32-x64\aci-edge-sandboxes\bin\aci_edge_agent.dll') {
         Assert-File -Path (Join-Path $bundle $file)
     }
-    $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = Join-Path $binaryDirectoryPath 'aci-edge-sandboxes'
-    $run = Invoke-LoggedNative -FilePath $tests -LogName 'microvm-nvx.log' -ArgumentList @(
-        '--include-ignored', '--nocapture', '--test-threads=1'
-    )
+    $previousAgent = $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR
+    try {
+        $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = Join-Path $binaryDirectoryPath 'aci-edge-sandboxes'
+        $run = Invoke-LoggedNative -FilePath $tests -LogName 'microvm-nvx.log' -ArgumentList @(
+            '--include-ignored', '--nocapture', '--test-threads=1'
+        )
+    } finally {
+        [Environment]::SetEnvironmentVariable('ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR', $previousAgent)
+    }
     $failure = Get-LibtestFailure -Run $run
     if ($failure) {
         throw "MicroVM SDK tests $failure."
@@ -478,7 +487,10 @@ function Invoke-MicroVmTests {
         }
     }
     $previousNvx = $env:MXC_ENABLE_NVX_TESTS
+    $previousFfi = $env:MXC_FFI_DIR
     try {
+        $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = ''
+        $env:MXC_FFI_DIR = ''
         $env:MXC_ENABLE_NVX_TESTS = '1'
         $failure = Invoke-XunitClasses -Bundle $bundle -Name 'microvm-json' -Classes 'MxcLifecycleNvxE2ETests' -RequiredMethods 'DevJson_NvxLifecycleCaptureAndLiveStreams'
         if ($failure) { throw ".NET NVX JSON: $failure" }
@@ -497,6 +509,8 @@ function Invoke-MicroVmTests {
         }
     } finally {
         [Environment]::SetEnvironmentVariable('MXC_ENABLE_NVX_TESTS', $previousNvx)
+        [Environment]::SetEnvironmentVariable('MXC_FFI_DIR', $previousFfi)
+        [Environment]::SetEnvironmentVariable('ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR', $previousAgent)
     }
 }
 
