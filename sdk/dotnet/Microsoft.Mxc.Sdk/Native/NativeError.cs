@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using System.Runtime.InteropServices;
+using System.Text.Json;
 
 using Microsoft.Mxc.Sdk.V1;
 
@@ -39,6 +40,44 @@ internal static unsafe class NativeError
             ToStringOrNull(detail.operation_utf8),
             ToStringOrNull(detail.native_code_utf8),
             ToStringOrNull(detail.remediation_utf8));
+    }
+
+    internal static MxcException ToExceptionWithDetails(
+        int status, MxcErrorDetail detail, string fallbackMessage, byte* detailsJsonUtf8)
+    {
+        var original = ToException(status, detail, fallbackMessage);
+        if (detailsJsonUtf8 is null)
+        {
+            return original;
+        }
+
+        try
+        {
+            var details = MxcJson.Deserialize<JsonElement>(ToStringOrNull(detailsJsonUtf8)!);
+            if (details.ValueKind != JsonValueKind.Object)
+            {
+                throw new JsonException("Lifecycle error details must be an object.");
+            }
+            if (details.TryGetProperty("nvxRecovery", out var recovery)
+                && recovery.ValueKind == JsonValueKind.Object
+                && recovery.TryGetProperty("sandboxId", out var idElement)
+                && idElement.ValueKind == JsonValueKind.String
+                && idElement.GetString() is { Length: > 0 } id)
+            {
+                static string? Redact(string? value, string id) =>
+                    value?.Replace(id, "[redacted]", StringComparison.Ordinal);
+                original = new MxcException(original.Code, Redact(original.Message, id)!,
+                    Redact(original.Operation, id), Redact(original.NativeCode, id),
+                    Redact(original.Remediation, id));
+            }
+            original.Data["details"] = details.Clone();
+            return original;
+        }
+        catch (JsonException)
+        {
+            return new MxcException(ErrorCode.BackendError,
+                "native lifecycle returned malformed error details", original);
+        }
     }
 
     /// <summary>

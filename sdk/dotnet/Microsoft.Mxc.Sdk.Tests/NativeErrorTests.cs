@@ -3,6 +3,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Microsoft.Mxc.Sdk;
 using Microsoft.Mxc.Sdk.V1;
 using Microsoft.Mxc.Sdk.Native;
@@ -64,6 +65,63 @@ public unsafe class NativeErrorTests
         Marshal.FreeCoTaskMem((IntPtr)detail.operation_utf8);
         Marshal.FreeCoTaskMem((IntPtr)detail.native_code_utf8);
         Marshal.FreeCoTaskMem((IntPtr)detail.remediation_utf8);
+    }
+
+    [Fact]
+    public void LifecycleDetailsAreDetachedAndNotIncludedInExceptionText()
+    {
+        var detail = Detail("cleanup failed for private-id", "operation private-id");
+        var json = Utf8("{\"nvxRecovery\":{\"sandboxId\":\"private-id\",\"state\":\"provisioned\"}}");
+        MxcException ex;
+        try
+        {
+            ex = NativeError.ToExceptionWithDetails((int)ErrorCode.BackendError, detail, "fallback", json);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+        var details = Assert.IsType<JsonElement>(ex.Data["details"]);
+        Assert.Equal("private-id", details.GetProperty("nvxRecovery").GetProperty("sandboxId").GetString());
+        Assert.DoesNotContain("private-id", ex.Message);
+        Assert.DoesNotContain("private-id", ex.ToString());
+    }
+
+    [Theory]
+    [InlineData("{")]
+    [InlineData("[]")]
+    [InlineData("null")]
+    public void InvalidLifecycleDetailsPreserveTheOriginalException(string jsonText)
+    {
+        var detail = Detail("original failure");
+        var json = Utf8(jsonText);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", json);
+            Assert.Equal(ErrorCode.BackendError, ex.Code);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Equal(ErrorCode.NotProvisioned, original.Code);
+            Assert.Equal("original failure", original.Message);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Fact]
+    public void NullLifecycleDetailsLeaveTheOriginalFailureUnchanged()
+    {
+        var detail = Detail("original failure");
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", null);
+            Assert.Equal(ErrorCode.NotProvisioned, ex.Code);
+            Assert.False(ex.Data.Contains("details"));
+        }
+        finally { Free(detail); }
     }
 
     [Fact]

@@ -7,7 +7,7 @@ import {
   runBindingStateAwareRequestWithNative,
   type BindingStateAwareRequest,
   type StateAwareNativeFacade,
-  type StateAwareNativeResult,
+  type StateAwareNativeResultV2,
 } from '../../src/bindings/state-aware.js';
 import type { AbiErrorDetail } from '../../src/bindings/native-error.js';
 import { MxcError } from '../../src/v1/errors.js';
@@ -22,16 +22,20 @@ class FakeStateAwareNative implements StateAwareNativeFacade {
   nativeStatus = 0;
   resultStatus = 0;
   freeCount = 0;
+  detailsJson: string | null = null;
+  errorMessage: string | null = null;
 
   run(
     request: string,
     dryRun: number,
     experimental: number,
-    result: StateAwareNativeResult,
+    result: StateAwareNativeResultV2,
     completion: (error: Error | null, status: number) => void,
   ): void {
     this.calls.push({ request, dryRun, experimental });
-    result.status = this.resultStatus;
+    result.result.status = this.resultStatus;
+    if (this.errorMessage !== null) result.result.error.message = Buffer.from(`${this.errorMessage}\0`);
+    if (this.detailsJson !== null) result.errorDetailsJsonUtf8 = Buffer.from(`${this.detailsJson}\0`);
     queueMicrotask(() => completion(this.callbackError, this.nativeStatus));
   }
 
@@ -100,4 +104,37 @@ describe('state-aware native binding ownership', () => {
     );
     assert.strictEqual(native.freeCount, 0);
   });
+  it('copies recovery details before free without exposing the id in the message', async () => {
+    const native = new FakeStateAwareNative();
+    native.resultStatus = 12;
+    native.errorMessage = 'cleanup failed for private-id';
+    native.detailsJson = JSON.stringify({ nvxRecovery: { sandboxId: 'private-id', state: 'provisioned' }, ffiStatus: 99 });
+    await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
+      assert.ok(error instanceof MxcError);
+      assert.deepStrictEqual(error.details?.nvxRecovery, { sandboxId: 'private-id', state: 'provisioned' });
+      assert.strictEqual(error.details?.ffiStatus, 12);
+      assert.ok(!error.message.includes('private-id'));
+      assert.ok(!String(error).includes('private-id'));
+      return true;
+    });
+    assert.strictEqual(native.freeCount, 1);
+  });
+
+  for (const json of ['{', '[]', 'null']) {
+    it(`rejects invalid error details ${json} and preserves the original error`, async () => {
+      const native = new FakeStateAwareNative();
+      native.resultStatus = 7;
+      native.detailsJson = json;
+      await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
+        assert.ok(error instanceof MxcError);
+        assert.strictEqual(error.code, 'backend_error');
+        assert.ok(error.details?.cause instanceof MxcError);
+        assert.strictEqual((error.details.cause as MxcError).code, 'not_provisioned');
+        assert.strictEqual(error.details?.ffiStatus, 7);
+        return true;
+      });
+      assert.strictEqual(native.freeCount, 1);
+    });
+  }
+
 });

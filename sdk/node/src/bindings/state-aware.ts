@@ -20,6 +20,11 @@ export interface StateAwareNativeResult {
   error: AbiErrorDetail;
 }
 
+export interface StateAwareNativeResultV2 {
+  result: StateAwareNativeResult;
+  errorDetailsJsonUtf8: unknown | null;
+}
+
 export interface BindingStateAwareRequest {
   requestJson: string;
   dryRun: boolean;
@@ -32,13 +37,18 @@ const AbiStateAwareResultType = koffi.struct('MxcNodeStateAwareResult', {
   error: AbiErrorDetailType,
 });
 
+const AbiStateAwareResultV2Type = koffi.struct('MxcNodeStateAwareResultV2', {
+  result: AbiStateAwareResultType,
+  errorDetailsJsonUtf8: 'void *',
+});
+
 type StateAwareFunction = (
   request: string,
   dryRun: number,
   experimental: number,
-  result: StateAwareNativeResult,
+  result: StateAwareNativeResultV2,
 ) => number;
-type FreeFunction = (result: StateAwareNativeResult) => void;
+type FreeFunction = (result: StateAwareNativeResultV2) => void;
 type StateAwareCompletion = (error: Error | null, status: number) => void;
 
 export interface StateAwareNativeFacade {
@@ -46,29 +56,29 @@ export interface StateAwareNativeFacade {
     request: string,
     dryRun: number,
     experimental: number,
-    result: StateAwareNativeResult,
+    result: StateAwareNativeResultV2,
     completion: StateAwareCompletion,
   ): void;
-  free(result: StateAwareNativeResult): void;
+  free(result: StateAwareNativeResultV2): void;
 }
 
 function bindStateAwareNativeFacade(
   native: ReturnType<typeof loadMxcFfi>,
 ): StateAwareNativeFacade {
   const run = bindNativeFunction<StateAwareFunction>(native.handle, {
-    symbol: 'mxc_run_state_aware_json',
+    symbol: 'mxc_run_state_aware_json_v2',
     result: 'int32_t',
     parameters: [
       'const char *',
       'int32_t',
       'int32_t',
-      koffi.out(koffi.pointer(AbiStateAwareResultType)),
+      koffi.out(koffi.pointer(AbiStateAwareResultV2Type)),
     ],
   });
   const free = bindNativeFunction<FreeFunction>(native.handle, {
-    symbol: 'mxc_state_aware_result_free',
+    symbol: 'mxc_state_aware_result_v2_free',
     result: 'void',
-    parameters: [koffi.pointer(AbiStateAwareResultType)],
+    parameters: [koffi.pointer(AbiStateAwareResultV2Type)],
   });
   return {
     run(request, dryRun, experimental, result, completion) {
@@ -78,29 +88,63 @@ function bindStateAwareNativeFacade(
   };
 }
 
-function createStateAwareResult(): StateAwareNativeResult {
+function createStateAwareResult(): StateAwareNativeResultV2 {
   return {
-    status: 0,
-    responseJsonUtf8: null,
-    error: {
-      message: null,
-      operation: null,
-      nativeCode: null,
-      remediation: null,
+    errorDetailsJsonUtf8: null,
+    result: {
+      status: 0,
+      responseJsonUtf8: null,
+      error: {
+        message: null,
+        operation: null,
+        nativeCode: null,
+        remediation: null,
+      },
     },
   };
 }
 
 function decodeStateAwareResult(
   nativeStatus: number,
-  result: StateAwareNativeResult,
+  outer: StateAwareNativeResultV2,
 ): string {
+  const result = outer.result;
   if (nativeStatus !== 0 || result.status !== 0) {
-    throw nativeStatusError(
+    const original = nativeStatusError(
       result.status || nativeStatus,
       result.error,
       'state-aware request failed',
     );
+    const detailsJson = decodeString(outer.errorDetailsJsonUtf8);
+    if (detailsJson === undefined) throw original;
+    let details: unknown;
+    try {
+      details = JSON.parse(detailsJson);
+      if (details === null || typeof details !== 'object' || Array.isArray(details)) {
+        throw new Error('details are not an object');
+      }
+    } catch {
+      throw new MxcError({
+        code: 'backend_error',
+        message: 'native lifecycle returned malformed error details',
+        details: { cause: original, ffiStatus: result.status || nativeStatus },
+      });
+    }
+    const detailObject = details as Record<string, unknown>;
+    const recovery = detailObject.nvxRecovery;
+    const sandboxId = recovery !== null && typeof recovery === 'object' && !Array.isArray(recovery)
+      ? (recovery as Record<string, unknown>).sandboxId : undefined;
+    const redact = (value: string | undefined): string | undefined =>
+      typeof sandboxId === 'string' && sandboxId.length > 0 && value !== undefined
+        ? value.split(sandboxId).join('[redacted]') : value;
+    throw new MxcError({
+      code: original.code,
+      message: redact(original.message)!,
+      operation: redact(original.operation),
+      nativeCode: redact(original.nativeCode),
+      remediation: redact(original.remediation),
+      details: { ...detailObject, ffiStatus: result.status || nativeStatus },
+    });
   }
   const responseJson = decodeString(result.responseJsonUtf8);
   if (responseJson === undefined || responseJson.length === 0) {
