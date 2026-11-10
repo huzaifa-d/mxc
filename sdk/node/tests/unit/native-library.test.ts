@@ -3,11 +3,9 @@
 
 import { afterEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import koffi from 'koffi';
-import { _mxcFfiCandidates, loadMxcFfi } from '../../src/native-library.js';
+import { _bootstrapNvxRuntimeForTest, _mxcFfiCandidates, loadMxcFfi } from '../../src/native-library.js';
 
 const oldFfiDir = process.env.MXC_FFI_DIR;
 
@@ -65,11 +63,9 @@ describe('mxc_ffi library resolution', () => {
   });
 
   it('loads the selected library and binds mxc_version', () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mxc-node-loader-'));
-    const libraryPath = path.join(directory, 'mxc_ffi.dll');
-    fs.writeFileSync(libraryPath, '');
+    const libraryPath = path.resolve('package.json');
 
-    try {
+    {
       let loadedPath: string | null | undefined;
       let boundDeclaration: string | undefined;
       const version = () => 'test-version';
@@ -92,8 +88,57 @@ describe('mxc_ffi library resolution', () => {
       } finally {
         load.mock.restore();
       }
-    } finally {
-      fs.rmSync(directory, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('NVX optional runtime bootstrap', () => {
+  const runtimeManifest = path.join('runtime', 'package.json');
+  const packageRoot = path.join('sdk');
+  const directory = path.join('runtime', 'aci-edge-sandboxes');
+  const canonical = path.resolve(directory);
+  function dependencies(runtimeVersion = '1.2.3', sdkVersion = '1.2.3') {
+    return {
+      resolve: () => runtimeManifest,
+      readFile: (name: string) => JSON.stringify({ version: name === runtimeManifest ? runtimeVersion : sdkVersion }),
+      realpath: (name: string) => { assert.strictEqual(name, directory); return canonical; },
+      isDirectory: () => true,
+    };
+  }
+  it('ignores a missing optional runtime package', () => {
+    const deps = dependencies();
+    deps.resolve = () => { throw Object.assign(new Error('missing'), { code: 'MODULE_NOT_FOUND' }); };
+    _bootstrapNvxRuntimeForTest({ register: () => assert.fail('unexpected registration'), freeError: () => {} }, deps, packageRoot);
+  });
+  it('registers the canonical runtime directory and propagates conflicting registrations', () => {
+    let registered: string | undefined;
+    let freed = 0;
+    const native = {
+      register: (backend: string, dir: string) => {
+        assert.strictEqual(backend, 'microvm');
+        if (registered && registered !== dir) return 11;
+        registered = dir;
+        return 0;
+      },
+      freeError: () => { freed++; },
+    };
+    const deps = dependencies();
+    _bootstrapNvxRuntimeForTest(native, deps, packageRoot);
+    _bootstrapNvxRuntimeForTest(native, deps, packageRoot);
+    assert.strictEqual(registered, canonical);
+    deps.realpath = () => path.resolve('other-runtime');
+    assert.throws(() => _bootstrapNvxRuntimeForTest(native, deps, packageRoot), /registration failed/);
+    assert.strictEqual(freed, 1);
+  });
+  it('rejects version mismatches, malformed manifests and missing directories', () => {
+    const native = { register: () => assert.fail('unexpected registration'), freeError: () => {} };
+    assert.throws(() => _bootstrapNvxRuntimeForTest(native, dependencies('2', '1'), packageRoot), /does not match/);
+    const malformed = dependencies();
+    malformed.readFile = () => '{';
+    assert.throws(() => _bootstrapNvxRuntimeForTest(native, malformed, packageRoot), /Invalid.*installation/);
+    const missing = dependencies();
+    missing.realpath = () => { throw new Error('missing aci-edge-sandboxes'); };
+    assert.throws(() => _bootstrapNvxRuntimeForTest(native, missing, packageRoot), /missing aci-edge-sandboxes/);
   });
 });

@@ -395,6 +395,36 @@ pub mod __ffi {
     use super::*;
     use crate::sandbox::WaitResult;
 
+    /// Whether this build contains the Windows x64 MicroVM runtime adapter.
+    #[doc(hidden)]
+    pub const MICROVM_RUNTIME_COMPILED: bool = cfg!(all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        feature = "microvm"
+    ));
+
+    /// Register the runtime directory used by the MicroVM backend in this process.
+    pub fn register_runtime_directory(backend: &str, directory: &str) -> Result<(), Error> {
+        if backend != "microvm" {
+            return Err(Error::new(
+                ErrorCode::UnsupportedContainment,
+                "unknown runtime backend",
+            ));
+        }
+        #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
+        {
+            crate::backend_modules::nvx::register_runtime_directory(directory).map_err(Error::from)
+        }
+        #[cfg(not(all(target_os = "windows", target_arch = "x86_64", feature = "microvm")))]
+        {
+            let _ = directory;
+            Err(Error::new(
+                ErrorCode::BackendUnavailable,
+                "MicroVM runtime is unavailable on this platform",
+            ))
+        }
+    }
+
     /// Spawn a raw exact-version JSON container request as a live process.
     ///
     /// The JSON must declare an exact registered `version` and contain a
