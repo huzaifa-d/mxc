@@ -2,9 +2,9 @@
 // Licensed under the MIT License.
 
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::mxc_common::logger::Logger;
@@ -178,6 +178,104 @@ fn agent_setup(bundle: &BundledAgent, state_root: &Path) -> SetupConfig {
     bundle.setup(state_root).with_cpu_profile(CpuProfile::Host)
 }
 
+static RUNTIME_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) fn register_runtime_directory(directory: &str) -> Result<(), MxcError> {
+    register_directory_in(&RUNTIME_DIRECTORY, directory)
+}
+
+fn register_directory_in(storage: &OnceLock<PathBuf>, directory: &str) -> Result<(), MxcError> {
+    let path = Path::new(directory);
+    if !path.is_absolute() {
+        return Err(MxcError::malformed_request(
+            "NVX runtime directory must be an absolute path",
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|error| {
+        MxcError::backend_unavailable(format!("cannot resolve NVX runtime directory: {error}"))
+    })?;
+    if !canonical.is_dir() {
+        return Err(MxcError::backend_unavailable(
+            "NVX runtime path is not a directory",
+        ));
+    }
+    crate::mxc_common::module_lifetime::pin_current_module()
+        .map_err(MxcError::backend_unavailable)?;
+    let registered = storage.get_or_init(|| canonical.clone());
+    if *registered != canonical {
+        return Err(MxcError::new(
+            MxcErrorCode::PolicyValidation,
+            "a different NVX runtime directory is already registered for this process",
+        ));
+    }
+    Ok(())
+}
+
+fn discover_bundle() -> Result<BundledAgent, MxcError> {
+    let configured = std::env::var_os("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    discover_bundle_from(
+        configured.as_deref(),
+        RUNTIME_DIRECTORY.get().map(PathBuf::as_path),
+        || {
+            crate::mxc_common::process_util::module_path_for_address(discover_bundle as *const ())
+                .map_err(MxcError::backend_unavailable)
+        },
+    )
+}
+
+fn module_candidates(directory: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![directory.join("aci-edge-sandboxes")];
+    if directory.ends_with(Path::new("runtimes").join("win-x64").join("native")) {
+        if let Some(rid) = directory.parent() {
+            candidates.push(rid.join("aci-edge-sandboxes"));
+            if let Some(root) = rid.parent().and_then(Path::parent) {
+                candidates.push(root.join("aci-edge-sandboxes"));
+            }
+        }
+    }
+    candidates
+}
+
+fn selected_bundle(directory: &Path) -> Result<BundledAgent, MxcError> {
+    let bundle = BundledAgent::from_dir(directory.to_path_buf()).map_err(map_error)?;
+    if !bundle.library().is_file() {
+        return Err(MxcError::backend_unavailable(format!(
+            "NVX bundle is missing {}",
+            bundle.library().display()
+        )));
+    }
+    Ok(bundle)
+}
+
+fn discover_bundle_from(
+    configured: Option<&Path>,
+    registered: Option<&Path>,
+    module_path: impl FnOnce() -> Result<PathBuf, MxcError>,
+) -> Result<BundledAgent, MxcError> {
+    if let Some(directory) = configured.or(registered) {
+        return selected_bundle(directory);
+    }
+    let module = module_path()?;
+    let directory = module.parent().ok_or_else(|| {
+        MxcError::backend_unavailable("the native module has no parent directory")
+    })?;
+    for candidate in module_candidates(directory) {
+        match std::fs::metadata(&candidate) {
+            Ok(_) => return selected_bundle(&candidate),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => {
+                return Err(MxcError::backend_unavailable(format!(
+                    "cannot inspect NVX runtime directory {}: {error}",
+                    candidate.display()
+                )))
+            }
+        }
+    }
+    BundledAgent::discover().map_err(map_error)
+}
+
 pub(super) fn create_persistent_client(
     guard: crate::mxc_common::filesystem_security::LockedDirectoryPath,
 ) -> Result<NvxClient, MxcError> {
@@ -189,7 +287,7 @@ fn create_client_with_guard(
     state_root: &Path,
     guard: Option<crate::mxc_common::filesystem_security::LockedDirectoryPath>,
 ) -> Result<NvxClient, MxcError> {
-    let bundle = BundledAgent::discover().map_err(map_error)?;
+    let bundle = discover_bundle()?;
     let directory = bundle.directory().canonicalize().map_err(|error| {
         MxcError::backend_unavailable(format!("cannot resolve NVX bundle: {error}"))
     })?;
@@ -219,11 +317,11 @@ impl NvxClient {
 }
 
 pub(super) fn agent_bundle_available() -> bool {
-    BundledAgent::discover().is_ok_and(|bundle| bundle.library().is_file())
+    discover_bundle().is_ok_and(|bundle| bundle.library().is_file())
 }
 
 pub(super) fn require_agent_bundle_present() -> Result<(), MxcError> {
-    let bundle = BundledAgent::discover().map_err(map_error)?;
+    let bundle = discover_bundle()?;
     if bundle.library().is_file() {
         Ok(())
     } else {
@@ -249,7 +347,7 @@ pub(super) fn state_root(
                 "NVX signed bundled agent: cannot resolve LOCALAPPDATA for the agent state directory",
             )
         })?;
-    let bundle = BundledAgent::discover().map_err(map_error)?;
+    let bundle = discover_bundle()?;
     state_root_in(&local_app_data, bundle.manifest_sha256())
 }
 
@@ -870,6 +968,74 @@ mod tests {
     use super::*;
     use aci_edge_sandboxes::ExecControl;
     use std::sync::Condvar;
+
+    #[test]
+    fn runtime_discovery_prioritizes_explicit_over_registration() {
+        let explicit = Path::new(r"C:\missing-explicit-nvx-bundle");
+        let registered = Path::new(r"C:\missing-registered-nvx-bundle");
+        let error = discover_bundle_from(Some(explicit), Some(registered), || {
+            panic!("module lookup must not run")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("missing-explicit-nvx-bundle"));
+        let error = discover_bundle_from(None, Some(registered), || {
+            panic!("module lookup must not run")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("missing-registered-nvx-bundle"));
+    }
+
+    #[test]
+    fn module_candidates_cover_nuget_and_flat_layouts() {
+        let module_dir = Path::new(r"C:\app\runtimes\win-x64\native");
+        assert_eq!(
+            module_candidates(module_dir),
+            vec![
+                PathBuf::from(r"C:\app\runtimes\win-x64\native\aci-edge-sandboxes"),
+                PathBuf::from(r"C:\app\runtimes\win-x64\aci-edge-sandboxes"),
+                PathBuf::from(r"C:\app\aci-edge-sandboxes"),
+            ]
+        );
+        assert_eq!(
+            module_candidates(Path::new(r"C:\app")),
+            vec![PathBuf::from(r"C:\app\aci-edge-sandboxes")]
+        );
+    }
+
+    #[test]
+    fn runtime_directory_is_canonical_idempotent_and_rejects_conflicts() {
+        let storage = OnceLock::new();
+        let current = std::env::current_dir().unwrap();
+        let parent = current.parent().unwrap();
+        let path = current.to_str().unwrap();
+        assert_eq!(
+            register_directory_in(&storage, "relative")
+                .unwrap_err()
+                .code,
+            MxcErrorCode::MalformedRequest
+        );
+        assert!(register_directory_in(&storage, path).is_ok());
+        assert!(register_directory_in(&storage, current.join(".").to_str().unwrap()).is_ok());
+        assert_eq!(
+            register_directory_in(&storage, parent.to_str().unwrap())
+                .unwrap_err()
+                .code,
+            MxcErrorCode::PolicyValidation
+        );
+        assert_eq!(
+            register_directory_in(
+                &OnceLock::new(),
+                current.join("no-such-nvx-runtime").to_str().unwrap()
+            )
+            .unwrap_err()
+            .code,
+            MxcErrorCode::BackendUnavailable
+        );
+    }
 
     #[test]
     fn lifecycle_ids_preserve_native_tokens_and_reject_malformed_ids() {
