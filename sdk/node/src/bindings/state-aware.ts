@@ -104,30 +104,6 @@ function createStateAwareResult(): StateAwareNativeResultV2 {
   };
 }
 
-function redactMalformedDetails(original: MxcError, detailsJson: string): MxcError {
-  const ids: string[] = [];
-  for (const match of detailsJson.matchAll(/"sandboxId"\s*:\s*("(?:\\.|[^"\\])*")/g)) {
-    try {
-      const id: unknown = JSON.parse(match[1]);
-      if (typeof id === 'string' && id.length > 0) ids.push(id);
-    } catch {
-      return new MxcError(original.code, 'native lifecycle request failed', original.details);
-    }
-  }
-  const redact = (value: string | undefined): string | undefined => {
-    for (const id of ids) value = value?.split(id).join('[redacted]');
-    return value;
-  };
-  return new MxcError({
-    code: original.code,
-    message: redact(original.message)!,
-    operation: redact(original.operation),
-    nativeCode: redact(original.nativeCode),
-    remediation: redact(original.remediation),
-    details: original.details,
-  });
-}
-
 function decodeStateAwareResult(
   nativeStatus: number,
   outer: StateAwareNativeResultV2,
@@ -148,10 +124,18 @@ function decodeStateAwareResult(
         throw new Error('details are not an object');
       }
     } catch {
+      const cause = new MxcError({
+        code: original.code,
+        message: 'original error message withheld because native error details were malformed',
+        operation: original.operation,
+        nativeCode: original.nativeCode,
+        remediation: original.remediation,
+        details: { ffiStatus: result.status || nativeStatus },
+      });
       throw new MxcError({
         code: 'backend_error',
         message: 'native lifecycle returned malformed error details',
-        details: { cause: redactMalformedDetails(original, detailsJson), ffiStatus: result.status || nativeStatus },
+        details: { cause, ffiStatus: result.status || nativeStatus },
       });
     }
     const detailObject = details as Record<string, unknown>;

@@ -24,6 +24,9 @@ class FakeStateAwareNative implements StateAwareNativeFacade {
   freeCount = 0;
   detailsJson: string | null = null;
   errorMessage: string | null = null;
+  operation: string | null = null;
+  nativeCode: string | null = null;
+  remediation: string | null = null;
 
   run(
     request: string,
@@ -35,6 +38,9 @@ class FakeStateAwareNative implements StateAwareNativeFacade {
     this.calls.push({ request, dryRun, experimental });
     result.result.status = this.resultStatus;
     if (this.errorMessage !== null) result.result.error.message = Buffer.from(`${this.errorMessage}\0`);
+    if (this.operation !== null) result.result.error.operation = Buffer.from(`${this.operation}\0`);
+    if (this.nativeCode !== null) result.result.error.nativeCode = Buffer.from(`${this.nativeCode}\0`);
+    if (this.remediation !== null) result.result.error.remediation = Buffer.from(`${this.remediation}\0`);
     if (this.detailsJson !== null) result.errorDetailsJsonUtf8 = Buffer.from(`${this.detailsJson}\0`);
     queueMicrotask(() => completion(this.callbackError, this.nativeStatus));
   }
@@ -123,11 +129,16 @@ describe('state-aware native binding ownership', () => {
   for (const detailsJson of [
     '{"nvxRecovery":{"sandboxId":"nvx:secret-123"}} trailing',
     '{"nvxRecovery":{"sandboxId":"nvx:secret-\\u003123"}} trailing',
+    '{"nvxRecovery":{"\\u0073andboxId":"nvx:secret-123"}} trailing',
+    '{"nvxRecovery":{"sandboxId":"nvx:secret-123',
   ]) {
     it('redacts the recovery ID from a preserved cause when details are malformed', async () => {
       const native = new FakeStateAwareNative();
       native.resultStatus = 7;
       native.errorMessage = 'cleanup failed for nvx:secret-123';
+      native.operation = 'Nvx.Close';
+      native.nativeCode = '0x1234';
+      native.remediation = 'Retry cleanup';
       native.detailsJson = detailsJson;
       await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
         assert.ok(error instanceof MxcError);
@@ -135,7 +146,13 @@ describe('state-aware native binding ownership', () => {
         const cause = error.details?.cause;
         assert.ok(cause instanceof MxcError);
         assert.strictEqual(cause.code, 'not_provisioned');
-        assert.ok(cause.message.includes('cleanup failed'));
+        assert.strictEqual(cause.message, 'original error message withheld because native error details were malformed');
+        assert.strictEqual(cause.operation, 'Nvx.Close');
+        assert.strictEqual(cause.nativeCode, '0x1234');
+        assert.strictEqual(cause.remediation, 'Retry cleanup');
+        assert.strictEqual(error.details?.ffiStatus, 7);
+        assert.strictEqual(cause.details?.ffiStatus, 7);
+        assert.ok(!JSON.stringify(error.details).includes('nvx:secret-123'));
         assert.ok(!error.message.includes('nvx:secret-123'));
         assert.ok(!String(error).includes('nvx:secret-123'));
         assert.ok(!cause.message.includes('nvx:secret-123'));

@@ -102,7 +102,7 @@ public unsafe class NativeErrorTests
             Assert.Equal(ErrorCode.BackendError, ex.Code);
             var original = Assert.IsType<MxcException>(ex.InnerException);
             Assert.Equal(ErrorCode.NotProvisioned, original.Code);
-            Assert.Equal("original failure", original.Message);
+            Assert.Equal("original error message withheld because native error details were malformed", original.Message);
         }
         finally
         {
@@ -114,10 +114,11 @@ public unsafe class NativeErrorTests
     [Theory]
     [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123\"}} trailing")]
     [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-\\u003123\"}} trailing")]
+    [InlineData("{\"nvxRecovery\":{\"\\u0073andboxId\":\"nvx:secret-123\"}} trailing")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123")]
     public void MalformedLifecycleDetailsRedactRecoveryIdFromOriginalFailure(string detailsJson)
     {
-        var detail = Detail("cleanup failed for nvx:secret-123", "operation nvx:secret-123",
-            "code nvx:secret-123", "remedy nvx:secret-123");
+        var detail = Detail("cleanup failed for nvx:secret-123", "Nvx.Close", "0x1234", "Retry cleanup");
         var json = Utf8(detailsJson);
         try
         {
@@ -125,7 +126,12 @@ public unsafe class NativeErrorTests
             Assert.Equal(ErrorCode.BackendError, ex.Code);
             var original = Assert.IsType<MxcException>(ex.InnerException);
             Assert.Equal(ErrorCode.NotProvisioned, original.Code);
-            Assert.Contains("cleanup failed", original.Message);
+            Assert.Equal("original error message withheld because native error details were malformed", original.Message);
+            Assert.Equal("Nvx.Close", original.Operation);
+            Assert.Equal("0x1234", original.NativeCode);
+            Assert.Equal("Retry cleanup", original.Remediation);
+            Assert.Empty(ex.Data);
+            Assert.Empty(original.Data);
             Assert.DoesNotContain("nvx:secret-123", ex.Message);
             Assert.DoesNotContain("nvx:secret-123", ex.ToString());
             Assert.DoesNotContain("nvx:secret-123", original.Message);

@@ -3,7 +3,6 @@
 
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 using Microsoft.Mxc.Sdk.V1;
 
@@ -77,38 +76,12 @@ internal static unsafe class NativeError
         }
         catch (JsonException)
         {
-            original = RedactMalformedDetails(original, detailsJson);
+            original = new MxcException(original.Code,
+                "original error message withheld because native error details were malformed",
+                original.Operation, original.NativeCode, original.Remediation);
             return new MxcException(ErrorCode.BackendError,
                 "native lifecycle returned malformed error details", original);
         }
-    }
-
-    private static MxcException RedactMalformedDetails(MxcException original, string detailsJson)
-    {
-        var message = original.Message;
-        var operation = original.Operation;
-        var nativeCode = original.NativeCode;
-        var remediation = original.Remediation;
-        foreach (Match match in Regex.Matches(detailsJson,
-            @"""sandboxId""\s*:\s*(""(?:\\.|[^""\\])*"")", RegexOptions.NonBacktracking))
-        {
-            string? id;
-            try
-            {
-                id = MxcJson.Deserialize<JsonElement>(match.Groups[1].Value).GetString();
-            }
-            catch (JsonException)
-            {
-                // An invalid escaped value cannot safely be recovered for redaction.
-                return new MxcException(original.Code, "native lifecycle request failed");
-            }
-            if (string.IsNullOrEmpty(id)) continue;
-            message = message.Replace(id, "[redacted]", StringComparison.Ordinal);
-            operation = operation?.Replace(id, "[redacted]", StringComparison.Ordinal);
-            nativeCode = nativeCode?.Replace(id, "[redacted]", StringComparison.Ordinal);
-            remediation = remediation?.Replace(id, "[redacted]", StringComparison.Ordinal);
-        }
-        return new MxcException(original.Code, message, operation, nativeCode, remediation);
     }
 
     /// <summary>
