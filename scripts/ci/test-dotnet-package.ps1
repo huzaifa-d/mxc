@@ -123,14 +123,25 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
                     if ((Get-FileHash $actual).Hash -ne (Get-FileHash (Join-Path $nvx $file)).Hash) { throw "Content mismatch: $actual" }
                 }
             }
-            dotnet restore $project --source $feed --packages (Join-Path $root 'nvx-cache') --nologo -p:NuGetAudit=false -p:RuntimeIdentifier=win-x64
-            if ($LASTEXITCODE -ne 0) { throw "$framework win-x64 NVX restore failed." }
-            dotnet build $project -c Release --no-restore --nologo -p:RuntimeIdentifier=win-x64
-            if ($LASTEXITCODE -ne 0) { throw "$framework win-x64 NVX build failed." }
-            $nested = Join-Path $consumer "bin/Release/$framework/win-x64/aci-edge-sandboxes/guest/deep/provenance.txt"
-            if (-not (Test-Path -LiteralPath $nested -PathType Leaf)) { throw "Missing RID output: $nested" }
+            foreach ($rid in @('win-x64', 'win10-x64')) {
+                [string[]]$ridGraph = if ($rid -eq 'win10-x64') { @('-p:UseRidGraph=true') } else { @() }
+                dotnet restore $project --source $feed --packages (Join-Path $root 'nvx-cache') --nologo -p:NuGetAudit=false "-p:RuntimeIdentifier=$rid" @ridGraph
+                if ($LASTEXITCODE -ne 0) { throw "$framework $rid NVX restore failed." }
+                dotnet build $project -c Release --no-restore --nologo "-p:RuntimeIdentifier=$rid" @ridGraph
+                if ($LASTEXITCODE -ne 0) { throw "$framework $rid NVX build failed." }
+                $ridPublish = Join-Path $consumer "publish-$rid"
+                dotnet publish $project -c Release --no-restore --nologo -o $ridPublish "-p:RuntimeIdentifier=$rid" @ridGraph
+                if ($LASTEXITCODE -ne 0) { throw "$framework $rid NVX publish failed." }
+                foreach ($output in @((Join-Path $consumer "bin/Release/$framework/$rid"), $ridPublish)) {
+                    foreach ($file in $files) {
+                        $actual = Join-Path $output "aci-edge-sandboxes/$file"
+                        if (-not (Test-Path -LiteralPath $actual -PathType Leaf)) { throw "Missing RID output: $actual" }
+                        if ((Get-FileHash $actual).Hash -ne (Get-FileHash (Join-Path $nvx $file)).Hash) { throw "Content mismatch: $actual" }
+                    }
+                }
+            }
             $errorOutput = & dotnet build $project -c Release --no-restore --nologo -p:RuntimeIdentifier=win-arm64 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0 -or $errorOutput -notmatch 'supports only the win-x64 RuntimeIdentifier') { throw "Unsupported RID was not rejected by NVX target: $errorOutput" }
+            if ($LASTEXITCODE -eq 0 -or $errorOutput -notmatch 'supports only the win-x64 or win10-x64 RuntimeIdentifier') { throw "Unsupported RID was not rejected by NVX target: $errorOutput" }
             $errorOutput = & dotnet build $project -c Release --no-restore --nologo -p:PlatformTarget=x86 2>&1 | Out-String
             if ($LASTEXITCODE -eq 0 -or $errorOutput -notmatch 'requires an x64 or AnyCPU PlatformTarget') { throw "Unsupported platform was not rejected by NVX target: $errorOutput" }
             Write-Host "$framework NVX package build, publish and negative platform checks passed."
