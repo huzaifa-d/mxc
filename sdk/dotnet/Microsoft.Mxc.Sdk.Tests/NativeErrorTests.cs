@@ -70,7 +70,7 @@ public unsafe class NativeErrorTests
     [Fact]
     public void LifecycleDetailsAreDetachedAndNotIncludedInExceptionText()
     {
-        var detail = Detail("cleanup failed for private-id", "operation private-id");
+        var detail = Detail("cleanup failed for private-id", "operation private-id", "code private-id", "fix private-id");
         var json = Utf8("{\"nvxRecovery\":{\"sandboxId\":\"private-id\",\"state\":\"provisioned\"}}");
         MxcException ex;
         try
@@ -86,6 +86,9 @@ public unsafe class NativeErrorTests
         Assert.Equal("private-id", details.GetProperty("nvxRecovery").GetProperty("sandboxId").GetString());
         Assert.DoesNotContain("private-id", ex.Message);
         Assert.DoesNotContain("private-id", ex.ToString());
+        Assert.DoesNotContain("private-id", ex.Operation);
+        Assert.DoesNotContain("private-id", ex.NativeCode);
+        Assert.DoesNotContain("private-id", ex.Remediation);
     }
 
     [Theory]
@@ -136,6 +139,35 @@ public unsafe class NativeErrorTests
             Assert.DoesNotContain("nvx:secret-123", ex.ToString());
             Assert.DoesNotContain("nvx:secret-123", original.Message);
             Assert.DoesNotContain("nvx:secret-123", original.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123", "nvx:secret-123")]
+    [InlineData("[]", "nvx:secret-123")]
+    [InlineData("{\"nvxRecovery\":{\"\\u0073andboxId\":\"private-id\"}} trailing", "private-id")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"private-\\u0069d\"}} trailing", "private-id")]
+    public void MalformedLifecycleDetailsRedactRecoveryIdFromMetadata(string detailsJson, string id)
+    {
+        var detail = Detail($"message {id}", $"op {id}", $"code {id}", $"fix {id}");
+        var json = Utf8(detailsJson);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.NotProvisioned, detail, "fallback", json);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Equal(ErrorCode.NotProvisioned, original.Code);
+            Assert.DoesNotContain(id, ex.ToString());
+            Assert.DoesNotContain(id, original.Operation);
+            Assert.DoesNotContain(id, original.NativeCode);
+            Assert.DoesNotContain(id, original.Remediation);
+            Assert.Contains("[redacted]", original.Operation);
+            Assert.Contains("[redacted]", original.NativeCode);
+            Assert.Contains("[redacted]", original.Remediation);
         }
         finally
         {

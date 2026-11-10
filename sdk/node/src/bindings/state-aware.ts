@@ -104,6 +104,24 @@ function createStateAwareResult(): StateAwareNativeResultV2 {
   };
 }
 
+function malformedDetailsRedactor(detailsJson: string): (value: string | undefined) => string | undefined {
+  const ids: string[] = [];
+  for (const match of detailsJson.matchAll(/("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")/g)) {
+    try {
+      const key: unknown = JSON.parse(match[1]);
+      const id: unknown = JSON.parse(match[2]);
+      if (key === 'sandboxId' && typeof id === 'string' && id.length > 0) ids.push(id);
+    } catch {
+      // The surrounding JSON is already known to be invalid.
+    }
+  }
+  return (value) => {
+    if (value === undefined) return undefined;
+    for (const id of ids) value = value.split(id).join('[redacted]');
+    return value.replace(/nvx:[^\s\]"'`,;]+/g, '[redacted]');
+  };
+}
+
 function decodeStateAwareResult(
   nativeStatus: number,
   outer: StateAwareNativeResultV2,
@@ -124,12 +142,13 @@ function decodeStateAwareResult(
         throw new Error('details are not an object');
       }
     } catch {
+      const redact = malformedDetailsRedactor(detailsJson);
       const cause = new MxcError({
         code: original.code,
         message: 'original error message withheld because native error details were malformed',
-        operation: original.operation,
-        nativeCode: original.nativeCode,
-        remediation: original.remediation,
+        operation: redact(original.operation),
+        nativeCode: redact(original.nativeCode),
+        remediation: redact(original.remediation),
         details: { ffiStatus: result.status || nativeStatus },
       });
       throw new MxcError({

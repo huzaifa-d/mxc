@@ -3,6 +3,7 @@
 
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 using Microsoft.Mxc.Sdk.V1;
 
@@ -76,12 +77,43 @@ internal static unsafe class NativeError
         }
         catch (JsonException)
         {
+            var ids = ExtractSandboxIds(detailsJson);
             original = new MxcException(original.Code,
                 "original error message withheld because native error details were malformed",
-                original.Operation, original.NativeCode, original.Remediation);
+                RedactMalformedMetadata(original.Operation, ids),
+                RedactMalformedMetadata(original.NativeCode, ids),
+                RedactMalformedMetadata(original.Remediation, ids));
             return new MxcException(ErrorCode.BackendError,
                 "native lifecycle returned malformed error details", original);
         }
+    }
+
+    private static List<string> ExtractSandboxIds(string detailsJson)
+    {
+        var ids = new List<string>();
+        foreach (Match match in Regex.Matches(detailsJson,
+            @"(""(?:\\.|[^""\\])*"")\s*:\s*(""(?:\\.|[^""\\])*"")",
+            RegexOptions.NonBacktracking))
+        {
+            try
+            {
+                var key = MxcJson.Deserialize<JsonElement>(match.Groups[1].Value).GetString();
+                var id = MxcJson.Deserialize<JsonElement>(match.Groups[2].Value).GetString();
+                if (key == "sandboxId" && !string.IsNullOrEmpty(id)) ids.Add(id);
+            }
+            catch (JsonException)
+            {
+                // The surrounding JSON is already known to be invalid.
+            }
+        }
+        return ids;
+    }
+
+    private static string? RedactMalformedMetadata(string? value, List<string> ids)
+    {
+        if (value is null) return null;
+        foreach (var id in ids) value = value.Replace(id, "[redacted]", StringComparison.Ordinal);
+        return Regex.Replace(value, @"nvx:[^\s\]""'`,;]+", "[redacted]", RegexOptions.NonBacktracking);
     }
 
     /// <summary>

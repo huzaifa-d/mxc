@@ -114,6 +114,9 @@ describe('state-aware native binding ownership', () => {
     const native = new FakeStateAwareNative();
     native.resultStatus = 12;
     native.errorMessage = 'cleanup failed for private-id';
+    native.operation = 'operation private-id';
+    native.nativeCode = 'code private-id';
+    native.remediation = 'fix private-id';
     native.detailsJson = JSON.stringify({ nvxRecovery: { sandboxId: 'private-id', state: 'provisioned' }, ffiStatus: 99 });
     await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
       assert.ok(error instanceof MxcError);
@@ -121,6 +124,9 @@ describe('state-aware native binding ownership', () => {
       assert.strictEqual(error.details?.ffiStatus, 12);
       assert.ok(!error.message.includes('private-id'));
       assert.ok(!String(error).includes('private-id'));
+      assert.ok(!error.operation?.includes('private-id'));
+      assert.ok(!error.nativeCode?.includes('private-id'));
+      assert.ok(!error.remediation?.includes('private-id'));
       return true;
     });
     assert.strictEqual(native.freeCount, 1);
@@ -157,6 +163,37 @@ describe('state-aware native binding ownership', () => {
         assert.ok(!String(error).includes('nvx:secret-123'));
         assert.ok(!cause.message.includes('nvx:secret-123'));
         assert.ok(!String(cause).includes('nvx:secret-123'));
+        return true;
+      });
+      assert.strictEqual(native.freeCount, 1);
+    });
+  }
+
+  for (const [detailsJson, id] of [
+    ['{"nvxRecovery":{"sandboxId":"nvx:secret-123', 'nvx:secret-123'],
+    ['[]', 'nvx:secret-123'],
+    ['{"nvxRecovery":{"\\u0073andboxId":"private-id"}} trailing', 'private-id'],
+    ['{"nvxRecovery":{"sandboxId":"private-\\u0069d"}} trailing', 'private-id'],
+  ]) {
+    it('redacts recovery IDs from malformed-details metadata', async () => {
+      const native = new FakeStateAwareNative();
+      native.resultStatus = 7;
+      native.errorMessage = `message ${id}`;
+      native.operation = `op ${id}`;
+      native.nativeCode = `code ${id}`;
+      native.remediation = `fix ${id}`;
+      native.detailsJson = detailsJson;
+      await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
+        assert.ok(error instanceof MxcError);
+        const cause = error.details?.cause;
+        assert.ok(cause instanceof MxcError);
+        assert.strictEqual(cause.code, 'not_provisioned');
+        assert.strictEqual(error.details?.ffiStatus, 7);
+        assert.ok(!JSON.stringify(error.details).includes(id));
+        assert.ok(!String(cause).includes(id));
+        assert.strictEqual(cause.operation, 'op [redacted]');
+        assert.strictEqual(cause.nativeCode, 'code [redacted]');
+        assert.strictEqual(cause.remediation, 'fix [redacted]');
         return true;
       });
       assert.strictEqual(native.freeCount, 1);
