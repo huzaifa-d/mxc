@@ -78,7 +78,16 @@ jobs:
           'runtimes\win-arm64\native\wslcsdk.dll',
           'runtimes\linux-x64\native\libmxc_ffi.so',
           'runtimes\linux-arm64\native\libmxc_ffi.so',
-          'runtimes\osx-arm64\native\libmxc_ffi.dylib'
+          'runtimes\osx-arm64\native\libmxc_ffi.dylib',
+          'nvx\bundle-manifest.json',
+          'nvx\bin\aci_edge_agent.dll',
+          'nvx\bin\openvmm.exe',
+          'nvx\bin\direct-images.exe',
+          'nvx\SOURCE-MANIFEST.json',
+          'nvx\SHA256SUMS',
+          'nvx\guest\vmlinux',
+          'nvx\guest\initramfs-edge.cpio.gz',
+          'nvx\guest\nvx-edge-agent'
         )
 
         foreach ($relativePath in $files) {
@@ -96,6 +105,23 @@ jobs:
         packDestination: $(packageOutput)
         versioningScheme: off
         buildProperties: version=${{ package.version }};managedOutput=$(packageRoot)\managed;x64Native=$(packageRoot)\runtimes\win-x64\native;arm64Native=$(packageRoot)\runtimes\win-arm64\native;linuxX64Native=$(packageRoot)\runtimes\linux-x64\native;linuxArm64Native=$(packageRoot)\runtimes\linux-arm64\native;macArm64Native=$(packageRoot)\runtimes\osx-arm64\native;repositoryRoot=$(Build.SourcesDirectory)
+
+    - task: NuGetCommand@2
+      displayName: Pack NVX runtime for ${{ package.displayName }}
+      inputs:
+        command: pack
+        packagesToPack: $(Build.SourcesDirectory)\sdk\dotnet\Microsoft.Mxc.Sdk.Nvx.Runtime.Package\Microsoft.Mxc.Sdk.Nvx.Runtime.nuspec
+        packDestination: $(packageOutput)
+        versioningScheme: off
+        buildProperties: version=${{ package.version }};nvxRuntime=$(packageRoot)\nvx;repositoryRoot=$(Build.SourcesDirectory)
+
+    - task: PowerShell@2
+      displayName: Verify ${{ package.displayName }} NVX runtime package
+      inputs:
+        filePath: $(Build.SourcesDirectory)\.azure-pipelines\scripts\verify-dotnet-nuget-package.ps1
+        arguments: >-
+          -PackagePath "$(packageOutput)\Microsoft.Mxc.Sdk.Nvx.Runtime.${{ package.version }}.nupkg"
+          -VerifyNvxRuntime
 
     - task: PowerShell@2
       displayName: Verify ${{ package.displayName }} package contract

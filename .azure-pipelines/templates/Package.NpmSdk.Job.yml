@@ -110,6 +110,14 @@ jobs:
       workingDirectory: $(sdkDirectory)
       displayName: npm pack
 
+    - script: |
+        set -euo pipefail
+        cp -R "$(sdkDirectory)/bin/x64/aci-edge-sandboxes" "$(Build.SourcesDirectory)/sdk/node-nvx-runtime/"
+        cp "$(Build.SourcesDirectory)/LICENSE.md" "$(Build.SourcesDirectory)/sdk/node-nvx-runtime/"
+        npm pack --pack-destination "$(sdkDirectory)"
+      workingDirectory: $(Build.SourcesDirectory)/sdk/node-nvx-runtime
+      displayName: Pack optional NVX runtime
+
     - task: CopyFiles@2
       displayName: Copy npm package
       inputs:
