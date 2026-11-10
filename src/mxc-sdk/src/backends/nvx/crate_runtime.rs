@@ -238,15 +238,43 @@ fn module_candidates(directory: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-fn selected_bundle(directory: &Path) -> Result<BundledAgent, MxcError> {
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+fn selected_bundle_with(
+    directory: &Path,
+    is_file: &impl Fn(&Path) -> bool,
+) -> Result<BundledAgent, MxcError> {
     let bundle = BundledAgent::from_dir(directory.to_path_buf()).map_err(map_error)?;
-    if !bundle.library().is_file() {
-        return Err(MxcError::backend_unavailable(format!(
-            "NVX bundle is missing {}",
-            bundle.library().display()
-        )));
+    for path in [
+        bundle.library().to_path_buf(),
+        directory.join("bundle-manifest.json"),
+        directory.join("SHA256SUMS"),
+        directory.join(r"bin\openvmm.exe"),
+        directory.join(r"bin\direct-images.exe"),
+        directory.join(r"guest\vmlinux"),
+        directory.join(r"guest\initramfs-edge.cpio.gz"),
+        directory.join(r"guest\nvx-edge-agent"),
+    ] {
+        if !is_file(&path) {
+            return Err(MxcError::backend_unavailable(format!(
+                "NVX bundle is missing {}",
+                path.display()
+            )));
+        }
     }
     Ok(bundle)
+}
+
+fn module_candidate_attributes(candidate: &Path) -> Result<Option<u32>, MxcError> {
+    use std::os::windows::fs::MetadataExt;
+    match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) => Ok(Some(metadata.file_attributes())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(MxcError::backend_unavailable(format!(
+            "cannot inspect NVX runtime directory {}: {error}",
+            candidate.display()
+        ))),
+    }
 }
 
 fn discover_bundle_from(
@@ -254,26 +282,42 @@ fn discover_bundle_from(
     registered: Option<&Path>,
     module_path: impl FnOnce() -> Result<PathBuf, MxcError>,
 ) -> Result<BundledAgent, MxcError> {
+    discover_bundle_from_with(
+        configured,
+        registered,
+        module_path,
+        &module_candidate_attributes,
+        &Path::is_file,
+    )
+}
+
+fn discover_bundle_from_with(
+    configured: Option<&Path>,
+    registered: Option<&Path>,
+    module_path: impl FnOnce() -> Result<PathBuf, MxcError>,
+    candidate_attributes: &impl Fn(&Path) -> Result<Option<u32>, MxcError>,
+    is_file: &impl Fn(&Path) -> bool,
+) -> Result<BundledAgent, MxcError> {
     if let Some(directory) = configured.or(registered) {
-        return selected_bundle(directory);
+        return selected_bundle_with(directory, is_file);
     }
     let module = module_path()?;
     let directory = module.parent().ok_or_else(|| {
         MxcError::backend_unavailable("the native module has no parent directory")
     })?;
     for candidate in module_candidates(directory) {
-        match std::fs::metadata(&candidate) {
-            Ok(_) => return selected_bundle(&candidate),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => {
+        if let Some(attributes) = candidate_attributes(&candidate)? {
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(MxcError::backend_unavailable(format!(
-                    "cannot inspect NVX runtime directory {}: {error}",
+                    "NVX runtime directory {} is a reparse point",
                     candidate.display()
-                )))
+                )));
             }
+            return selected_bundle_with(&candidate, is_file);
         }
     }
-    BundledAgent::discover().map_err(map_error)
+    let bundle = BundledAgent::discover().map_err(map_error)?;
+    selected_bundle_with(bundle.directory(), is_file)
 }
 
 pub(super) fn create_persistent_client(
@@ -987,6 +1031,62 @@ mod tests {
         .unwrap();
         assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
         assert!(error.message.contains("missing-registered-nvx-bundle"));
+    }
+
+    #[test]
+    fn bundle_requires_each_runtime_file() {
+        let directory = Path::new(r"C:\nvx-bundle");
+        let files = std::cell::RefCell::new(Vec::new());
+        assert!(selected_bundle_with(directory, &|path| {
+            files.borrow_mut().push(path.to_path_buf());
+            true
+        })
+        .is_ok());
+        let files = files.into_inner();
+        assert_eq!(files.len(), 8);
+        for missing in &files {
+            let error = selected_bundle_with(directory, &|path| path != missing)
+                .err()
+                .unwrap();
+            assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+            assert!(error
+                .message
+                .contains(&missing.to_string_lossy().to_string()));
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_bundle_with_only_agent_library() {
+        let directory = Path::new(r"C:\incomplete-nvx-bundle");
+        let result = discover_bundle_from_with(
+            Some(directory),
+            None,
+            || panic!("module lookup must not run"),
+            &|_| panic!("module candidates must not be inspected"),
+            &|path| path.ends_with("aci_edge_agent.dll"),
+        );
+        let error = result.err().unwrap();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("bundle-manifest.json"));
+    }
+
+    #[test]
+    fn discovery_rejects_dangling_module_reparse_point_without_fallback() {
+        let candidates_seen = std::cell::Cell::new(0);
+        let result = discover_bundle_from_with(
+            None,
+            None,
+            || Ok(PathBuf::from(r"C:\app\runtimes\win-x64\native\mxc_ffi.dll")),
+            &|_| {
+                candidates_seen.set(candidates_seen.get() + 1);
+                Ok(Some(FILE_ATTRIBUTE_REPARSE_POINT))
+            },
+            &|_| panic!("reparse point must not be followed"),
+        );
+        let error = result.err().unwrap();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("reparse point"));
+        assert_eq!(candidates_seen.get(), 1);
     }
 
     #[test]

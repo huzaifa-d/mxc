@@ -1169,9 +1169,8 @@ mod tests {
         let mut detail = MxcErrorDetail::none();
         let status =
             unsafe { mxc_register_runtime_directory(backend.as_ptr(), path.as_ptr(), &mut detail) };
-        if status == MXC_STATUS_BACKEND_UNAVAILABLE
-            && std::env::var_os("MXC_TEST_EXPECT_MICROVM").is_none()
-        {
+        if !mxc_sdk::__ffi::MICROVM_RUNTIME_COMPILED {
+            assert_eq!(status, MXC_STATUS_BACKEND_UNAVAILABLE);
             unsafe { mxc_error_detail_free(&mut detail) };
             return;
         }

@@ -395,6 +395,14 @@ pub mod __ffi {
     use super::*;
     use crate::sandbox::WaitResult;
 
+    /// Whether this build contains the Windows x64 MicroVM runtime adapter.
+    #[doc(hidden)]
+    pub const MICROVM_RUNTIME_COMPILED: bool = cfg!(all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        feature = "microvm"
+    ));
+
     /// Register the runtime directory used by the MicroVM backend in this process.
     pub fn register_runtime_directory(backend: &str, directory: &str) -> Result<(), Error> {
         if backend != "microvm" {
