@@ -60,18 +60,18 @@ internal static unsafe class NativeError
             {
                 throw new JsonException("Lifecycle error details must be an object.");
             }
+            var ids = new List<string>();
             if (details.TryGetProperty("nvxRecovery", out var recovery)
                 && recovery.ValueKind == JsonValueKind.Object
                 && recovery.TryGetProperty("sandboxId", out var idElement)
                 && idElement.ValueKind == JsonValueKind.String
                 && idElement.GetString() is { Length: > 0 } id)
             {
-                static string? Redact(string? value, string id) =>
-                    value?.Replace(id, "[redacted]", StringComparison.Ordinal);
-                original = new MxcException(original.Code, Redact(original.Message, id)!,
-                    Redact(original.Operation, id), Redact(original.NativeCode, id),
-                    Redact(original.Remediation, id));
+                ids.Add(id);
             }
+            original = new MxcException(original.Code, RedactMetadata(original.Message, ids)!,
+                RedactMetadata(original.Operation, ids), RedactMetadata(original.NativeCode, ids),
+                RedactMetadata(original.Remediation, ids));
             original.Data["details"] = details.Clone();
             return original;
         }
@@ -80,9 +80,9 @@ internal static unsafe class NativeError
             var ids = ExtractSandboxIds(detailsJson);
             original = new MxcException(original.Code,
                 "original error message withheld because native error details were malformed",
-                ParameterFreeMetadata(RedactMalformedMetadata(original.Operation, ids)),
-                ParameterFreeMetadata(RedactMalformedMetadata(original.NativeCode, ids)),
-                RedactMalformedMetadata(original.Remediation, ids));
+                ParameterFreeMetadata(RedactMetadata(original.Operation, ids)),
+                ParameterFreeMetadata(RedactMetadata(original.NativeCode, ids)),
+                RedactMetadata(original.Remediation, ids));
             return new MxcException(ErrorCode.BackendError,
                 "native lifecycle returned malformed error details", original);
         }
@@ -111,7 +111,7 @@ internal static unsafe class NativeError
         return ids;
     }
 
-    private static string? RedactMalformedMetadata(string? value, List<string> ids)
+    private static string? RedactMetadata(string? value, List<string> ids)
     {
         if (value is null) return null;
         foreach (var id in ids) value = value.Replace(id, "[redacted]", StringComparison.Ordinal);

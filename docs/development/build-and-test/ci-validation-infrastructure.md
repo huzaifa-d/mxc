@@ -15,9 +15,9 @@ the individual local test scripts are documented in
 
 - Validation tests **never build from source**. They download the artifacts
   produced by `Build.Windows.Job.yml` / `Build.Linux.Job.yml` /
-  `Build.MacOS.Job.yml`, and for ProcessContainer, IsolationSession, and WSLC the
-  Windows SDK bundle from `Package.WindowsSdk.TestBundle.Job.yml`, in the same
-  workflow run, so what gets tested is exactly what got built.
+  `Build.MacOS.Job.yml`, and for ProcessContainer, IsolationSession, WSLC,
+  and MicroVM the Windows SDK bundle from `Package.WindowsSdk.TestBundle.Job.yml`,
+  in the same workflow run, so what gets tested is exactly what got built.
 
 - IsolationSession also downloads `telemetry-test-executor-<target>`, a separate
   local-only debug executor with `test-support` and `isolation_session`. Shipping

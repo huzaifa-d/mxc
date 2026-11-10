@@ -92,6 +92,39 @@ public unsafe class NativeErrorTests
     }
 
     [Theory]
+    [InlineData("private-id")]
+    [InlineData("microvm:0123456789abcdef0123456789abcdef")]
+    [InlineData(null)]
+    public void ValidLifecycleDetailsRedactAlternateNvxTokens(string? id)
+    {
+        var hasId = id is not null;
+        var detail = Detail($"message {id ?? "private-id"} nvx:other-one", "operation MICROVM:other-two",
+            "code nvx:other-three", "fix microvm:other-four");
+        var jsonText = hasId
+            ? "{\"nvxRecovery\":{\"sandboxId\":\"" + id + "\",\"state\":\"provisioned\"},\"primaryDetails\":{\"reason\":\"original\"}}"
+            : "{\"nvxRecovery\":{\"state\":\"provisioned\"},\"primaryDetails\":{\"reason\":\"original\"}}";
+        var json = Utf8(jsonText);
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.BackendError, detail, "fallback", json);
+            var details = Assert.IsType<JsonElement>(ex.Data["details"]);
+            var recovery = details.GetProperty("nvxRecovery");
+            Assert.Equal(hasId, recovery.TryGetProperty("sandboxId", out var sandboxId));
+            if (hasId) Assert.Equal(id, sandboxId.GetString());
+            Assert.Equal("original", details.GetProperty("primaryDetails").GetProperty("reason").GetString());
+            Assert.Equal($"message {(hasId ? "[redacted]" : "private-id")} [redacted]", ex.Message);
+            Assert.Equal("operation [redacted]", ex.Operation);
+            Assert.Equal("code [redacted]", ex.NativeCode);
+            Assert.Equal("fix [redacted]", ex.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Theory]
     [InlineData("{")]
     [InlineData("[]")]
     [InlineData("null")]

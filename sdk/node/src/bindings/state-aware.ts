@@ -104,6 +104,12 @@ function createStateAwareResult(): StateAwareNativeResultV2 {
   };
 }
 
+function redactMetadata(value: string | undefined, ids: readonly string[]): string | undefined {
+  if (value === undefined) return undefined;
+  for (const id of ids) value = value.split(id).join('[redacted]');
+  return value.replace(/(?:microvm|nvx):[^\s\]"'`,;]+/gi, '[redacted]');
+}
+
 function malformedDetailsRedactor(detailsJson: string): (value: string | undefined) => string | undefined {
   const ids: string[] = [];
   for (const match of detailsJson.matchAll(/("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*(?:(")|$))/g)) {
@@ -116,11 +122,7 @@ function malformedDetailsRedactor(detailsJson: string): (value: string | undefin
       // The surrounding JSON is already known to be invalid.
     }
   }
-  return (value) => {
-    if (value === undefined) return undefined;
-    for (const id of ids) value = value.split(id).join('[redacted]');
-    return value.replace(/(?:microvm|nvx):[^\s\]"'`,;]+/gi, '[redacted]');
-  };
+  return (value) => redactMetadata(value, ids);
 }
 
 function decodeStateAwareResult(
@@ -166,9 +168,8 @@ function decodeStateAwareResult(
     const recovery = detailObject.nvxRecovery;
     const sandboxId = recovery !== null && typeof recovery === 'object' && !Array.isArray(recovery)
       ? (recovery as Record<string, unknown>).sandboxId : undefined;
-    const redact = (value: string | undefined): string | undefined =>
-      typeof sandboxId === 'string' && sandboxId.length > 0 && value !== undefined
-        ? value.split(sandboxId).join('[redacted]') : value;
+    const ids = typeof sandboxId === 'string' && sandboxId.length > 0 ? [sandboxId] : [];
+    const redact = (value: string | undefined): string | undefined => redactMetadata(value, ids);
     throw new MxcError({
       code: original.code,
       message: redact(original.message)!,

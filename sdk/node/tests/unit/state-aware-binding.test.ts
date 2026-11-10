@@ -132,6 +132,34 @@ describe('state-aware native binding ownership', () => {
     assert.strictEqual(native.freeCount, 1);
   });
 
+  for (const recovery of [
+    { sandboxId: 'private-id', state: 'provisioned' },
+    { sandboxId: 'microvm:0123456789abcdef0123456789abcdef', state: 'provisioned' },
+    { state: 'provisioned' },
+  ]) {
+    it('redacts alternate NVX tokens from valid-details metadata while preserving details', async () => {
+      const native = new FakeStateAwareNative();
+      native.resultStatus = 12;
+      const id = 'sandboxId' in recovery ? recovery.sandboxId : 'private-id';
+      native.errorMessage = `message ${id} nvx:other-one`;
+      native.operation = 'operation MICROVM:other-two';
+      native.nativeCode = 'code nvx:other-three';
+      native.remediation = 'fix microvm:other-four';
+      native.detailsJson = JSON.stringify({ nvxRecovery: recovery, primaryDetails: { reason: 'original' } });
+      await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
+        assert.ok(error instanceof MxcError);
+        assert.deepStrictEqual(error.details?.nvxRecovery, recovery);
+        assert.deepStrictEqual(error.details?.primaryDetails, { reason: 'original' });
+        assert.strictEqual(error.message, `message ${'sandboxId' in recovery ? '[redacted]' : 'private-id'} [redacted]`);
+        assert.strictEqual(error.operation, 'operation [redacted]');
+        assert.strictEqual(error.nativeCode, 'code [redacted]');
+        assert.strictEqual(error.remediation, 'fix [redacted]');
+        return true;
+      });
+      assert.strictEqual(native.freeCount, 1);
+    });
+  }
+
   for (const detailsJson of [
     '{"nvxRecovery":{"sandboxId":"nvx:secret-123"}} trailing',
     '{"nvxRecovery":{"sandboxId":"nvx:secret-\\u003123"}} trailing',

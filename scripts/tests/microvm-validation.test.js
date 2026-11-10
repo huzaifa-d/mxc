@@ -573,7 +573,7 @@ for (const [mode, message] of [
 }
 
 test("artifact dispatcher executes prebuilt SDK tests and preserves the log", () => {
-  const directory = artifact();
+  const directory = managedArtifact();
   const result = dispatch(directory);
   assert.equal(result.status, 0, result.output);
   const log = readFileSync(join(directory, "logs", "microvm-nvx.log"), "utf8");
@@ -607,7 +607,7 @@ for (const [mode, message] of [
   ["ignored", /skipped or filtered tests/],
 ]) {
   test(`artifact dispatcher fails closed for ${mode}`, () => {
-    const result = dispatch(artifact(), mode);
+    const result = dispatch(managedArtifact(), mode);
     assert.notEqual(result.status, 0, result.output);
     assert.match(result.output, message);
   });
@@ -638,6 +638,12 @@ for (const mode of ["managed-dotnet-skipped", "managed-node-skipped"]) {
   });
 }
 
+test("artifact dispatcher rejects a missing managed SDK bundle", () => {
+  const result = dispatch(artifact());
+  assert.notEqual(result.status, 0, result.output);
+  assert.match(result.output, /Required CI artifact file is missing:[\s\S]*Microsoft\.Mxc\.Sdk\.Tests\.exe/);
+});
+
 test("artifact dispatcher rejects an incomplete managed SDK bundle", () => {
   const directory = artifact();
   mkdirSync(join(directory, "windows-sdk-bundle"));
@@ -646,9 +652,23 @@ test("artifact dispatcher rejects an incomplete managed SDK bundle", () => {
   assert.match(result.output, /Required CI artifact file is missing:[\s\S]*Microsoft\.Mxc\.Sdk\.Tests\.exe/);
 });
 
+for (const missing of ["node/node.exe", "sdk-integration/dist/nvx-json.test.js"]) {
+  test(`artifact dispatcher rejects missing ${missing}`, () => {
+    const directory = managedArtifact();
+    rmSync(join(directory, "windows-sdk-bundle", ...missing.split("/")));
+    const result = dispatch(directory);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, /Required CI artifact file is missing/);
+  });
+}
+
 test("scheduled MicroVM lane downloads the Windows SDK bundle", () => {
   const workflow = readFileSync(join(root, ".github", "workflows", "Validation.Tests.Matrix.Job.yml"), "utf8");
-  assert.match(workflow, /matrix\.backend == 'microvm'/);
+  const download = workflow.match(/- name: Download Windows SDK test bundle[\s\S]*?(?=\n      - name:)/);
+  assert.ok(download, "Windows SDK bundle download step is missing");
+  assert.match(download[0], /matrix\.backend == 'microvm'/);
+  assert.match(download[0], /name: windows-sdk-test-bundle-\$\{\{ matrix\.target \}\}/);
+  assert.match(download[0], /path: artifacts\/bin\/windows-sdk-bundle/);
 });
 
 test("artifact dispatcher rejects a missing test payload", () => {

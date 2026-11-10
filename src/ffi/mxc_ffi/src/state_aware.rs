@@ -78,6 +78,12 @@ pub struct MxcStateAwareResultV2 {
     pub error_details_json_utf8: *mut c_char,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LIFECYCLE_ERROR: std::cell::RefCell<Option<mxc_sdk::v1::Error>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl MxcStateAwareResult {
     #[cfg(test)]
     fn empty() -> Self {
@@ -174,6 +180,11 @@ fn state_aware_inner(
             }
         }
     };
+
+    #[cfg(test)]
+    if let Some(error) = TEST_LIFECYCLE_ERROR.with(|slot| slot.borrow_mut().take()) {
+        return result_v2_from_sdk_error(&error, include_details);
+    }
 
     match run_state_aware_json(request_json, dry_run, experimental) {
         Ok(response_json) => MxcStateAwareResultV2 {
@@ -762,31 +773,47 @@ mod tests {
     }
 
     #[test]
-    fn structured_recovery_results_are_independent_and_survive_until_freed() {
-        let mut first_error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "first");
-        let mut second_error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "second");
-        first_error.details = Some(Box::new(
-            serde_json::json!({"nvxRecovery": {"sandboxId": "id-one", "state": "provisioned"}}),
-        ));
-        second_error.details = Some(Box::new(
-            serde_json::json!({"nvxRecovery": {"sandboxId": "id-two", "state": "provisioned"}, "other": 2}),
-        ));
-        let mut first = result_v2_from_sdk_error(&first_error, true);
-        let mut second = result_v2_from_sdk_error(&second_error, true);
+    fn v2_entrypoint_keeps_populated_recovery_results_independently_owned() {
+        let request = CString::new(WINDOWS_SANDBOX_PROVISION_REQUEST).unwrap();
+        let details = [
+            serde_json::json!({"nvxRecovery": {"sandboxId": "microvm:0123456789abcdef0123456789abcdef", "state": "provisioned"}, "primaryDetails": {"reason": "first"}}),
+            serde_json::json!({"nvxRecovery": {"sandboxId": "microvm:fedcba9876543210fedcba9876543210", "state": "provisioned"}, "primaryDetails": {"reason": "second"}}),
+        ];
+        let mut first = MxcStateAwareResultV2 {
+            result: MxcStateAwareResult::empty(),
+            error_details_json_utf8: ptr::null_mut(),
+        };
+        let mut second = MxcStateAwareResultV2 {
+            result: MxcStateAwareResult::empty(),
+            error_details_json_utf8: ptr::null_mut(),
+        };
+        for (detail, out) in details.iter().zip([&mut first, &mut second]) {
+            let mut error = mxc_sdk::v1::Error::new(crate::ErrorCode::BackendError, "close failed");
+            error.details = Some(Box::new(detail.clone()));
+            TEST_LIFECYCLE_ERROR.with(|slot| assert!(slot.replace(Some(error)).is_none()));
+            // SAFETY: the request is a live C string and out is writable.
+            let status = unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 1, out) };
+            assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
+            assert_eq!(out.result.status, status);
+        }
         let read = |result: &MxcStateAwareResultV2| -> serde_json::Value {
+            assert!(!result.error_details_json_utf8.is_null());
             // SAFETY: the live result owns a NUL-terminated UTF-8 string.
             let json = unsafe { std::ffi::CStr::from_ptr(result.error_details_json_utf8) }
                 .to_str()
                 .unwrap();
             serde_json::from_str(json).unwrap()
         };
-        assert_eq!(read(&first), *first_error.details.unwrap());
-        assert_eq!(read(&second), *second_error.details.unwrap());
-        // SAFETY: both results were constructed by the same allocator.
-        unsafe {
-            mxc_state_aware_result_v2_free(&mut second);
-        }
-        assert_eq!(read(&first)["nvxRecovery"]["sandboxId"], "id-one");
+        assert_ne!(
+            first.error_details_json_utf8,
+            second.error_details_json_utf8
+        );
+        assert_eq!(read(&first), details[0]);
+        assert_eq!(read(&second), details[1]);
+        // SAFETY: both results were populated by the V2 entry point.
+        unsafe { mxc_state_aware_result_v2_free(&mut second) };
+        assert!(second.error_details_json_utf8.is_null());
+        assert_eq!(read(&first), details[0]);
         // SAFETY: both result structs remain live and freeing twice is supported.
         unsafe {
             mxc_state_aware_result_v2_free(&mut first);
