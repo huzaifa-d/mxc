@@ -172,6 +172,10 @@ describe('state-aware native binding ownership', () => {
   for (const [detailsJson, id] of [
     ['{"nvxRecovery":{"sandboxId":"nvx:secret-123', 'nvx:secret-123'],
     ['[]', 'nvx:secret-123'],
+    ['{"nvxRecovery":{"sandboxId":"microvm:0123456789abcdef0123456789abcdef', 'microvm:0123456789abcdef0123456789abcdef'],
+    ['[]', 'microvm:0123456789abcdef0123456789abcdef'],
+    ['[]', 'MICROVM:0123456789abcdef0123456789abcdef'],
+    ['{"nvxRecovery":{"sandboxId":"private-id', 'private-id'],
     ['{"nvxRecovery":{"\\u0073andboxId":"private-id"}} trailing', 'private-id'],
     ['{"nvxRecovery":{"sandboxId":"private-\\u0069d"}} trailing', 'private-id'],
   ]) {
@@ -191,12 +195,37 @@ describe('state-aware native binding ownership', () => {
         assert.strictEqual(error.details?.ffiStatus, 7);
         assert.ok(!JSON.stringify(error.details).includes(id));
         assert.ok(!String(cause).includes(id));
-        assert.strictEqual(cause.operation, 'op [redacted]');
-        assert.strictEqual(cause.nativeCode, 'code [redacted]');
+        assert.strictEqual(cause.operation, undefined);
+        assert.strictEqual(cause.nativeCode, undefined);
         assert.strictEqual(cause.remediation, 'fix [redacted]');
         return true;
       });
       assert.strictEqual(native.freeCount, 1);
+    });
+  }
+
+  for (const [operation, nativeCode, expectedCode] of [
+    ['op:arbitrary', 'normalcode', 'normalcode'],
+    ['operation with space', 'code:arbitrary', undefined],
+    ['op\targs', 'code\nargs', undefined],
+    ['op\u0085args', 'code\u0085args', undefined],
+  ] as const) {
+    it('withholds parameterized operation and native code for malformed details', async () => {
+      const native = new FakeStateAwareNative();
+      native.resultStatus = 12;
+      native.operation = operation;
+      native.nativeCode = nativeCode;
+      native.remediation = 'safe remediation';
+      native.detailsJson = '[]';
+      await assert.rejects(() => runBindingStateAwareRequestWithNative(REQUEST, native), (error: unknown) => {
+        assert.ok(error instanceof MxcError);
+        const cause = error.details?.cause;
+        assert.ok(cause instanceof MxcError);
+        assert.strictEqual(cause.operation, undefined);
+        assert.strictEqual(cause.nativeCode, expectedCode);
+        assert.strictEqual(cause.remediation, 'safe remediation');
+        return true;
+      });
     });
   }
 

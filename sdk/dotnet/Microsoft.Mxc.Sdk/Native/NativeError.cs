@@ -80,8 +80,8 @@ internal static unsafe class NativeError
             var ids = ExtractSandboxIds(detailsJson);
             original = new MxcException(original.Code,
                 "original error message withheld because native error details were malformed",
-                RedactMalformedMetadata(original.Operation, ids),
-                RedactMalformedMetadata(original.NativeCode, ids),
+                ParameterFreeMetadata(RedactMalformedMetadata(original.Operation, ids)),
+                ParameterFreeMetadata(RedactMalformedMetadata(original.NativeCode, ids)),
                 RedactMalformedMetadata(original.Remediation, ids));
             return new MxcException(ErrorCode.BackendError,
                 "native lifecycle returned malformed error details", original);
@@ -92,13 +92,15 @@ internal static unsafe class NativeError
     {
         var ids = new List<string>();
         foreach (Match match in Regex.Matches(detailsJson,
-            @"(""(?:\\.|[^""\\])*"")\s*:\s*(""(?:\\.|[^""\\])*"")",
+            @"(""(?:\\.|[^""\\])*"")\s*:\s*(""(?:\\.|[^""\\])*(?:("")|\z))",
             RegexOptions.NonBacktracking))
         {
             try
             {
                 var key = MxcJson.Deserialize<JsonElement>(match.Groups[1].Value).GetString();
-                var id = MxcJson.Deserialize<JsonElement>(match.Groups[2].Value).GetString();
+                var value = match.Groups[2].Value;
+                if (!match.Groups[3].Success) value += '"';
+                var id = MxcJson.Deserialize<JsonElement>(value).GetString();
                 if (key == "sandboxId" && !string.IsNullOrEmpty(id)) ids.Add(id);
             }
             catch (JsonException)
@@ -113,7 +115,18 @@ internal static unsafe class NativeError
     {
         if (value is null) return null;
         foreach (var id in ids) value = value.Replace(id, "[redacted]", StringComparison.Ordinal);
-        return Regex.Replace(value, @"nvx:[^\s\]""'`,;]+", "[redacted]", RegexOptions.NonBacktracking);
+        return Regex.Replace(value, @"(?:microvm|nvx):[^\s\]""'`,;]+", "[redacted]",
+            RegexOptions.NonBacktracking | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    private static string? ParameterFreeMetadata(string? value)
+    {
+        if (value is null) return null;
+        foreach (var character in value)
+        {
+            if (character == ':' || char.IsWhiteSpace(character)) return null;
+        }
+        return value;
     }
 
     /// <summary>

@@ -150,6 +150,10 @@ public unsafe class NativeErrorTests
     [Theory]
     [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"nvx:secret-123", "nvx:secret-123")]
     [InlineData("[]", "nvx:secret-123")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"microvm:0123456789abcdef0123456789abcdef", "microvm:0123456789abcdef0123456789abcdef")]
+    [InlineData("[]", "microvm:0123456789abcdef0123456789abcdef")]
+    [InlineData("[]", "MICROVM:0123456789abcdef0123456789abcdef")]
+    [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"private-id", "private-id")]
     [InlineData("{\"nvxRecovery\":{\"\\u0073andboxId\":\"private-id\"}} trailing", "private-id")]
     [InlineData("{\"nvxRecovery\":{\"sandboxId\":\"private-\\u0069d\"}} trailing", "private-id")]
     public void MalformedLifecycleDetailsRedactRecoveryIdFromMetadata(string detailsJson, string id)
@@ -162,12 +166,35 @@ public unsafe class NativeErrorTests
             var original = Assert.IsType<MxcException>(ex.InnerException);
             Assert.Equal(ErrorCode.NotProvisioned, original.Code);
             Assert.DoesNotContain(id, ex.ToString());
-            Assert.DoesNotContain(id, original.Operation);
-            Assert.DoesNotContain(id, original.NativeCode);
+            Assert.Null(original.Operation);
+            Assert.Null(original.NativeCode);
             Assert.DoesNotContain(id, original.Remediation);
-            Assert.Contains("[redacted]", original.Operation);
-            Assert.Contains("[redacted]", original.NativeCode);
             Assert.Contains("[redacted]", original.Remediation);
+        }
+        finally
+        {
+            Free(detail);
+            Marshal.FreeCoTaskMem((IntPtr)json);
+        }
+    }
+
+    [Theory]
+    [InlineData("op:arbitrary", "normalcode")]
+    [InlineData("operation with space", "code:arbitrary")]
+    [InlineData("op\targs", "code\nargs")]
+    [InlineData("op\u0085args", "code\u0085args")]
+    public void MalformedDetailsWithholdParameterizedOperationAndNativeCode(string operation, string nativeCode)
+    {
+        var detail = Detail("failure", operation, nativeCode, "safe remediation");
+        var json = Utf8("[]");
+        try
+        {
+            var ex = NativeError.ToExceptionWithDetails((int)ErrorCode.BackendError, detail, "fallback", json);
+            var original = Assert.IsType<MxcException>(ex.InnerException);
+            Assert.Null(original.Operation);
+            if (nativeCode.Contains(':') || nativeCode.Any(char.IsWhiteSpace)) Assert.Null(original.NativeCode);
+            else Assert.Equal(nativeCode, original.NativeCode);
+            Assert.Equal("safe remediation", original.Remediation);
         }
         finally
         {

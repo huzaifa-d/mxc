@@ -106,10 +106,11 @@ function createStateAwareResult(): StateAwareNativeResultV2 {
 
 function malformedDetailsRedactor(detailsJson: string): (value: string | undefined) => string | undefined {
   const ids: string[] = [];
-  for (const match of detailsJson.matchAll(/("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")/g)) {
+  for (const match of detailsJson.matchAll(/("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*(?:(")|$))/g)) {
     try {
       const key: unknown = JSON.parse(match[1]);
-      const id: unknown = JSON.parse(match[2]);
+      const rawValue = match[3] === undefined ? `${match[2]}"` : match[2];
+      const id: unknown = JSON.parse(rawValue);
       if (key === 'sandboxId' && typeof id === 'string' && id.length > 0) ids.push(id);
     } catch {
       // The surrounding JSON is already known to be invalid.
@@ -118,7 +119,7 @@ function malformedDetailsRedactor(detailsJson: string): (value: string | undefin
   return (value) => {
     if (value === undefined) return undefined;
     for (const id of ids) value = value.split(id).join('[redacted]');
-    return value.replace(/nvx:[^\s\]"'`,;]+/g, '[redacted]');
+    return value.replace(/(?:microvm|nvx):[^\s\]"'`,;]+/gi, '[redacted]');
   };
 }
 
@@ -143,11 +144,15 @@ function decodeStateAwareResult(
       }
     } catch {
       const redact = malformedDetailsRedactor(detailsJson);
+      const parameterFree = (value: string | undefined): string | undefined => {
+        const redacted = redact(value);
+        return redacted !== undefined && /[:\s\p{White_Space}]/u.test(redacted) ? undefined : redacted;
+      };
       const cause = new MxcError({
         code: original.code,
         message: 'original error message withheld because native error details were malformed',
-        operation: redact(original.operation),
-        nativeCode: redact(original.nativeCode),
+        operation: parameterFree(original.operation),
+        nativeCode: parameterFree(original.nativeCode),
         remediation: redact(original.remediation),
         details: { ffiStatus: result.status || nativeStatus },
       });
