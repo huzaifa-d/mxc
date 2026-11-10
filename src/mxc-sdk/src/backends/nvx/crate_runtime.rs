@@ -227,7 +227,16 @@ fn discover_bundle() -> Result<BundledAgent, MxcError> {
 
 fn module_candidates(directory: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![directory.join("aci-edge-sandboxes")];
-    if directory.ends_with(Path::new("runtimes").join("win-x64").join("native")) {
+    let mut components = directory.components().rev();
+    let is_rid_native = ["native", "win-x64", "runtimes"].iter().all(|expected| {
+        components.next().is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|part| part.eq_ignore_ascii_case(expected))
+        })
+    });
+    if is_rid_native {
         if let Some(rid) = directory.parent() {
             candidates.push(rid.join("aci-edge-sandboxes"));
             if let Some(root) = rid.parent().and_then(Path::parent) {
@@ -238,22 +247,164 @@ fn module_candidates(directory: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+// File inventory from the approved SHA256SUMS pinned in signature_verification.
+const REQUIRED_BUNDLE_FILES: &[&str] = &[
+    r"bin\aci_edge_agent.dll",
+    r"bundle-manifest.json",
+    r"SOURCE-MANIFEST.json",
+    r"SHA256SUMS",
+    r"NOTICE.txt",
+    r"bin\EULA.txt",
+    r"bin\direct-images.exe",
+    r"bin\openvmm.exe",
+    r"guest\initramfs-edge.cpio.gz",
+    r"guest\nvx-edge-agent",
+    r"guest\vmlinux",
+    r"guest\vmlinux.config",
+    r"licenses\linux\COPYING",
+    r"licenses\linux\LICENSES\deprecated\0BSD",
+    r"licenses\linux\LICENSES\deprecated\CC0-1.0",
+    r"licenses\linux\LICENSES\deprecated\GFDL-1.1",
+    r"licenses\linux\LICENSES\deprecated\GFDL-1.2",
+    r"licenses\linux\LICENSES\deprecated\GPL-1.0",
+    r"licenses\linux\LICENSES\deprecated\ISC",
+    r"licenses\linux\LICENSES\deprecated\Linux-OpenIB",
+    r"licenses\linux\LICENSES\deprecated\X11",
+    r"licenses\linux\LICENSES\deprecated\Zlib",
+    r"licenses\linux\LICENSES\dual\Apache-2.0",
+    r"licenses\linux\LICENSES\dual\CC-BY-4.0",
+    r"licenses\linux\LICENSES\dual\CDDL-1.0",
+    r"licenses\linux\LICENSES\dual\MPL-1.1",
+    r"licenses\linux\LICENSES\dual\copyleft-next-0.3.1",
+    r"licenses\linux\LICENSES\exceptions\GCC-exception-2.0",
+    r"licenses\linux\LICENSES\exceptions\Linux-syscall-note",
+    r"licenses\linux\LICENSES\preferred\BSD-2-Clause",
+    r"licenses\linux\LICENSES\preferred\BSD-3-Clause",
+    r"licenses\linux\LICENSES\preferred\BSD-3-Clause-Clear",
+    r"licenses\linux\LICENSES\preferred\GPL-2.0",
+    r"licenses\linux\LICENSES\preferred\LGPL-2.0",
+    r"licenses\linux\LICENSES\preferred\LGPL-2.1",
+    r"licenses\linux\LICENSES\preferred\MIT",
+    r"provenance\direct-images\NOTICE.txt",
+    r"provenance\direct-images\SHA256SUMS",
+    r"provenance\direct-images\cgmanifest.json",
+    r"provenance\direct-images\dependency-inventory.json",
+    r"provenance\direct-images\direct-images-manifest.json",
+    r"provenance\direct-images\licenses\modules\001\LICENSE",
+    r"provenance\direct-images\licenses\modules\002\LICENSE",
+    r"provenance\direct-images\licenses\modules\003\LICENSE",
+    r"provenance\direct-images\licenses\modules\004\LICENSE.md",
+    r"provenance\direct-images\licenses\modules\005\AUTHORS",
+    r"provenance\direct-images\licenses\modules\005\LICENSE",
+    r"provenance\direct-images\licenses\modules\005\NOTICE",
+    r"provenance\direct-images\licenses\modules\005\cli\connhelper\internal\syntax\LICENSE",
+    r"provenance\direct-images\licenses\modules\006\LICENSE",
+    r"provenance\direct-images\licenses\modules\007\LICENSE",
+    r"provenance\direct-images\licenses\modules\008\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\gzhttp\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\internal\lz4ref\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\internal\snapref\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\s2\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\s2\cmd\internal\filepathx\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\s2\cmd\internal\readahead\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\snappy\AUTHORS",
+    r"provenance\direct-images\licenses\modules\009\snappy\CONTRIBUTORS",
+    r"provenance\direct-images\licenses\modules\009\snappy\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\snappy\xerial\LICENSE",
+    r"provenance\direct-images\licenses\modules\009\zstd\internal\xxhash\LICENSE.txt",
+    r"provenance\direct-images\licenses\modules\010\LICENSE",
+    r"provenance\direct-images\licenses\modules\011\LICENSE",
+    r"provenance\direct-images\licenses\modules\012\LICENSE",
+    r"provenance\direct-images\licenses\modules\012\cmd\runhcs\LICENSE",
+    r"provenance\direct-images\licenses\modules\012\cmd\runhcs\NOTICE",
+    r"provenance\direct-images\licenses\modules\012\pkg\go-runhcs\LICENSE",
+    r"provenance\direct-images\licenses\modules\012\pkg\go-runhcs\NOTICE",
+    r"provenance\direct-images\licenses\modules\013\LICENSE.md",
+    r"provenance\direct-images\licenses\modules\014\LICENSE",
+    r"provenance\direct-images\licenses\modules\014\LICENSE.docs",
+    r"provenance\direct-images\licenses\modules\015\LICENSE",
+    r"provenance\direct-images\licenses\modules\016\LICENSE",
+    r"provenance\direct-images\licenses\modules\017\LICENSE.txt",
+    r"provenance\direct-images\licenses\modules\018\LICENSE",
+    r"provenance\direct-images\licenses\modules\019\LICENSE",
+    r"provenance\direct-images\licenses\modules\020\LICENSE",
+    r"provenance\direct-images\licenses\modules\021\AUTHORS",
+    r"provenance\direct-images\licenses\modules\021\LICENSE",
+    r"provenance\direct-images\licenses\modules\022\LICENSE",
+    r"provenance\direct-images\licenses\modules\022\PATENTS",
+    r"provenance\direct-images\licenses\modules\023\LICENSE",
+    r"provenance\direct-images\licenses\modules\023\PATENTS",
+    r"provenance\direct-images\licenses\modules\024\LICENSE",
+    r"provenance\direct-images\licenses\modules\024\PATENTS",
+    r"provenance\direct-images\licenses\source\EULA.txt",
+    r"provenance\direct-images\licenses\toolchain\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\compile\internal\ssa\_gen\vendor\golang.org\x\tools\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\compile\internal\ssa\_gen\vendor\golang.org\x\tools\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\google\pprof\AUTHORS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\google\pprof\CONTRIBUTORS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\google\pprof\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\google\pprof\third_party\svgpan\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\ianlancetaylor\demangle\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\microsoft\go-infra\telemetry\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\github.com\microsoft\go-infra\telemetry\config\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\arch\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\arch\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\build\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\build\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\mod\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\mod\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\sync\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\sync\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\sys\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\sys\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\telemetry\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\telemetry\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\term\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\term\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\text\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\text\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\tools\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\golang.org\x\tools\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\cmd\vendor\rsc.io\markdown\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\crypto\internal\boring\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\runtime\testdata\testgoroutineleakprofile\goker\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\github.com\microsoft\go-crypto-darwin\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\github.com\microsoft\go-crypto-openssl\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\github.com\microsoft\go-crypto-winnative\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\crypto\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\crypto\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\net\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\net\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\sys\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\sys\PATENTS",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\text\LICENSE",
+    r"provenance\direct-images\licenses\toolchain\src\vendor\golang.org\x\text\PATENTS",
+    r"provenance\edge-guest.json",
+    r"provenance\edge-windows.json",
+    r"provenance\licenses\linux\COPYING-LINUX",
+    r"provenance\licenses\nvx\LICENSE",
+    r"provenance\licenses\nvx\THIRD_PARTY_NOTICES.md",
+    r"provenance\licenses\openvmm\LICENSE",
+    r"provenance\openvmm.provenance.json",
+    r"provenance\vmlinux.provenance.json",
+    r"source\linux\BUILD-ENVIRONMENT.txt",
+    r"source\linux\SOURCE-MANIFEST.json",
+    r"source\linux\SOURCE.md",
+    r"source\linux\config-microvm",
+    r"source\linux\patches\0001-microvm-xe9-earlycon.patch",
+    r"source\linux\patches\0002-microvm-hvc-xe9.patch",
+    r"source\linux\patches\0003-microvm-virtio-mmio-shared-status.patch",
+];
+
 fn selected_bundle_with(
     directory: &Path,
     is_file: &impl Fn(&Path) -> bool,
 ) -> Result<BundledAgent, MxcError> {
     let bundle = BundledAgent::from_dir(directory.to_path_buf()).map_err(map_error)?;
-    for path in [
-        bundle.library().to_path_buf(),
-        directory.join("bundle-manifest.json"),
-        directory.join("SOURCE-MANIFEST.json"),
-        directory.join("SHA256SUMS"),
-        directory.join(r"bin\openvmm.exe"),
-        directory.join(r"bin\direct-images.exe"),
-        directory.join(r"guest\vmlinux"),
-        directory.join(r"guest\initramfs-edge.cpio.gz"),
-        directory.join(r"guest\nvx-edge-agent"),
-    ] {
+    for relative_path in REQUIRED_BUNDLE_FILES {
+        let path = directory.join(relative_path);
         if !is_file(&path) {
             return Err(MxcError::backend_unavailable(format!(
                 "NVX bundle is missing {}",
@@ -1054,7 +1205,7 @@ mod tests {
         })
         .is_ok());
         let files = files.into_inner();
-        assert_eq!(files.len(), 9);
+        assert_eq!(files.len(), 147);
         for missing in &files {
             let error = selected_bundle_with(directory, &|path| path != missing)
                 .err()
@@ -1080,6 +1231,17 @@ mod tests {
         let error = result.err().unwrap();
         assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
         assert!(error.message.contains("bundle-manifest.json"));
+    }
+
+    #[test]
+    fn discovery_rejects_missing_kernel_config() {
+        let directory = Path::new(r"C:\incomplete-nvx-bundle");
+        let missing = directory.join(r"guest\vmlinux.config");
+        let error = selected_bundle_with(directory, &|path| path != missing)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, MxcErrorCode::BackendUnavailable);
+        assert!(error.message.contains("vmlinux.config"));
     }
 
     #[test]
@@ -1159,6 +1321,16 @@ mod tests {
             vec![
                 PathBuf::from(r"C:\app\runtimes\win-x64\native\aci-edge-sandboxes"),
                 PathBuf::from(r"C:\app\runtimes\win-x64\aci-edge-sandboxes"),
+                PathBuf::from(r"C:\app\aci-edge-sandboxes"),
+            ]
+        );
+        let mixed_module = Path::new(r"C:\app\Runtimes\Win-X64\Native\mxc_ffi.dll");
+        let mixed_case = mixed_module.parent().unwrap();
+        assert_eq!(
+            module_candidates(mixed_case),
+            vec![
+                PathBuf::from(r"C:\app\Runtimes\Win-X64\Native\aci-edge-sandboxes"),
+                PathBuf::from(r"C:\app\Runtimes\Win-X64\aci-edge-sandboxes"),
                 PathBuf::from(r"C:\app\aci-edge-sandboxes"),
             ]
         );
