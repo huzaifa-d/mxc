@@ -908,6 +908,39 @@ mod tests {
                     }
                     #[cfg(target_arch = "x86_64")]
                     {
+                        let bad_id = CString::new(
+                            r#"{"version":"1.0.0","phase":"start","sandboxId":"microvm:bad"}"#,
+                        )
+                        .unwrap();
+                        let mut bad = MxcStateAwareResult::empty();
+                        // SAFETY: the C string and output are valid for the duration of the call.
+                        let status =
+                            unsafe { mxc_run_state_aware_json(bad_id.as_ptr(), 1, 1, &mut bad) };
+                        assert_eq!(status, crate::MXC_STATUS_MALFORMED_ID);
+                        unsafe { mxc_state_aware_result_free(&mut bad) };
+                        let mut bad_v2 = MxcStateAwareResultV2 {
+                            result: MxcStateAwareResult::empty(),
+                            error_details_json_utf8: ptr::null_mut(),
+                        };
+                        // SAFETY: the C string and output are valid for the duration of the call.
+                        let status = unsafe {
+                            mxc_run_state_aware_json_v2(bad_id.as_ptr(), 1, 1, &mut bad_v2)
+                        };
+                        assert_eq!(status, crate::MXC_STATUS_MALFORMED_ID);
+                        unsafe { mxc_state_aware_result_v2_free(&mut bad_v2) };
+                        let bad_policy = CString::new(concat!(
+                            r#"{"version":"1.1.0-alpha","phase":"exec","#,
+                            r#""sandboxId":"microvm:0123456789abcdef0123456789abcdef","#,
+                            r#""process":{"commandLine":"echo test","cwd":"relative"}}"#,
+                        ))
+                        .unwrap();
+                        let mut rejected = MxcStateAwareResult::empty();
+                        // SAFETY: the C string and output are valid for the duration of the call.
+                        let status = unsafe {
+                            mxc_run_state_aware_json(bad_policy.as_ptr(), 1, 1, &mut rejected)
+                        };
+                        assert_eq!(status, crate::MXC_STATUS_POLICY_VALIDATION);
+                        unsafe { mxc_state_aware_result_free(&mut rejected) };
                         let mut out = MxcStateAwareResult::empty();
                         // SAFETY: request and out remain valid during the call.
                         let status =

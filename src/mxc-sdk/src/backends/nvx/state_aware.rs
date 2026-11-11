@@ -33,6 +33,90 @@ pub(crate) fn take_recovery_for_test() -> Option<(String, Value)> {
     TEST_RECOVERY.with(|slot| slot.borrow_mut().take())
 }
 
+pub(crate) fn dispatch(
+    bound: crate::mxc_common::state_aware_binding::BoundStateAwareRequest<NvxStateAwareRunner>,
+    dry_run: bool,
+) -> Result<crate::mxc_common::state_aware_dispatch::DispatchOutcome, MxcError> {
+    use crate::mxc_common::state_aware_binding::BoundStateAwareOperation;
+    use crate::mxc_common::state_aware_dispatch::dispatch_state_aware;
+
+    // The shared dispatcher repeats these checks, but they must precede
+    // impersonation capture and native work on a small-stack thread.
+    let request = bound.request();
+    match bound.operation() {
+        BoundStateAwareOperation::Provision(config) => {
+            super::policy::validate_provision_request(request, config.as_ref())?;
+        }
+        BoundStateAwareOperation::Start { sandbox_id, .. }
+        | BoundStateAwareOperation::Stop { sandbox_id, .. }
+        | BoundStateAwareOperation::Deprovision { sandbox_id, .. } => {
+            SandboxId::from_mxc(sandbox_id)?;
+            super::policy::validate_post_provision_request(request)?;
+        }
+        BoundStateAwareOperation::Exec { sandbox_id, .. } => {
+            crate::mxc_common::validator::validate_exec_common(request)?;
+            SandboxId::from_mxc(sandbox_id)?;
+            super::policy::validate_post_provision_request(request)?;
+            super::policy::validate_process_request(request)?;
+        }
+        BoundStateAwareOperation::ProvisionSession(_)
+        | BoundStateAwareOperation::DeprovisionSession { .. } => {
+            return dispatch_state_aware(&mut NvxStateAwareRunner::new(), bound, dry_run);
+        }
+    }
+
+    run_nvx_with_sufficient_stack(move || {
+        let mut runner = NvxStateAwareRunner::new();
+        #[cfg(feature = "test-support")]
+        if let Some((sandbox_id, primary_details)) = take_recovery_for_test() {
+            runner.configure_recovery_for_test(&sandbox_id)?;
+            let mut error = MxcError::backend_error("injected primary failure");
+            error.details = Some(primary_details);
+            return runner.finish(Err(error));
+        }
+        let outcome = dispatch_state_aware(&mut runner, bound, dry_run);
+        runner.finish(outcome)
+    })
+}
+
+fn run_nvx_with_sufficient_stack(
+    run: impl FnOnce() -> Result<crate::mxc_common::state_aware_dispatch::DispatchOutcome, MxcError>
+        + Send,
+) -> Result<crate::mxc_common::state_aware_dispatch::DispatchOutcome, MxcError> {
+    let (mut low, mut high) = (0usize, 0usize);
+    // SAFETY: both output pointers refer to writable stack locals.
+    unsafe { windows::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high) };
+    if high.saturating_sub(low) >= 1024 * 1024 {
+        return run();
+    }
+    let context = crate::lifecycle_thread_context::LifecycleThreadContext::capture()
+        .map_err(MxcError::backend_error)?;
+    #[cfg(feature = "test-support")]
+    let recovery = take_recovery_for_test();
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("mxc-lifecycle".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                context.run(|| {
+                    #[cfg(feature = "test-support")]
+                    if let Some((sandbox_id, details)) = recovery {
+                        set_recovery_for_test(&sandbox_id, details);
+                    }
+                    run()
+                })
+            })
+            .map_err(|error| {
+                MxcError::backend_error(format!("could not start lifecycle worker: {error}"))
+            })?;
+        match worker.join() {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(MxcError::backend_error(error)),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 pub(crate) struct NvxStateAwareRunner {
     client: std::cell::RefCell<Option<NvxClient>>,
     capture_limit: Option<usize>,
@@ -337,5 +421,47 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
         super::policy::validate_post_provision_request(request)?;
         let _ = self.client()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mxc_common::mxc_error::MxcErrorCode;
+    use crate::mxc_common::state_aware_binding::{
+        BoundStateAwareOperation, BoundStateAwareRequest,
+    };
+    use windows::Win32::Security::{ImpersonateSelf, RevertToSelf, SecurityIdentification};
+
+    #[test]
+    fn provision_policy_is_validated_before_low_stack_worker() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                // SAFETY: reverted on this thread before it exits.
+                unsafe { ImpersonateSelf(SecurityIdentification) }.unwrap();
+                struct Revert;
+                impl Drop for Revert {
+                    fn drop(&mut self) {
+                        // SAFETY: balances the successful ImpersonateSelf call.
+                        unsafe { RevertToSelf() }.unwrap();
+                    }
+                }
+                let _revert = Revert;
+                let mut request = ExecutionRequest::default();
+                request.policy.ui_specified = true;
+                let bound = BoundStateAwareRequest::for_test(
+                    request,
+                    BoundStateAwareOperation::Provision(Some(MicroVmProvisionConfig {
+                        image: "mcr.microsoft.com/azurelinux/base/core:3.0".into(),
+                        memory_mib: None,
+                    })),
+                );
+                let error = dispatch(bound, true).unwrap_err();
+                assert_eq!(error.code, MxcErrorCode::PolicyValidation);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
