@@ -78,57 +78,6 @@ pub struct MxcStateAwareResultV2 {
     pub error_details_json_utf8: *mut c_char,
 }
 
-// SAFETY: every pointer in this result owns a CString allocation, which can be
-// transferred between threads and is released only after the joined call returns.
-struct LifecycleThreadResult(MxcStateAwareResultV2);
-unsafe impl Send for LifecycleThreadResult {}
-
-fn state_aware_on_stack(
-    request_json_utf8: *const c_char,
-    dry_run: bool,
-    experimental: bool,
-    include_details: bool,
-) -> MxcStateAwareResultV2 {
-    let failure = |message: String| MxcStateAwareResultV2 {
-        result: MxcStateAwareResult::error(crate::MXC_STATUS_BACKEND_ERROR, message),
-        error_details_json_utf8: ptr::null_mut(),
-    };
-    let context = match mxc_sdk::__ffi::LifecycleThreadContext::capture() {
-        Ok(context) => context,
-        Err(error) => return failure(error),
-    };
-    // The C caller keeps this buffer valid until this function joins the worker.
-    let request_address = request_json_utf8 as usize;
-    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
-    let test_recovery = mxc_sdk::__ffi::take_nvx_recovery_for_test();
-    std::thread::scope(|scope| {
-        match std::thread::Builder::new()
-            .name("mxc-lifecycle".to_owned())
-            .stack_size(2 * 1024 * 1024)
-            .spawn_scoped(scope, move || {
-                context.run(|| {
-                    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
-                    if let Some((sandbox_id, details)) = test_recovery {
-                        mxc_sdk::__ffi::set_nvx_recovery_for_test(&sandbox_id, details);
-                    }
-                    LifecycleThreadResult(state_aware_inner(
-                        request_address as *const c_char,
-                        dry_run,
-                        experimental,
-                        include_details,
-                    ))
-                })
-            }) {
-            Ok(worker) => match worker.join() {
-                Ok(Ok(result)) => result.0,
-                Ok(Err(error)) => failure(error),
-                Err(panic) => std::panic::resume_unwind(panic),
-            },
-            Err(error) => failure(format!("could not start lifecycle worker: {error}")),
-        }
-    })
-}
-
 impl MxcStateAwareResult {
     #[cfg(test)]
     fn empty() -> Self {
@@ -182,7 +131,7 @@ pub unsafe extern "C" fn mxc_run_state_aware_json(
     }
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        state_aware_on_stack(request_json_utf8, dry_run != 0, experimental != 0, false).result
+        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0, false).result
     }))
     .unwrap_or_else(|panic| {
         crate::report_panic("mxc_run_state_aware_json", &*panic);
@@ -273,7 +222,7 @@ pub unsafe extern "C" fn mxc_run_state_aware_json_v2(
         return MXC_STATUS_NULL_ARGUMENT;
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        state_aware_on_stack(request_json_utf8, dry_run != 0, experimental != 0, true)
+        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0, true)
     }))
     .unwrap_or_else(|panic| {
         crate::report_panic("mxc_run_state_aware_json_v2", &*panic);
@@ -759,6 +708,12 @@ mod tests {
     const WINDOWS_SANDBOX_PROVISION_REQUEST: &str =
         r#"{"version":"1.1.0-alpha","phase":"provision","containment":"windows_sandbox"}"#;
 
+    #[cfg(target_os = "windows")]
+    const MICROVM_PROVISION_REQUEST: &str = concat!(
+        r#"{"version":"1.1.0-alpha","phase":"provision","containment":"microvm","#,
+        r#""microvm":{"image":"mcr.microsoft.com/azurelinux/base/core:3.0"}}"#,
+    );
+
     #[test]
     fn captured_exec_rejects_null_output_before_reading_request() {
         // SAFETY: both null arguments are explicitly supported.
@@ -871,39 +826,144 @@ mod tests {
         }
 
         #[test]
-        fn insufficient_impersonation_fails_closed_before_lifecycle_dispatch() {
-            let _guard = Impersonation::enter(1); // SecurityIdentification
-            let mut out = call("{}", false);
-            assert_eq!(out.status, crate::MXC_STATUS_BACKEND_ERROR);
-            // SAFETY: the failed result owns a NUL-terminated error message.
-            let message = unsafe { std::ffi::CStr::from_ptr(out.error.message_utf8) }
-                .to_str()
+        #[cfg(target_arch = "x86_64")]
+        fn normal_stack_keeps_identification_for_microvm() {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| {
+                    let _guard = Impersonation::enter(1);
+                    mxc_sdk::__ffi::set_nvx_recovery_for_test(
+                        "microvm:0123456789abcdef0123456789abcdef",
+                        serde_json::json!({"reason":"inline"}),
+                    );
+                    let request = CString::new(MICROVM_PROVISION_REQUEST).unwrap();
+                    let mut out = MxcStateAwareResultV2 {
+                        result: MxcStateAwareResult::empty(),
+                        error_details_json_utf8: ptr::null_mut(),
+                    };
+                    // SAFETY: request and out remain live through the call.
+                    let status =
+                        unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 1, &mut out) };
+                    assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
+                    assert!(
+                        !out.error_details_json_utf8.is_null(),
+                        "normal stack must not duplicate the caller token"
+                    );
+                    unsafe { mxc_state_aware_result_v2_free(&mut out) };
+                })
+                .unwrap()
+                .join()
                 .unwrap();
-            assert!(
-                message.contains("calling thread's impersonation"),
-                "{message}"
-            );
-            // SAFETY: out is a valid result to release.
-            unsafe { mxc_state_aware_result_free(&mut out) };
+        }
 
-            let request = CString::new("{}").unwrap();
-            let mut out = MxcStateAwareResultV2 {
-                result: MxcStateAwareResult::empty(),
-                error_details_json_utf8: ptr::null_mut(),
-            };
-            // SAFETY: request and out remain valid for the duration of the call.
-            let status = unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 0, &mut out) };
-            assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
-            // SAFETY: the failed result owns a NUL-terminated error message.
-            let message = unsafe { std::ffi::CStr::from_ptr(out.result.error.message_utf8) }
-                .to_str()
+        #[test]
+        fn identification_preserves_validation_errors_before_worker_dispatch() {
+            std::thread::Builder::new()
+                .stack_size(512 * 1024)
+                .spawn(|| {
+                    let mut baseline = call_opt(WINDOWS_SANDBOX_PROVISION_REQUEST, true, true);
+                    let non_microvm_status = baseline.status;
+                    unsafe { mxc_state_aware_result_free(&mut baseline) };
+                    let _guard = Impersonation::enter(1); // SecurityIdentification
+                    let non_microvm = CString::new(WINDOWS_SANDBOX_PROVISION_REQUEST).unwrap();
+                    let invalid_utf8 = [0xffu8, 0];
+                    let malformed = CString::new("{}").unwrap();
+                    let unknown = CString::new(
+                        r#"{"version":"1.0.0","phase":"start","sandboxId":"nosuchbackend:abc"}"#,
+                    )
+                    .unwrap();
+                    let microvm = CString::new(MICROVM_PROVISION_REQUEST).unwrap();
+                    for (request, experimental, expected) in [
+                        (ptr::null(), 0, crate::MXC_STATUS_NULL_ARGUMENT),
+                        (
+                            invalid_utf8.as_ptr().cast(),
+                            0,
+                            crate::MXC_STATUS_INVALID_UTF8,
+                        ),
+                        (malformed.as_ptr(), 0, crate::MXC_STATUS_MALFORMED_REQUEST),
+                        (
+                            unknown.as_ptr(),
+                            0,
+                            crate::MXC_STATUS_UNSUPPORTED_CONTAINMENT,
+                        ),
+                        (microvm.as_ptr(), 0, crate::MXC_STATUS_BACKEND_UNAVAILABLE),
+                        (non_microvm.as_ptr(), 1, non_microvm_status),
+                    ] {
+                        let mut out = MxcStateAwareResult::empty();
+                        // SAFETY: request is null or a valid C string and out is writable.
+                        let status =
+                            unsafe { mxc_run_state_aware_json(request, 1, experimental, &mut out) };
+                        assert_eq!(status, expected);
+                        unsafe { mxc_state_aware_result_free(&mut out) };
+                        let mut out = MxcStateAwareResultV2 {
+                            result: MxcStateAwareResult::empty(),
+                            error_details_json_utf8: ptr::null_mut(),
+                        };
+                        // SAFETY: request is null or a valid C string and out is writable.
+                        let status = unsafe {
+                            mxc_run_state_aware_json_v2(request, 1, experimental, &mut out)
+                        };
+                        assert_eq!(status, expected);
+                        unsafe { mxc_state_aware_result_v2_free(&mut out) };
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let mut out = MxcStateAwareResult::empty();
+                        // SAFETY: request and out remain valid during the call.
+                        let status =
+                            unsafe { mxc_run_state_aware_json(microvm.as_ptr(), 1, 1, &mut out) };
+                        assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
+                        let message = unsafe { std::ffi::CStr::from_ptr(out.error.message_utf8) }
+                            .to_str()
+                            .unwrap();
+                        assert!(
+                            message.contains("calling thread's impersonation"),
+                            "{message}"
+                        );
+                        unsafe { mxc_state_aware_result_free(&mut out) };
+                    }
+                })
+                .unwrap()
+                .join()
                 .unwrap();
-            assert!(
-                message.contains("calling thread's impersonation"),
-                "{message}"
-            );
-            // SAFETY: out is a valid result to release.
-            unsafe { mxc_state_aware_result_v2_free(&mut out) };
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn microvm_recovery_survives_both_worker_and_inline_paths() {
+        for stack_size in [512 * 1024, 2 * 1024 * 1024] {
+            std::thread::Builder::new()
+                .stack_size(stack_size)
+                .spawn(move || {
+                    let request = CString::new(MICROVM_PROVISION_REQUEST).unwrap();
+                    mxc_sdk::__ffi::set_nvx_recovery_for_test(
+                        "microvm:0123456789abcdef0123456789abcdef",
+                        serde_json::json!({"reason":"test"}),
+                    );
+                    let mut out = MxcStateAwareResultV2 {
+                        result: MxcStateAwareResult::empty(),
+                        error_details_json_utf8: ptr::null_mut(),
+                    };
+                    // SAFETY: request and out remain live through the call.
+                    let status =
+                        unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 1, &mut out) };
+                    assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
+                    assert!(!out.error_details_json_utf8.is_null());
+                    // SAFETY: the live result owns its details string.
+                    let details = unsafe { std::ffi::CStr::from_ptr(out.error_details_json_utf8) };
+                    let details: serde_json::Value =
+                        serde_json::from_str(details.to_str().unwrap()).unwrap();
+                    assert_eq!(
+                        details["nvxRecovery"]["sandboxId"],
+                        "microvm:0123456789abcdef0123456789abcdef"
+                    );
+                    assert_eq!(details["primaryDetails"]["reason"], "test");
+                    unsafe { mxc_state_aware_result_v2_free(&mut out) };
+                })
+                .unwrap()
+                .join()
+                .unwrap();
         }
     }
 

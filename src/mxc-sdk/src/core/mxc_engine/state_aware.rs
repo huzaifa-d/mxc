@@ -141,22 +141,25 @@ pub fn run_state_aware(
         #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
         crate::mxc_common::models::ContainmentBackend::MicroVm => {
             let bound = crate::mxc_common::state_aware_binding::bind_microvm(parsed)?;
-            let mut runner = crate::backend_modules::nvx::state_aware::NvxStateAwareRunner::new();
-            #[cfg(feature = "test-support")]
-            if let Some((sandbox_id, primary_details)) =
-                crate::backend_modules::nvx::state_aware::take_recovery_for_test()
-            {
-                runner.configure_recovery_for_test(&sandbox_id)?;
-                let mut error = MxcError::backend_error("injected primary failure");
-                error.details = Some(primary_details);
-                return runner.finish(Err(error));
-            }
-            let outcome = crate::mxc_common::state_aware_dispatch::dispatch_state_aware(
-                &mut runner,
-                bound,
-                dry_run,
-            );
-            runner.finish(outcome)
+            run_nvx_with_sufficient_stack(move || {
+                let mut runner =
+                    crate::backend_modules::nvx::state_aware::NvxStateAwareRunner::new();
+                #[cfg(feature = "test-support")]
+                if let Some((sandbox_id, primary_details)) =
+                    crate::backend_modules::nvx::state_aware::take_recovery_for_test()
+                {
+                    runner.configure_recovery_for_test(&sandbox_id)?;
+                    let mut error = MxcError::backend_error("injected primary failure");
+                    error.details = Some(primary_details);
+                    return runner.finish(Err(error));
+                }
+                let outcome = crate::mxc_common::state_aware_dispatch::dispatch_state_aware(
+                    &mut runner,
+                    bound,
+                    dry_run,
+                );
+                runner.finish(outcome)
+            })
         }
         #[cfg(not(all(target_os = "windows", feature = "wslc")))]
         crate::mxc_common::models::ContainmentBackend::Wslc => Err(wslc_unavailable()),
@@ -166,6 +169,47 @@ pub fn run_state_aware(
         }
         _ => run_state_aware_fallback(parsed, dry_run),
     }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "microvm"))]
+fn run_nvx_with_sufficient_stack(
+    run: impl FnOnce() -> Result<DispatchOutcome, MxcError> + Send,
+) -> Result<DispatchOutcome, MxcError> {
+    let (mut low, mut high) = (0usize, 0usize);
+    // SAFETY: both output pointers refer to writable stack locals.
+    unsafe { windows::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high) };
+    if high.saturating_sub(low) >= 1024 * 1024 {
+        return run();
+    }
+    let context = crate::lifecycle_thread_context::LifecycleThreadContext::capture()
+        .map_err(MxcError::backend_error)?;
+    #[cfg(feature = "test-support")]
+    let recovery = crate::backend_modules::nvx::state_aware::take_recovery_for_test();
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("mxc-lifecycle".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                context.run(|| {
+                    #[cfg(feature = "test-support")]
+                    if let Some((sandbox_id, details)) = recovery {
+                        crate::backend_modules::nvx::state_aware::set_recovery_for_test(
+                            &sandbox_id,
+                            details,
+                        );
+                    }
+                    run()
+                })
+            })
+            .map_err(|error| {
+                MxcError::backend_error(format!("could not start lifecycle worker: {error}"))
+            })?;
+        match worker.join() {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(MxcError::backend_error(error)),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// Backend-specific metadata returned by typed engine lifecycle dispatch.
