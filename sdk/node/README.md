@@ -21,6 +21,12 @@ Node.js 24 or later is required. On Windows, native stdio transfer requires
 Node.js 24.21.0 or later within the Node.js 24 release line, or Node.js 26.8.0
 or later.
 
+Before loading its native library, the SDK attempts to set Koffi's process-wide
+async stack to at least 2 MiB. If your application uses Koffi directly, configure
+that minimum before its first native call: Koffi can lock its settings after
+initializing async pools, and the SDK cannot raise an already-locked stack. Each
+concurrent asynchronous call may reserve this much stack memory.
+
 ## MicroVM JSON requests
 
 On Windows x64 with Windows Hypervisor Platform enabled, install the optional

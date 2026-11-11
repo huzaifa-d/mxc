@@ -188,7 +188,7 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
         New-Item -ItemType Directory -Force -Path $realConsumer | Out-Null
         @"
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
   <ItemGroup><PackageReference Include="Microsoft.Mxc.Sdk.Nvx.Runtime" Version="$version" /></ItemGroup>
 </Project>
 "@ | Set-Content (Join-Path $realConsumer 'Consumer.csproj')
@@ -196,25 +196,63 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Mxc.Sdk.V1;
+using Dev = Microsoft.Mxc.Sdk.V1.Dev;
 
 if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MXC_FFI_DIR")) ||
     !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR")))
     throw new Exception("Native discovery overrides must be empty.");
+var mode = args[0];
 var support = MxcPlatform.GetPlatformSupport();
 var backends = MxcPlatform.GetAvailableBackends();
 var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
     .Single(module => string.Equals(module.ModuleName, "mxc_ffi.dll", StringComparison.OrdinalIgnoreCase));
 if (!Path.GetFullPath(native.FileName).StartsWith(Path.GetFullPath(AppContext.BaseDirectory), StringComparison.OrdinalIgnoreCase))
     throw new Exception("The consumer did not load its packaged mxc_ffi.dll.");
-var whp = false;
-try { whp = Hypervisor.Present(); } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
+var bundle = Path.Combine(AppContext.BaseDirectory, "aci-edge-sandboxes");
+if (Directory.Exists(bundle) != (mode != "absent"))
+    throw new Exception($"Unexpected packaged runtime directory for {mode}.");
+var detectedWhp = false;
+try { detectedWhp = Hypervisor.Present(); } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
+var simulatedNoWhp = args.Contains("simulate-no-whp");
+var whp = detectedWhp && !simulatedNoWhp;
 var found = backends.Any(backend => backend.Backend == ContainmentBackend.MicroVm);
-if (whp && found != (args[0] == "present"))
-    throw new Exception($"Module-relative NVX discovery mismatch: expected {args[0]}, found={found}");
-Console.WriteLine($"Native discovery passed: supported={support.IsSupported}, hypervisor={whp}, microvm={found}, expected={args[0]}");
+if (mode == "absent" && found)
+    throw new Exception("Base-only consumer unexpectedly reported MicroVM.");
+if (mode == "present" && whp && !found)
+    throw new Exception("The real packaged runtime was not discovered on a WHP host.");
+const string request = """{"version":"1.1.0-alpha","phase":"provision","containment":"microvm","microvm":{"image":"mcr.microsoft.com/azurelinux/base/core:3.0"}}""";
+MxcException? failure = null;
+try { Dev.MxcLifecycle.ValidateProvisionJson(request, new Dev.JsonOptions { Experimental = true }); }
+catch (MxcException error) { failure = error; }
+if (mode == "absent")
+{
+    if (failure is null || failure.Code != ErrorCode.BackendUnavailable ||
+        !failure.Message.Contains("no agent bundle is beside", StringComparison.OrdinalIgnoreCase))
+        throw new Exception($"Base-only validation did not report a missing bundle: {failure}");
+}
+else if (mode == "synthetic")
+{
+    if (failure is null || failure.Code != ErrorCode.BackendUnavailable ||
+        !failure.Message.Contains("signature rejected", StringComparison.OrdinalIgnoreCase) ||
+        !failure.Message.Contains(Path.Combine(bundle, "bin", "aci_edge_agent.dll"), StringComparison.OrdinalIgnoreCase))
+        throw new Exception($"Synthetic validation did not reach signature verification of the packaged bundle: {failure}");
+}
+else if (failure is not null)
+{
+    if (failure.Code != ErrorCode.BackendUnavailable ||
+        failure.Message.Contains("no agent bundle", StringComparison.OrdinalIgnoreCase) ||
+        failure.Message.Contains("bundle is missing", StringComparison.OrdinalIgnoreCase) ||
+        failure.Message.Contains("signature rejected", StringComparison.OrdinalIgnoreCase) ||
+        !(failure.Message.Contains("hypervisor", StringComparison.OrdinalIgnoreCase) ||
+          failure.Message.Contains("capabilit", StringComparison.OrdinalIgnoreCase) ||
+          failure.Message.Contains("WHP", StringComparison.OrdinalIgnoreCase)))
+        throw new Exception($"Real packaged runtime failed before capability validation: {failure}");
+}
+Console.WriteLine($"Native discovery asserted: mode={mode}, supported={support.IsSupported}, hypervisor={detectedWhp}, simulatedNoWhp={simulatedNoWhp}, microvm={found}, validation={(failure is null ? "success" : failure.Message)}");
 
 static class Hypervisor
 {
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("WinHvPlatform.dll", ExactSpelling = true)]
     private static extern int WHvGetCapability(uint code, out int value, uint size, out uint written);
     internal static bool Present() => WHvGetCapability(0, out var value, sizeof(int), out var written) >= 0 && written == sizeof(int) && value != 0;
@@ -229,13 +267,49 @@ static class Hypervisor
         $realExe = Join-Path $realPublish 'Consumer.exe'
         $publishedRuntime = Join-Path $realPublish 'aci-edge-sandboxes'
         if (-not (Test-Path -LiteralPath (Join-Path $publishedRuntime 'bundle-manifest.json') -PathType Leaf)) { throw 'Real NVX runtime was not copied into the published consumer.' }
-        & $realExe present
-        if ($LASTEXITCODE -ne 0) { throw 'Real packaged NVX discovery failed.' }
-        Rename-Item -LiteralPath $publishedRuntime -NewName 'aci-edge-sandboxes-disabled'
-        try {
-            & $realExe absent
-            if ($LASTEXITCODE -ne 0) { throw 'Missing packaged NVX runtime was not detected.' }
-        } finally { Rename-Item -LiteralPath (Join-Path $realPublish 'aci-edge-sandboxes-disabled') -NewName 'aci-edge-sandboxes' }
+        foreach ($extra in @('', 'simulate-no-whp')) {
+            & $realExe present $extra
+            if ($LASTEXITCODE -ne 0) { throw 'Real packaged NVX discovery failed.' }
+        }
+        $syntheticFeed = Join-Path $root 'synthetic-feed'
+        New-Item -ItemType Directory -Force -Path $syntheticFeed | Out-Null
+        Copy-Item -LiteralPath (Join-Path $realFeed "Microsoft.Mxc.Sdk.$version.nupkg") -Destination $syntheticFeed
+        $syntheticRuntime = Join-Path $root 'synthetic-discovery-runtime'
+        $runtimeSource = Get-Content -LiteralPath (Join-Path $repoRoot 'src\mxc-sdk\src\backends\nvx\crate_runtime.rs') -Raw
+        $inventory = [regex]::Match($runtimeSource, '(?s)const REQUIRED_BUNDLE_FILES:\s*&\[&str\]\s*=\s*&\[(.*?)\];')
+        if (-not $inventory.Success) { throw 'NVX bundle inventory not found.' }
+        $entries = [regex]::Matches($inventory.Groups[1].Value, 'r"([^"\r\n]+)"')
+        if ($entries.Count -ne 147) { throw "Expected 147 synthetic bundle entries, got $($entries.Count)." }
+        foreach ($entry in $entries) {
+            $path = Join-Path $syntheticRuntime $entry.Groups[1].Value
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+            [IO.File]::WriteAllText($path, 'synthetic')
+        }
+        nuget pack $nuspec -OutputDirectory $syntheticFeed -NonInteractive -Properties "version=$version;nvxRuntime=$syntheticRuntime;repositoryRoot=$repoRoot"
+        if ($LASTEXITCODE -ne 0) { throw 'Packing the synthetic discovery runtime failed.' }
+        foreach ($scenario in @('absent', 'synthetic')) {
+            $consumer = Join-Path $root "real-$scenario-consumer"
+            New-Item -ItemType Directory -Force -Path $consumer | Out-Null
+            $reference = if ($scenario -eq 'absent') { 'Microsoft.Mxc.Sdk' } else { 'Microsoft.Mxc.Sdk.Nvx.Runtime' }
+            $source = if ($scenario -eq 'absent') { $realFeed } else { $syntheticFeed }
+            @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup><PackageReference Include="$reference" Version="$version" /></ItemGroup>
+</Project>
+"@ | Set-Content (Join-Path $consumer 'Consumer.csproj')
+            Copy-Item -LiteralPath (Join-Path $realConsumer 'Program.cs') -Destination $consumer
+            $project = Join-Path $consumer 'Consumer.csproj'
+            dotnet restore $project --source $source --packages (Join-Path $root "$scenario-cache") --nologo -p:NuGetAudit=false
+            if ($LASTEXITCODE -ne 0) { throw "$scenario packaged consumer restore failed." }
+            $publish = Join-Path $consumer 'publish'
+            dotnet publish $project -c Release --no-restore --self-contained false --nologo -o $publish
+            if ($LASTEXITCODE -ne 0) { throw "$scenario packaged consumer publish failed." }
+            foreach ($extra in @('', 'simulate-no-whp')) {
+                & (Join-Path $publish 'Consumer.exe') $scenario $extra
+                if ($LASTEXITCODE -ne 0) { throw "$scenario packaged NVX validation failed." }
+            }
+        }
         Write-Host 'Real packaged .NET NVX discovery passed with overrides cleared.'
     } elseif ($NvxOnly) { throw 'NVX package consumer test requires a Windows x64 host.' }
 }

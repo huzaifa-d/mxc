@@ -173,6 +173,24 @@ function bootstrapNvxRuntime(handle: LibraryHandle): void {
   });
 }
 
+const MIN_ASYNC_STACK_SIZE = 2 * 1024 * 1024;
+const ASYNC_STACK_GUARD = Symbol.for('@microsoft/mxc-sdk/koffi-async-stack');
+
+function configureAsyncStack(): void {
+  try {
+    const state = globalThis as typeof globalThis & Record<symbol, WeakSet<object> | undefined>;
+    const configured = state[ASYNC_STACK_GUARD] ??= new WeakSet<object>();
+    if (configured.has(koffi)) return;
+    configured.add(koffi);
+    const current = koffi.config().async_stack_size;
+    if (typeof current === 'number' && current < MIN_ASYNC_STACK_SIZE) {
+      koffi.config({ async_stack_size: MIN_ASYNC_STACK_SIZE });
+    }
+  } catch {
+    // Koffi cannot change configuration after its async pools are initialized.
+  }
+}
+
 export function loadMxcFfi(candidates = _mxcFfiCandidates()): MxcNativeLibrary {
   const libraryPath = findMxcFfiLibrary(candidates);
   if (!libraryPath) {
@@ -180,6 +198,7 @@ export function loadMxcFfi(candidates = _mxcFfiCandidates()): MxcNativeLibrary {
       `mxc_ffi native library was not found. Searched:\n${candidates.map((candidate) => `- ${candidate}`).join('\n')}`,
     );
   }
+  configureAsyncStack();
   const handle = koffi.load(libraryPath);
   try {
     const version = handle.func('const char *mxc_version(void)') as () => string;
