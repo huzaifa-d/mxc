@@ -183,7 +183,7 @@ $helperPaths = @(& (Join-Path $PSScriptRoot 'stage-isolation-session-test-helper
     -SourceDirectory (Join-Path $repoRoot 'tests\scripts') -ScriptsDirectory $scriptsOut)
 
 $integrationOut = New-Directory (Join-Path $OutputDirectory 'sdk-integration')
-Copy-Item -Path (Join-Path $integrationRoot 'dist\isolation-session-*.test.js'), (Join-Path $integrationRoot 'dist\windows-process-container.test.js'), (Join-Path $integrationRoot 'dist\dev.test.js'), (Join-Path $integrationRoot 'dist\wslc-state-aware.test.js'), (Join-Path $integrationRoot 'dist\wslc-e2e.test.js'), (Join-Path $integrationRoot 'dist\nvx-json.test.js'), (Join-Path $integrationRoot 'dist\test-helpers.js') -Destination (New-Directory (Join-Path $integrationOut 'dist'))
+Copy-Item -Path (Join-Path $integrationRoot 'dist\isolation-session-*.test.js'), (Join-Path $integrationRoot 'dist\windows-process-container.test.js'), (Join-Path $integrationRoot 'dist\dev.test.js'), (Join-Path $integrationRoot 'dist\wslc-state-aware.test.js'), (Join-Path $integrationRoot 'dist\wslc-e2e.test.js'), (Join-Path $integrationRoot 'dist\nvx-json.test.js'), (Join-Path $integrationRoot 'dist\packaged-runtime-test.js'), (Join-Path $integrationRoot 'dist\test-helpers.js') -Destination (New-Directory (Join-Path $integrationOut 'dist'))
 Copy-Item -LiteralPath (Join-Path $integrationRoot 'package.json'), (Join-Path $integrationRoot 'run-tests.js') -Destination $integrationOut
 # Stages the SDK built above in place of the installed copy.
 $modulesOut = New-Directory (Join-Path $integrationOut 'node_modules')
@@ -251,6 +251,7 @@ $required = @(
     'sdk-integration\dist\wslc-state-aware.test.js',
     'sdk-integration\dist\wslc-e2e.test.js',
     'sdk-integration\dist\nvx-json.test.js',
+    'sdk-integration\dist\packaged-runtime-test.js',
     "sdk-integration\node_modules\@microsoft\mxc-sdk\bin\$Architecture\wxc-wslc-daemon.exe",
     "sdk-integration\node_modules\@microsoft\mxc-sdk\bin\$Architecture\wslcsdk.dll",
     'test_scripts\run_isolation_session_tests.ps1',
@@ -344,7 +345,7 @@ try {
     Assert-Discovery 'Node ProcessContainer suite' '(?m)^[^A-Za-z0-9]*tests\s+[1-9][0-9]*\r?$' {
         & (Join-Path $OutputDirectory 'node\node.exe') --test --test-force-exit dist/windows-process-container.test.js
     }
-    Assert-Discovery 'Node exact-JSON creation suite' 'V1.Dev spawnWithPtyJson supports an interactive terminal' {
+    Assert-Discovery 'Node exact-JSON creation suite' '(?s)(?=.*V1.Dev spawnWithPtyJson supports an interactive terminal)(?=.*V1.Dev installs both npm packages and discovers NVX without overrides)' {
         & (Join-Path $OutputDirectory 'node\node.exe') --test --test-force-exit dist/dev.test.js
     }
     Assert-Discovery 'Node NVX JSON lifecycle suite' 'V1.Dev NVX JSON lifecycle capture, live streams and overflow recovery' {

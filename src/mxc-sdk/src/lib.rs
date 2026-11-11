@@ -492,6 +492,65 @@ pub mod __ffi {
         );
     }
 
+    /// Context carried onto the C ABI lifecycle worker.
+    #[doc(hidden)]
+    pub struct LifecycleThreadContext {
+        #[cfg(target_os = "windows")]
+        token: Option<crate::mxc_common::process_util::SendOwnedHandle>,
+        telemetry: crate::mxc_common::telemetry::session::SessionContext,
+        sink: Option<crate::mxc_common::logger::Logger>,
+    }
+
+    impl LifecycleThreadContext {
+        /// Capture the caller's security and diagnostic context before spawning.
+        pub fn capture() -> Result<Self, String> {
+            #[cfg(target_os = "windows")]
+            let token =
+                crate::mxc_common::process_util::duplicate_thread_token().map_err(|error| {
+                    format!("could not preserve the calling thread's impersonation: {error}")
+                })?;
+            let sink = crate::mxc_common::logger::Logger::inherit_thread_diagnostic_sink();
+            Ok(Self {
+                #[cfg(target_os = "windows")]
+                token,
+                telemetry: crate::mxc_common::telemetry::session::capture(),
+                sink: sink.has_diagnostic_sink().then_some(sink),
+            })
+        }
+
+        /// Run under the captured context, refusing to execute if impersonation fails.
+        pub fn run<T>(self, f: impl FnOnce() -> T) -> Result<T, String> {
+            #[cfg(target_os = "windows")]
+            if let Some(token) = &self.token {
+                // SAFETY: token is a live impersonation token and None selects this thread.
+                unsafe {
+                    windows::Win32::System::Threading::SetThreadToken(None, Some(token.get()))
+                }
+                .map_err(|error| {
+                    format!("could not impersonate on the lifecycle worker: {error}")
+                })?;
+            }
+            let _session = crate::mxc_common::telemetry::session::resume(self.telemetry);
+            let _sink = self
+                .sink
+                .as_ref()
+                .map(crate::mxc_common::logger::Logger::install_thread_diagnostic_sink);
+            Ok(f())
+        }
+    }
+
+    /// Move the pending test fixture to the lifecycle worker thread.
+    #[doc(hidden)]
+    #[cfg(all(
+        feature = "test-support",
+        target_os = "windows",
+        target_arch = "x86_64",
+        feature = "microvm"
+    ))]
+    pub fn take_nvx_recovery_for_test() -> Option<(String, serde_json::Value)> {
+        crate::backend_modules::nvx::state_aware::take_recovery_for_test()
+    }
+
     /// Run an [MXC lifecycle JSON request](https://github.com/microsoft/mxc/blob/main/docs/development/architecture/container-lifecycle.md#raw-json-entry-points) and return its JSON response envelope.
     pub fn run_lifecycle_json(
         request_json: &str,

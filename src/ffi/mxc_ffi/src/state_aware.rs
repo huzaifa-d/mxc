@@ -78,6 +78,57 @@ pub struct MxcStateAwareResultV2 {
     pub error_details_json_utf8: *mut c_char,
 }
 
+// SAFETY: every pointer in this result owns a CString allocation, which can be
+// transferred between threads and is released only after the joined call returns.
+struct LifecycleThreadResult(MxcStateAwareResultV2);
+unsafe impl Send for LifecycleThreadResult {}
+
+fn state_aware_on_stack(
+    request_json_utf8: *const c_char,
+    dry_run: bool,
+    experimental: bool,
+    include_details: bool,
+) -> MxcStateAwareResultV2 {
+    let failure = |message: String| MxcStateAwareResultV2 {
+        result: MxcStateAwareResult::error(crate::MXC_STATUS_BACKEND_ERROR, message),
+        error_details_json_utf8: ptr::null_mut(),
+    };
+    let context = match mxc_sdk::__ffi::LifecycleThreadContext::capture() {
+        Ok(context) => context,
+        Err(error) => return failure(error),
+    };
+    // The C caller keeps this buffer valid until this function joins the worker.
+    let request_address = request_json_utf8 as usize;
+    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+    let test_recovery = mxc_sdk::__ffi::take_nvx_recovery_for_test();
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("mxc-lifecycle".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                context.run(|| {
+                    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+                    if let Some((sandbox_id, details)) = test_recovery {
+                        mxc_sdk::__ffi::set_nvx_recovery_for_test(&sandbox_id, details);
+                    }
+                    LifecycleThreadResult(state_aware_inner(
+                        request_address as *const c_char,
+                        dry_run,
+                        experimental,
+                        include_details,
+                    ))
+                })
+            }) {
+            Ok(worker) => match worker.join() {
+                Ok(Ok(result)) => result.0,
+                Ok(Err(error)) => failure(error),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+            Err(error) => failure(format!("could not start lifecycle worker: {error}")),
+        }
+    })
+}
+
 impl MxcStateAwareResult {
     #[cfg(test)]
     fn empty() -> Self {
@@ -131,7 +182,7 @@ pub unsafe extern "C" fn mxc_run_state_aware_json(
     }
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0, false).result
+        state_aware_on_stack(request_json_utf8, dry_run != 0, experimental != 0, false).result
     }))
     .unwrap_or_else(|panic| {
         crate::report_panic("mxc_run_state_aware_json", &*panic);
@@ -222,7 +273,7 @@ pub unsafe extern "C" fn mxc_run_state_aware_json_v2(
         return MXC_STATUS_NULL_ARGUMENT;
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        state_aware_inner(request_json_utf8, dry_run != 0, experimental != 0, true)
+        state_aware_on_stack(request_json_utf8, dry_run != 0, experimental != 0, true)
     }))
     .unwrap_or_else(|panic| {
         crate::report_panic("mxc_run_state_aware_json_v2", &*panic);
@@ -759,6 +810,101 @@ mod tests {
         };
         assert_eq!(status, out.status);
         out
+    }
+
+    #[cfg(target_os = "windows")]
+    mod impersonation_tests {
+        use super::*;
+
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn ImpersonateSelf(level: i32) -> i32;
+            fn RevertToSelf() -> i32;
+            fn OpenThreadToken(
+                thread: isize,
+                access: u32,
+                open_as_self: i32,
+                token: *mut isize,
+            ) -> i32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        struct Impersonation;
+        impl Impersonation {
+            fn enter(level: i32) -> Self {
+                // SAFETY: impersonation is reverted by Drop on the same thread.
+                assert_ne!(unsafe { ImpersonateSelf(level) }, 0);
+                Self
+            }
+        }
+        impl Drop for Impersonation {
+            fn drop(&mut self) {
+                // SAFETY: balances the successful call to ImpersonateSelf.
+                assert_ne!(unsafe { RevertToSelf() }, 0);
+            }
+        }
+
+        #[test]
+        fn worker_inherits_impersonation() {
+            let _guard = Impersonation::enter(2); // SecurityImpersonation
+            let context = mxc_sdk::__ffi::LifecycleThreadContext::capture().unwrap();
+            let present = std::thread::spawn(move || {
+                context
+                    .run(|| {
+                        let mut token = 0;
+                        // SAFETY: the token out-parameter is writable and handles are closed below.
+                        let opened =
+                            unsafe { OpenThreadToken(GetCurrentThread(), 8, 1, &mut token) };
+                        if opened != 0 {
+                            unsafe { CloseHandle(token) };
+                        }
+                        opened != 0
+                    })
+                    .unwrap()
+            })
+            .join()
+            .unwrap();
+            assert!(present, "lifecycle worker lost the caller's impersonation");
+        }
+
+        #[test]
+        fn insufficient_impersonation_fails_closed_before_lifecycle_dispatch() {
+            let _guard = Impersonation::enter(1); // SecurityIdentification
+            let mut out = call("{}", false);
+            assert_eq!(out.status, crate::MXC_STATUS_BACKEND_ERROR);
+            // SAFETY: the failed result owns a NUL-terminated error message.
+            let message = unsafe { std::ffi::CStr::from_ptr(out.error.message_utf8) }
+                .to_str()
+                .unwrap();
+            assert!(
+                message.contains("calling thread's impersonation"),
+                "{message}"
+            );
+            // SAFETY: out is a valid result to release.
+            unsafe { mxc_state_aware_result_free(&mut out) };
+
+            let request = CString::new("{}").unwrap();
+            let mut out = MxcStateAwareResultV2 {
+                result: MxcStateAwareResult::empty(),
+                error_details_json_utf8: ptr::null_mut(),
+            };
+            // SAFETY: request and out remain valid for the duration of the call.
+            let status = unsafe { mxc_run_state_aware_json_v2(request.as_ptr(), 0, 0, &mut out) };
+            assert_eq!(status, crate::MXC_STATUS_BACKEND_ERROR);
+            // SAFETY: the failed result owns a NUL-terminated error message.
+            let message = unsafe { std::ffi::CStr::from_ptr(out.result.error.message_utf8) }
+                .to_str()
+                .unwrap();
+            assert!(
+                message.contains("calling thread's impersonation"),
+                "{message}"
+            );
+            // SAFETY: out is a valid result to release.
+            unsafe { mxc_state_aware_result_v2_free(&mut out) };
+        }
     }
 
     #[test]
