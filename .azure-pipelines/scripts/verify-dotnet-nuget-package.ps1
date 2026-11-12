@@ -21,22 +21,15 @@ try {
     }
 
     if ($VerifyNvxRuntime) {
+        . (Join-Path $PSScriptRoot 'get-nvx-bundle-inventory.ps1')
         $prefix = 'runtimes/win-x64/aci-edge-sandboxes/'
         $required = @(
             'build/Microsoft.Mxc.Sdk.Nvx.Runtime.targets',
             'buildTransitive/Microsoft.Mxc.Sdk.Nvx.Runtime.targets',
-            "${prefix}bundle-manifest.json",
-            "${prefix}bin/aci_edge_agent.dll",
-            "${prefix}bin/openvmm.exe",
-            "${prefix}bin/direct-images.exe",
-            "${prefix}SOURCE-MANIFEST.json",
-            "${prefix}SHA256SUMS",
-            "${prefix}guest/vmlinux",
-            "${prefix}guest/initramfs-edge.cpio.gz",
-            "${prefix}guest/nvx-edge-agent",
             'README.md',
             'LICENSE.md'
         )
+        $required += @(Get-NvxBundleInventory | ForEach-Object { "$prefix$_" })
         $missing = @($required | Where-Object { -not $entries.ContainsKey($_) })
         if ($missing.Count) { throw "NVX runtime package is missing required files:`n  $($missing -join "`n  ")" }
         $stray = @($entries.Keys | Where-Object { $_ -match '(?i)(^|/)(mxc_ffi|Microsoft\.Mxc\.Sdk)\.dll$' })

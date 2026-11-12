@@ -8,12 +8,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$tempRoot = Join-Path $repoRoot 'out'
+$tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$tempDirectory = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($tempRoot))
+for ($ancestor = $tempDirectory; $null -ne $ancestor; $ancestor = $ancestor.Parent) {
+    if ((Test-Path -LiteralPath (Join-Path $ancestor.FullName '.git') -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path $ancestor.FullName 'src\Cargo.toml') -PathType Leaf)) {
+        throw "Package smoke temporary directory must be outside a checkout: $tempRoot"
+    }
+}
 $root = Join-Path $tempRoot "dotnet-package-smoke-$([guid]::NewGuid())"
 $feed = Join-Path $root 'feed'
 $version = '0.0.0-package-smoke'
 $originalFfiDir = $env:MXC_FFI_DIR
 $originalAgentDir = $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR
+$originalLocalAppData = $env:LOCALAPPDATA
 
 Push-Location (Join-Path $repoRoot 'sdk\dotnet')
 try {
@@ -38,14 +46,29 @@ try {
         @'
 using Microsoft.Mxc.Sdk.V1;
 
-var support = MxcPlatform.GetPlatformSupport();
-Console.WriteLine($"platform supported: {support.IsSupported}; reason: {support.Reason}");
-foreach (var backend in MxcPlatform.GetAvailableBackends())
+var expectMissing = Environment.GetEnvironmentVariable("MXC_TEST_EXPECT_MISSING_NATIVE") == "1";
+try
 {
-    Console.WriteLine($"backend: {backend.Backend}");
-    Console.WriteLine($"capabilities: {string.Join(", ", backend.Capabilities)}");
-    Console.WriteLine($"warnings: {string.Join(", ", backend.Warnings)}");
+    var support = MxcPlatform.GetPlatformSupport();
+    Console.WriteLine($"platform supported: {support.IsSupported}; reason: {support.Reason}");
+    foreach (var backend in MxcPlatform.GetAvailableBackends())
+    {
+        Console.WriteLine($"backend: {backend.Backend}");
+        Console.WriteLine($"capabilities: {string.Join(", ", backend.Capabilities)}");
+        Console.WriteLine($"warnings: {string.Join(", ", backend.Warnings)}");
+    }
 }
+catch (DllNotFoundException) when (expectMissing)
+{
+    Console.WriteLine("Missing native library rejected.");
+    return 0;
+}
+if (expectMissing)
+{
+    Console.Error.WriteLine("Missing native library was unexpectedly loaded.");
+    return 1;
+}
+return 0;
 '@ | Set-Content (Join-Path $consumer 'Program.cs')
             $cache = Join-Path $root "cache-$framework"
             dotnet package add Microsoft.Mxc.Sdk --project $consumer --version $version --source $feed --package-directory $cache
@@ -58,14 +81,29 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
                 throw "The $framework consumer did not use the matching SDK assembly."
             }
             Write-Host "$framework packed SDK discovery and assembly checks passed."
+
+            $nativeName = if ($IsWindows) { 'mxc_ffi.dll' } elseif ($IsMacOS) { 'libmxc_ffi.dylib' } else { 'libmxc_ffi.so' }
+            $nativeFiles = @(Get-ChildItem -LiteralPath (Join-Path $consumer 'bin'), $cache -Filter $nativeName -File -Recurse)
+            if ($nativeFiles.Count -eq 0) { throw "No packaged $nativeName found for the missing-native test." }
+            $nativeFiles | Remove-Item -Force
+            $originalMissing = $env:MXC_TEST_EXPECT_MISSING_NATIVE
+            try {
+                $env:MXC_TEST_EXPECT_MISSING_NATIVE = '1'
+                $output = & dotnet (Join-Path $consumer "bin\Release\$framework\Consumer.dll") 2>&1 | Out-String
+                if ($LASTEXITCODE -ne 0 -or $output -notmatch 'Missing native library rejected\.') {
+                    throw "$framework consumer did not reject a missing native library: $output"
+                }
+            } finally {
+                $env:MXC_TEST_EXPECT_MISSING_NATIVE = $originalMissing
+            }
+            Write-Host "$framework missing packaged native library was rejected."
         }
     }
 
     if ($IsWindows -and [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'X64') {
         $nvx = Join-Path $root 'nvx'
-        $files = @('bundle-manifest.json', 'bin/aci_edge_agent.dll', 'bin/openvmm.exe',
-            'bin/direct-images.exe', 'SOURCE-MANIFEST.json', 'SHA256SUMS', 'guest/vmlinux',
-            'guest/initramfs-edge.cpio.gz', 'guest/nvx-edge-agent', 'guest/deep/provenance.txt')
+        . (Join-Path $repoRoot '.azure-pipelines\scripts\get-nvx-bundle-inventory.ps1')
+        $files = @(Get-NvxBundleInventory) + @('guest/deep/provenance.txt')
         foreach ($file in $files) {
             $path = Join-Path $nvx $file
             New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
@@ -94,11 +132,14 @@ foreach (var backend in MxcPlatform.GetAvailableBackends())
             Copy-Item $package $bad
             $zip = [IO.Compression.ZipFile]::Open($bad, [IO.Compression.ZipArchiveMode]::Update)
             try {
-                if ($mutation -eq 'missing') { $zip.GetEntry('runtimes/win-x64/aci-edge-sandboxes/guest/vmlinux').Delete() }
+                if ($mutation -eq 'missing') { $zip.GetEntry('runtimes/win-x64/aci-edge-sandboxes/guest/vmlinux.config').Delete() }
                 else { [void]$zip.CreateEntry('runtimes/win-x64/aci-edge-sandboxes/bin/mxc_ffi.dll') }
             } finally { $zip.Dispose() }
             $rejected = $false
-            try { & $verify -PackagePath $bad -VerifyNvxRuntime } catch { $rejected = $true }
+            try { & $verify -PackagePath $bad -VerifyNvxRuntime } catch {
+                if ($mutation -eq 'missing' -and $_.Exception.Message -notmatch 'guest/vmlinux\.config') { throw }
+                $rejected = $true
+            }
             if (-not $rejected) { throw "Verifier accepted $mutation package." }
         }
         foreach ($framework in @('net8.0', 'net10.0')) {
@@ -267,6 +308,8 @@ static class Hypervisor
         $realExe = Join-Path $realPublish 'Consumer.exe'
         $publishedRuntime = Join-Path $realPublish 'aci-edge-sandboxes'
         if (-not (Test-Path -LiteralPath (Join-Path $publishedRuntime 'bundle-manifest.json') -PathType Leaf)) { throw 'Real NVX runtime was not copied into the published consumer.' }
+        $env:LOCALAPPDATA = Join-Path $root 'local-appdata'
+        New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
         foreach ($extra in @('', 'simulate-no-whp')) {
             & $realExe present $extra
             if ($LASTEXITCODE -ne 0) { throw 'Real packaged NVX discovery failed.' }
@@ -275,13 +318,8 @@ static class Hypervisor
         New-Item -ItemType Directory -Force -Path $syntheticFeed | Out-Null
         Copy-Item -LiteralPath (Join-Path $realFeed "Microsoft.Mxc.Sdk.$version.nupkg") -Destination $syntheticFeed
         $syntheticRuntime = Join-Path $root 'synthetic-discovery-runtime'
-        $runtimeSource = Get-Content -LiteralPath (Join-Path $repoRoot 'src\mxc-sdk\src\backends\nvx\crate_runtime.rs') -Raw
-        $inventory = [regex]::Match($runtimeSource, '(?s)const REQUIRED_BUNDLE_FILES:\s*&\[&str\]\s*=\s*&\[(.*?)\];')
-        if (-not $inventory.Success) { throw 'NVX bundle inventory not found.' }
-        $entries = [regex]::Matches($inventory.Groups[1].Value, 'r"([^"\r\n]+)"')
-        if ($entries.Count -ne 147) { throw "Expected 147 synthetic bundle entries, got $($entries.Count)." }
-        foreach ($entry in $entries) {
-            $path = Join-Path $syntheticRuntime $entry.Groups[1].Value
+        foreach ($entry in (Get-NvxBundleInventory)) {
+            $path = Join-Path $syntheticRuntime $entry
             New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
             [IO.File]::WriteAllText($path, 'synthetic')
         }
@@ -316,6 +354,7 @@ static class Hypervisor
 finally {
     $env:MXC_FFI_DIR = $originalFfiDir
     $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = $originalAgentDir
+    $env:LOCALAPPDATA = $originalLocalAppData
     Pop-Location
     if (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force

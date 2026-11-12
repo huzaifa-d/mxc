@@ -78,17 +78,10 @@ jobs:
           'runtimes\win-arm64\native\wslcsdk.dll',
           'runtimes\linux-x64\native\libmxc_ffi.so',
           'runtimes\linux-arm64\native\libmxc_ffi.so',
-          'runtimes\osx-arm64\native\libmxc_ffi.dylib',
-          'nvx\bundle-manifest.json',
-          'nvx\bin\aci_edge_agent.dll',
-          'nvx\bin\openvmm.exe',
-          'nvx\bin\direct-images.exe',
-          'nvx\SOURCE-MANIFEST.json',
-          'nvx\SHA256SUMS',
-          'nvx\guest\vmlinux',
-          'nvx\guest\initramfs-edge.cpio.gz',
-          'nvx\guest\nvx-edge-agent'
+          'runtimes\osx-arm64\native\libmxc_ffi.dylib'
         )
+        . "$(Build.SourcesDirectory)\.azure-pipelines\scripts\get-nvx-bundle-inventory.ps1"
+        $files += @(Get-NvxBundleInventory | ForEach-Object { "nvx\$_" })
 
         foreach ($relativePath in $files) {
           $path = Join-Path $root $relativePath
@@ -122,6 +115,34 @@ jobs:
         arguments: >-
           -PackagePath "$(packageOutput)\Microsoft.Mxc.Sdk.Nvx.Runtime.${{ package.version }}.nupkg"
           -VerifyNvxRuntime
+
+    - task: PowerShell@2
+      displayName: Reject incomplete ${{ package.displayName }} NVX runtime package
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $source = "$(packageOutput)\Microsoft.Mxc.Sdk.Nvx.Runtime.${{ package.version }}.nupkg"
+          $bad = "$(packageOutput)\incomplete-${{ package.version }}.nupkg"
+          Copy-Item -LiteralPath $source -Destination $bad
+          try {
+            $archive = [IO.Compression.ZipFile]::Open($bad, [IO.Compression.ZipArchiveMode]::Update)
+            try {
+              $entry = $archive.GetEntry('runtimes/win-x64/aci-edge-sandboxes/guest/vmlinux.config')
+              if ($null -eq $entry) { throw 'Expected vmlinux.config in the original package.' }
+              $entry.Delete()
+            } finally { $archive.Dispose() }
+            $rejected = $false
+            try {
+              & "$(Build.SourcesDirectory)\.azure-pipelines\scripts\verify-dotnet-nuget-package.ps1" -PackagePath $bad -VerifyNvxRuntime
+            } catch {
+              if ($_.Exception.Message -notmatch 'guest/vmlinux\.config') { throw }
+              $rejected = $true
+            }
+            if (-not $rejected) { throw 'Verifier accepted a package missing guest/vmlinux.config.' }
+          } finally { Remove-Item -LiteralPath $bad -Force }
 
     - task: PowerShell@2
       displayName: Verify ${{ package.displayName }} package contract
