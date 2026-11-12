@@ -69,5 +69,5 @@ completion after a workload timeout.
 
 MicroVM lifecycle capture limits stdout and stderr together to 64 MiB
 (67,108,864 bytes). Overflow returns `BackendError` and preserves the container.
-A provision failure after creation can include recovery information in
-`MxcException.Data["details"]` as a `JsonElement` for that call.
+If provision succeeds but cleanup fails, .NET does not expose the retained
+container ID needed for recovery. See [huzaifa-d/mxc#16](https://github.com/huzaifa-d/mxc/issues/16).

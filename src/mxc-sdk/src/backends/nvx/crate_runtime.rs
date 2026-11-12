@@ -402,7 +402,7 @@ fn selected_bundle_with(
     directory: &Path,
     is_file: &impl Fn(&Path) -> bool,
 ) -> Result<BundledAgent, MxcError> {
-    let bundle = BundledAgent::from_dir(directory.to_path_buf()).map_err(map_error)?;
+    let bundle = BundledAgent::from_dir(directory).map_err(map_error)?;
     for relative_path in REQUIRED_BUNDLE_FILES {
         let path = directory.join(relative_path);
         if !is_file(&path) {

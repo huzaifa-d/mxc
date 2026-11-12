@@ -11,7 +11,7 @@ namespace Microsoft.Mxc.Sdk.Tests;
 public class DevEntryPointTests
 {
     [Fact]
-    public async Task RealNativeLifecycleV2AndCapturedExecRejectUnsupportedBackend()
+    public async Task RealNativeLifecycleAndCapturedExecRejectUnsupportedBackend()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows() &&
             System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.X64 &&

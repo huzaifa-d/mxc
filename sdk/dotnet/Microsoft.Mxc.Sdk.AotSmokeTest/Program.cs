@@ -34,9 +34,6 @@ static void CheckRoundTrip<T>(T value, Func<T, bool> check, string name)
     Check(restored is not null && check(restored), name);
 }
 
-using var detailsDocument = JsonDocument.Parse("{\"nvxRecovery\":{\"state\":\"provisioned\"}}");
-CheckRoundTrip(detailsDocument.RootElement, x => x.GetProperty("nvxRecovery").GetProperty("state").GetString() == "provisioned", "lifecycle error details");
-
 var initialPtySize = new MxcPtySize(40, 120);
 CheckRoundTrip(new Dev.JsonOptions { Experimental = true },
     x => x.Experimental, "dev JSON options experimental authorization");

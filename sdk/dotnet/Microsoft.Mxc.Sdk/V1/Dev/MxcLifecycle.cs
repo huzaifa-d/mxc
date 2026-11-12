@@ -185,17 +185,17 @@ public static class MxcLifecycle
         {
             fixed (byte* requestPtr = request)
             {
-                MxcStateAwareResultV2 result = default;
-                var status = NativeMethods.mxc_run_state_aware_json_v2(
+                MxcStateAwareResult result = default;
+                var status = NativeMethods.mxc_run_state_aware_json(
                     requestPtr, dryRun ? 1 : 0, options?.Experimental == true ? 1 : 0, &result);
                 try
                 {
                     if (status != (int)ErrorCode.Success)
                     {
-                        throw NativeError.ToExceptionWithDetails(status, result.result.error, "exact JSON lifecycle failed", result.error_details_json_utf8);
+                        throw NativeError.ToException(status, result.error, "exact JSON lifecycle failed");
                     }
-                    var responseJson = result.result.response_json_utf8 is null
-                        ? null : Marshal.PtrToStringUTF8((IntPtr)result.result.response_json_utf8);
+                    var responseJson = result.response_json_utf8 is null
+                        ? null : Marshal.PtrToStringUTF8((IntPtr)result.response_json_utf8);
                     return string.IsNullOrEmpty(responseJson)
                         ? throw new MxcException(ErrorCode.BackendError,
                             "native lifecycle response has no JSON")
@@ -203,7 +203,7 @@ public static class MxcLifecycle
                 }
                 finally
                 {
-                    NativeMethods.mxc_state_aware_result_v2_free(&result);
+                    NativeMethods.mxc_state_aware_result_free(&result);
                 }
             }
         }

@@ -228,9 +228,8 @@ Pre-existing error details are retained under `details.primaryDetails`.
 These fields are part of the experimental Rust `v1::dev` behaviour and may
 change as the development API evolves.
 
-Node callers receive recovery information in `MxcError.details.nvxRecovery`;
-.NET callers receive it as a `JsonElement` in `MxcException.Data["details"]`. These details belong
-to the failing call.
+Node and .NET do not expose the retained container ID in this failure case.
+See [huzaifa-d/mxc#16](https://github.com/huzaifa-d/mxc/issues/16).
 
 A workload timeout preserves captured partial output and tears down the
 create-and-run container. Live execution starts its workload deadline only

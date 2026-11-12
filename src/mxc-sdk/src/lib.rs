@@ -526,21 +526,6 @@ pub mod __ffi {
         }
     }
 
-    /// Configure one synthetic NVX cleanup failure on the current thread.
-    #[doc(hidden)]
-    #[cfg(all(
-        feature = "test-support",
-        target_os = "windows",
-        target_arch = "x86_64",
-        feature = "microvm"
-    ))]
-    pub fn set_nvx_recovery_for_test(sandbox_id: &str, primary_details: serde_json::Value) {
-        crate::backend_modules::nvx::state_aware::set_recovery_for_test(
-            sandbox_id,
-            primary_details,
-        );
-    }
-
     #[doc(hidden)]
     pub use crate::lifecycle_thread_context::LifecycleThreadContext;
 
