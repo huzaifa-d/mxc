@@ -24,8 +24,7 @@ public static class MxcLifecycle
     {
         var (request, timeout) = DevJsonRequest.Prepare(json, nameof(RunInContainerJson), "exec");
         using var process = await Microsoft.Mxc.Sdk.V1.MxcLifecycle.RunBlockingOperationAsync(
-            () => SpawnInContainer(request, timeout, options, captureOutput: true),
-            late => late.Dispose(), cancellationToken)
+            () => SpawnInContainer(request, timeout, options), late => late.Dispose(), cancellationToken)
             .ConfigureAwait(false);
         var (outcome, stdout, stderr) = await process
             .WaitForExitWithOutputAsync(cancellationToken).ConfigureAwait(false);
@@ -47,7 +46,7 @@ public static class MxcLifecycle
     }
 
     private static MxcProcess SpawnInContainer(
-        byte[] request, uint? timeout, JsonOptions? options, bool captureOutput = false)
+        byte[] request, uint? timeout, JsonOptions? options)
     {
         unsafe
         {
@@ -55,11 +54,8 @@ public static class MxcLifecycle
             {
                 NativeSandbox* handle = null;
                 MxcErrorDetail error = default;
-                var status = captureOutput
-                    ? NativeMethods.mxc_exec_state_aware_capture_json(
-                        requestPtr, options?.Experimental == true ? 1 : 0, &handle, &error)
-                    : NativeMethods.mxc_exec_state_aware_json(
-                        requestPtr, options?.Experimental == true ? 1 : 0, &handle, &error);
+                var status = NativeMethods.mxc_exec_state_aware_json(
+                    requestPtr, options?.Experimental == true ? 1 : 0, &handle, &error);
                 if (status != (int)ErrorCode.Success)
                 {
                     try

@@ -146,7 +146,7 @@ does not define the limits of this integration.
 | Working directory | Optional absolute POSIX guest path; see the limits below. |
 | Environment | Guest default, optionally extended with additive entries; see below. |
 | Process timeout | `0` means no workload timeout; nonzero values may not exceed 3,600,000 ms. |
-| Captured output | Create-and-run capture and lifecycle `run_in_container_json` accept at most 64 MiB (67,108,864 bytes) combined stdout and stderr. Live streams are caller-controlled and do not have this MXC capture limit. |
+| Captured output | Create-and-run capture and lifecycle `run_in_container_json` accept at most 64 MiB (67,108,864 bytes) combined stdout and stderr, except .NET lifecycle capture. Live streams are caller-controlled and do not have this MXC capture limit. |
 | Filesystem policy | Read-only, read-write, and denied paths are mapped to the agent and require the corresponding runtime capabilities. |
 | Network policy | Egress defaults and CIDR/protocol/port rules, ingress defaults, and host-loopback postures require the corresponding runtime capabilities and native validation. Host-loopback allow makes guest listeners reachable on the same host loopback port. |
 | Runtime proxy | `runtimeConfig.networkProxy` requires the runtime's proxy capability and a port other than 0 or 53. Proxy environment variables remain rejected. |
@@ -210,7 +210,9 @@ mean that the workload has stopped.
 For lifecycle `run_in_container_json`, overflow cancels only that execution;
 the caller-owned container remains provisioned and usable. The limit also
 applies when the workload timeout is zero. Cleanup failures are reported
-alongside the original failure.
+alongside the original failure. The .NET `RunInContainerJson` and
+`RunInContainerJsonAsync` methods do not enforce this limit; large output can
+consume significant memory. See [huzaifa-d/mxc#17](https://github.com/huzaifa-d/mxc/issues/17).
 
 Lifecycle envelope calls, including validation, explicitly close the native
 host. A close failure after successful work returns `BackendError`; a primary
