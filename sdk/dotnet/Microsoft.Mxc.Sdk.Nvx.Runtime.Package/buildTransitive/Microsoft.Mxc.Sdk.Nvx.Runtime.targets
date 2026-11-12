@@ -6,6 +6,7 @@
   </PropertyGroup>
   <Target Name="_MxcNvxValidatePlatform" BeforeTargets="PrepareForBuild;Publish">
     <Error Condition="'$(RuntimeIdentifier)' != '' And '$(_MxcNvxSupportedRid)' != 'true'" Text="Microsoft.Mxc.Sdk.Nvx.Runtime supports only the win-x64 or win10-x64 RuntimeIdentifier; got '$(RuntimeIdentifier)'." />
+    <Error Condition="'$(RuntimeIdentifier)' == '' And '$(_MxcNvxHostSupported)' != 'true'" Text="Microsoft.Mxc.Sdk.Nvx.Runtime requires an explicit Windows x64 runtime identifier when building outside Windows x64. Build or publish with -r win-x64." />
     <Error Condition="'$(PlatformTarget)' != '' And '$(PlatformTarget)' != 'AnyCPU' And '$(PlatformTarget)' != 'x64'" Text="Microsoft.Mxc.Sdk.Nvx.Runtime requires an x64 or AnyCPU PlatformTarget; got '$(PlatformTarget)'." />
   </Target>
   <ItemGroup Condition="'$(_MxcNvxSupportedRid)' == 'true' Or '$(_MxcNvxHostSupported)' == 'true'">
