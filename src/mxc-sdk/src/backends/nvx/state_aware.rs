@@ -34,10 +34,7 @@ pub(crate) fn dispatch(
             super::policy::validate_post_provision_request(request)?;
         }
         BoundStateAwareOperation::Exec { sandbox_id, .. } => {
-            crate::mxc_common::validator::validate_exec_common(request)?;
-            SandboxId::from_mxc(sandbox_id)?;
-            super::policy::validate_post_provision_request(request)?;
-            super::policy::validate_process_request(request)?;
+            validate_exec_before_worker(request, sandbox_id)?;
         }
         BoundStateAwareOperation::ProvisionSession(_)
         | BoundStateAwareOperation::DeprovisionSession { .. } => {
@@ -45,38 +42,49 @@ pub(crate) fn dispatch(
         }
     }
 
-    run_nvx_with_sufficient_stack(move || {
+    super::run_with_sufficient_stack(move || {
         let mut runner = NvxStateAwareRunner::new();
         let outcome = dispatch_state_aware(&mut runner, bound, dry_run);
         runner.finish(outcome)
     })
 }
 
-fn run_nvx_with_sufficient_stack(
-    run: impl FnOnce() -> Result<crate::mxc_common::state_aware_dispatch::DispatchOutcome, MxcError>
-        + Send,
-) -> Result<crate::mxc_common::state_aware_dispatch::DispatchOutcome, MxcError> {
-    let (mut low, mut high) = (0usize, 0usize);
-    // SAFETY: both output pointers refer to writable stack locals.
-    unsafe { windows::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high) };
-    if high.saturating_sub(low) >= 1024 * 1024 {
-        return run();
-    }
-    let context = crate::lifecycle_thread_context::LifecycleThreadContext::capture()
-        .map_err(MxcError::backend_error)?;
-    std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new()
-            .name("mxc-lifecycle".to_owned())
-            .stack_size(2 * 1024 * 1024)
-            .spawn_scoped(scope, move || context.run(run))
-            .map_err(|error| {
-                MxcError::backend_error(format!("could not start lifecycle worker: {error}"))
-            })?;
-        match worker.join() {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(MxcError::backend_error(error)),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+fn validate_exec_before_worker(
+    request: &ExecutionRequest,
+    sandbox_id: &str,
+) -> Result<(), MxcError> {
+    crate::mxc_common::validator::validate_exec_common(request)?;
+    SandboxId::from_mxc(sandbox_id)?;
+    super::policy::validate_post_provision_request(request)?;
+    super::policy::validate_process_request(request)
+}
+
+pub(crate) fn dispatch_exec(
+    bound: crate::mxc_common::state_aware_binding::BoundStateAwareRequest<NvxStateAwareRunner>,
+    capture_output: bool,
+) -> Result<Box<dyn crate::mxc_common::sandbox_process::SandboxProcess>, MxcError> {
+    use crate::mxc_common::state_aware_binding::BoundStateAwareOperation;
+    let BoundStateAwareOperation::Exec { sandbox_id, .. } = bound.operation() else {
+        return Err(MxcError::malformed_request(format!(
+            "streaming exec requires the exec phase, got {}",
+            bound.phase()
+        )));
+    };
+    validate_exec_before_worker(bound.request(), sandbox_id)?;
+
+    super::run_with_sufficient_stack(move || {
+        let mut runner = if capture_output {
+            NvxStateAwareRunner::for_capture()
+        } else {
+            NvxStateAwareRunner::new()
+        };
+        let handle =
+            crate::mxc_common::state_aware_dispatch::dispatch_state_aware_exec(&mut runner, bound);
+        let handle = runner.finish(handle)?;
+        Ok(
+            Box::new(crate::mxc_common::exec_stream::ExecSandboxProcess::from_exec_handle(handle)?)
+                as Box<dyn crate::mxc_common::sandbox_process::SandboxProcess>,
+        )
     })
 }
 
@@ -366,12 +374,96 @@ impl StatefulSandboxBackend for NvxStateAwareRunner {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{run_with_sufficient_stack, stack_has_sufficient_space};
     use super::*;
     use crate::mxc_common::mxc_error::MxcErrorCode;
     use crate::mxc_common::state_aware_binding::{
         BoundStateAwareOperation, BoundStateAwareRequest,
     };
     use windows::Win32::Security::{ImpersonateSelf, RevertToSelf, SecurityIdentification};
+
+    #[test]
+    fn stack_guard_requires_current_pointer_inside_bounds() {
+        let low = 0x1000;
+        let high = low + 2 * 1024 * 1024;
+        assert!(stack_has_sufficient_space(low, high, low + 1024 * 1024));
+        assert!(!stack_has_sufficient_space(
+            low,
+            high,
+            low + 1024 * 1024 - 1
+        ));
+        assert!(!stack_has_sufficient_space(low, high, low - 1));
+        assert!(!stack_has_sufficient_space(low, high, high));
+        assert!(!stack_has_sufficient_space(high, low, high));
+    }
+
+    #[test]
+    fn consumed_stack_dispatches_to_worker() {
+        const CHILD: &str = "MXC_TEST_CONSUMED_NVX_STACK";
+        if std::env::var_os(CHILD).is_some() {
+            #[inline(never)]
+            fn consume(depth: usize, caller: std::thread::ThreadId) {
+                let mut frame = [0u8; 32 * 1024];
+                std::hint::black_box(&mut frame);
+                let (mut low, mut high) = (0usize, 0usize);
+                // SAFETY: both output pointers refer to writable stack locals.
+                unsafe {
+                    windows::Win32::System::Threading::GetCurrentThreadStackLimits(
+                        &mut low, &mut high,
+                    )
+                };
+                let current = std::hint::black_box(&frame) as *const _ as usize;
+                assert!(current >= low && current < high);
+                if current - low < 800 * 1024 {
+                    let worker =
+                        run_with_sufficient_stack(|| Ok(std::thread::current().id())).unwrap();
+                    assert_ne!(caller, worker, "insufficient remaining stack ran inline");
+                } else {
+                    assert!(depth < 48, "failed to consume the bounded test stack");
+                    consume(depth + 1, caller);
+                }
+                std::hint::black_box(&frame);
+            }
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| consume(0, std::thread::current().id()))
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backend_modules::nvx::state_aware::tests::consumed_stack_dispatches_to_worker",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "consumed-stack test timed out: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn provision_policy_is_validated_before_low_stack_worker() {

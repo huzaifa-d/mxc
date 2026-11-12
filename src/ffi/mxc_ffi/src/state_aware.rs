@@ -624,6 +624,172 @@ mod tests {
     );
 
     #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn microvm_low_stack_exec_reaches_client() {
+        const CHILD: &str = "MXC_TEST_LOW_STACK_EXEC";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let stack_size = std::env::var("MXC_TEST_STACK_BYTES")
+                .unwrap_or_else(|_| (128 * 1024).to_string())
+                .parse()
+                .unwrap();
+            std::thread::Builder::new()
+                .stack_size(stack_size)
+                .spawn(move || {
+                    let request = if mode.starts_with("once-") {
+                        CString::new(concat!(
+                            r#"{"version":"1.1.0-alpha","containment":"microvm","#,
+                            r#""microvm":{"image":"mcr.microsoft.com/azurelinux/base/core:3.0"},"#,
+                            r#""process":{"commandLine":"true","timeout":30000}}"#,
+                        ))
+                    } else {
+                        CString::new(concat!(
+                            r#"{"version":"1.1.0-alpha","phase":"exec","#,
+                            r#""sandboxId":"microvm:0123456789abcdef0123456789abcdef","#,
+                            r#""process":{"commandLine":"true","timeout":30000}}"#,
+                        ))
+                    }
+                    .unwrap();
+                    if mode == "once-capture" {
+                        let mut result = crate::MxcRunResult::empty();
+                        // SAFETY: the C string and output storage remain live through the call.
+                        let status =
+                            unsafe { crate::mxc_run_json(request.as_ptr(), 1, &mut result) };
+                        let message = if result.error.message_utf8.is_null() {
+                            String::new()
+                        } else {
+                            // SAFETY: the result owns a NUL-terminated message.
+                            unsafe { std::ffi::CStr::from_ptr(result.error.message_utf8) }
+                                .to_string_lossy()
+                                .into_owned()
+                        };
+                        // SAFETY: the result was populated by this FFI call.
+                        unsafe { crate::mxc_run_result_free(&mut result) };
+                        assert_eq!(
+                            status,
+                            crate::MXC_STATUS_BACKEND_UNAVAILABLE,
+                            "{mode}: {message}"
+                        );
+                        assert!(message.contains("SHA-256 mismatch"), "{mode}: {message}");
+                        return;
+                    }
+                    let mut handle = ptr::null_mut();
+                    let mut error = MxcErrorDetail::none();
+                    let execute = if mode == "capture" {
+                        mxc_exec_state_aware_capture_json
+                    } else if mode == "once-stream" {
+                        crate::mxc_spawn_json
+                    } else {
+                        mxc_exec_state_aware_json
+                    };
+                    // SAFETY: the C string and output storage remain live until the call returns.
+                    let status = unsafe { execute(request.as_ptr(), 1, &mut handle, &mut error) };
+                    let message = if error.message_utf8.is_null() {
+                        String::new()
+                    } else {
+                        // SAFETY: populated error owns a NUL-terminated message.
+                        unsafe { std::ffi::CStr::from_ptr(error.message_utf8) }
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    if !handle.is_null() {
+                        // SAFETY: a successful call returned the owned handle.
+                        unsafe { crate::mxc_sandbox_free(handle) };
+                    }
+                    // SAFETY: error was populated by this FFI call.
+                    unsafe { crate::mxc_error_detail_free(&mut error) };
+                    if mode == "once-stream" {
+                        assert_eq!(
+                            status,
+                            crate::MXC_STATUS_BACKEND_UNAVAILABLE,
+                            "{mode}: {message}"
+                        );
+                        assert!(message.contains("SHA-256 mismatch"), "{mode}: {message}");
+                    } else {
+                        assert_eq!(status, crate::MXC_STATUS_STALE_ID, "{mode}: {message}");
+                    }
+                    eprintln!("{mode}: status={status}, message={message}");
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let bundle = exe
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("aci-edge-sandboxes");
+        assert!(
+            bundle.join("SHA256SUMS").is_file(),
+            "missing staged NVX bundle"
+        );
+        fn copy_directory(source: &std::path::Path, target: &std::path::Path) {
+            std::fs::create_dir_all(target).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let destination = target.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_directory(&entry.path(), &destination);
+                } else {
+                    std::fs::copy(entry.path(), destination).unwrap();
+                }
+            }
+        }
+        let invalid = tempfile::tempdir().unwrap();
+        copy_directory(&bundle, invalid.path());
+        std::fs::write(invalid.path().join("guest/vmlinux"), b"modified").unwrap();
+        let mut failures = Vec::new();
+        for mode in ["stream", "capture", "once-stream", "once-capture"] {
+            let state = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "state_aware::tests::microvm_low_stack_exec_reaches_client",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env("LOCALAPPDATA", state.path())
+                .env(
+                    "ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR",
+                    if mode.starts_with("once-") {
+                        invalid.path()
+                    } else {
+                        &bundle
+                    },
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "{mode} timed out: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let output = child.wait_with_output().unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{mode}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn captured_exec_rejects_null_output_before_reading_request() {
         // SAFETY: both null arguments are explicitly supported.
         let status = unsafe { mxc_run_state_aware_exec_json(ptr::null(), 0, ptr::null_mut()) };
@@ -786,6 +952,25 @@ mod tests {
                             unsafe { mxc_run_state_aware_json(bad_id.as_ptr(), 1, 1, &mut bad) };
                         assert_eq!(status, crate::MXC_STATUS_MALFORMED_ID);
                         unsafe { mxc_state_aware_result_free(&mut bad) };
+                        let bad_exec_id = CString::new(concat!(
+                            r#"{"version":"1.0.0","phase":"exec","#,
+                            r#""sandboxId":"microvm:bad","process":{"commandLine":"true"}}"#,
+                        ))
+                        .unwrap();
+                        let mut handle = ptr::null_mut();
+                        let mut error = MxcErrorDetail::none();
+                        // SAFETY: the C string and output storage remain live through the call.
+                        let status = unsafe {
+                            mxc_exec_state_aware_json(
+                                bad_exec_id.as_ptr(),
+                                1,
+                                &mut handle,
+                                &mut error,
+                            )
+                        };
+                        assert_eq!(status, crate::MXC_STATUS_MALFORMED_ID);
+                        assert!(handle.is_null());
+                        unsafe { crate::mxc_error_detail_free(&mut error) };
                         let bad_policy = CString::new(concat!(
                             r#"{"version":"1.1.0-alpha","phase":"exec","#,
                             r#""sandboxId":"microvm:0123456789abcdef0123456789abcdef","#,
@@ -799,6 +984,19 @@ mod tests {
                         };
                         assert_eq!(status, crate::MXC_STATUS_POLICY_VALIDATION);
                         unsafe { mxc_state_aware_result_free(&mut rejected) };
+                        let mut error = MxcErrorDetail::none();
+                        // SAFETY: the C string and output storage remain live through the call.
+                        let status = unsafe {
+                            mxc_exec_state_aware_json(
+                                bad_policy.as_ptr(),
+                                1,
+                                &mut handle,
+                                &mut error,
+                            )
+                        };
+                        assert_eq!(status, crate::MXC_STATUS_POLICY_VALIDATION);
+                        assert!(handle.is_null());
+                        unsafe { crate::mxc_error_detail_free(&mut error) };
                         let mut out = MxcStateAwareResult::empty();
                         // SAFETY: request and out remain valid during the call.
                         let status =

@@ -64,7 +64,10 @@ console.log(output.stdout, output.exitCode);
 the workload exit code, timeout state, warnings, and optional output metadata.
 
 On Windows, `getPlatformSupport` reports ProcessContainer only when native PSEC
-is available; other backends are detected independently. `probe(request)` from
+is available; other backends are detected independently. It reports available
+MicroVM support for the development JSON APIs, not typed V1 requests. Windows
+native backend availability is refreshed on each call and remains advisory.
+`probe(request)` from
 `@microsoft/mxc-sdk/v1` checks request compatibility without creating a container.
 If native ProcessContainer cannot serve the request, `tier` is omitted and
 `error` explains why; `probes` still contains host capability facts.

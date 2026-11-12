@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { it } from 'node:test';
-import { MxcError } from '@microsoft/mxc-sdk/v1';
+import { getAvailableBackends, MxcError } from '@microsoft/mxc-sdk/v1';
 import * as dev from '@microsoft/mxc-sdk/v1/dev';
 
 const enabled = process.platform === 'win32' && process.arch === 'x64'
@@ -13,6 +13,10 @@ const image = 'mcr.microsoft.com/azurelinux/base/core:3.0';
 
 it('V1.Dev NVX JSON lifecycle capture, live streams and overflow recovery',
   { skip: !enabled, timeout: 600_000 }, async () => {
+    assert.ok(
+      getAvailableBackends().some(backend => backend.backend === 'microvm'),
+      'the packaged NVX runtime must be discoverable on the MicroVM validation host',
+    );
     const request = (commandLine: string) => JSON.stringify({
       version: '1.1.0-alpha', containment: 'microvm', microvm: { image },
       process: { commandLine, timeout: 30000 },

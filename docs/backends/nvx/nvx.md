@@ -11,8 +11,10 @@ The backend supports Windows x64 only. Windows ARM64 and Linux hosts do not have
 active MicroVM execution path; support for those platforms is
 future work. Enabling the feature does not make an unsupported host available.
 
-`v1::available_backends` checks the feature, bundle manifest/library, and active
-hypervisor. Availability is advisory; execution verifies runtime requirements.
+`v1::available_backends` and platform support report MicroVM when the feature,
+bundle manifest/library, and active hypervisor are available. This is advisory;
+execution verifies runtime requirements. MicroVM execution uses the development
+JSON APIs, not typed V1 requests.
 
 ## Requirements and quick start
 
