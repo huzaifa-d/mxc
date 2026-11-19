@@ -848,6 +848,36 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         std::fs::remove_file(path).map_err(|error| format!("retire cleanup identity: {error}"))
     }
 
+    fn cleanup_failure_diagnostics(
+        identity_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<String, String> {
+        let identity: CleanupIdentity = serde_json::from_slice(
+            &std::fs::read(identity_path)
+                .map_err(|error| format!("read cleanup identity: {error}"))?,
+        )
+        .map_err(|error| format!("parse cleanup identity: {error}"))?;
+        if identity.sandbox_id.is_empty() {
+            return Err("cleanup identity is empty".to_owned());
+        }
+        let stderr = std::fs::read_to_string(stderr_path)
+            .map_err(|error| format!("read cleanup diagnostics: {error}"))?;
+        let message = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("recover lifecycle container: "))
+            .ok_or_else(|| "cleanup worker did not report a recovery error".to_owned())?;
+        let native_id = identity
+            .sandbox_id
+            .strip_prefix("microvm:")
+            .unwrap_or(&identity.sandbox_id);
+        if native_id.is_empty() {
+            return Err("cleanup identity has no native ID".to_owned());
+        }
+        Ok(message
+            .replace(&identity.sandbox_id, "<redacted>")
+            .replace(native_id, "<redacted>"))
+    }
+
     #[test]
     fn provision_close_failure_publishes_identity_for_parent_cleanup() {
         let directory = tempfile::tempdir().unwrap();
@@ -900,6 +930,22 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert!(failure.contains("stop failed"), "{failure}");
         assert!(failure.contains("deprovision failed"), "{failure}");
         assert!(path.exists(), "failed cleanup must retain its identity");
+
+        let stderr = directory.path().join("cleanup.stderr");
+        std::fs::write(
+            &stderr,
+            format!(
+                "ignored native diagnostics\nrecover lifecycle container: StaleId for {id}, native {}",
+                id.strip_prefix("microvm:").unwrap()
+            ),
+        )
+        .unwrap();
+        let diagnostics = cleanup_failure_diagnostics(&path, &stderr).unwrap();
+        assert_eq!(diagnostics, "StaleId for <redacted>, native <redacted>");
+        std::fs::write(&stderr, "unrelated native diagnostics").unwrap();
+        assert!(cleanup_failure_diagnostics(&path, &stderr).is_err());
+        std::fs::write(&path, b"invalid identity").unwrap();
+        assert!(cleanup_failure_diagnostics(&path, &stderr).is_err());
     }
 
     fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
@@ -1112,13 +1158,24 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         if !success || !stdout.contains(MARKER) {
             let id_file = directory.path().join("nvx-undrained-sandbox-id");
             let cleanup = if id_file.exists() {
+                let cleanup_stderr = directory.path().join("cleanup.stderr");
                 match spawn(
                     "cleanup",
                     &directory.path().join("cleanup.stdout"),
-                    &directory.path().join("cleanup.stderr"),
+                    &cleanup_stderr,
                 ) {
                     Ok(mut cleanup) => {
-                        format!("{:?}", wait_bounded(&mut cleanup, Duration::from_secs(90)))
+                        let result = wait_bounded(&mut cleanup, Duration::from_secs(90));
+                        if matches!(result, Ok(true)) {
+                            format!("{result:?}")
+                        } else {
+                            let diagnostics =
+                                cleanup_failure_diagnostics(&id_file, &cleanup_stderr)
+                                    .unwrap_or_else(|error| {
+                                        format!("diagnostics unavailable: {error}")
+                                    });
+                            format!("{result:?}; cleanup stderr: {diagnostics}")
+                        }
                     }
                     Err(error) => format!("could not start cleanup worker: {error}"),
                 }
