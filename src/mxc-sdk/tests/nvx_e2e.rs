@@ -981,23 +981,54 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert!(cleanup_failure_diagnostics(&path, &stderr).is_err());
     }
 
-    fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
+    fn wait_bounded_with<C>(
+        child: &mut C,
+        timeout: Duration,
+        reap_timeout: Duration,
+        mut try_wait: impl FnMut(&mut C) -> std::io::Result<Option<bool>>,
+        mut kill: impl FnMut(&mut C) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status.success());
+            if let Some(success) = try_wait(child)? {
+                return Ok(success);
             }
             if Instant::now() >= deadline {
-                if let Err(error) = child.kill() {
-                    if child.try_wait()?.is_none() {
+                if let Err(error) = kill(child) {
+                    if try_wait(child)?.is_none() {
                         return Err(error);
                     }
                 }
-                child.wait()?;
-                return Ok(false);
+                let reap_deadline = Instant::now() + reap_timeout;
+                loop {
+                    if try_wait(child)?.is_some() {
+                        return Ok(false);
+                    }
+                    if Instant::now() >= reap_deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "watchdog could not confirm worker termination",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
+        wait_bounded_with(
+            child,
+            timeout,
+            Duration::from_secs(5),
+            |child| {
+                child
+                    .try_wait()
+                    .map(|status| status.map(|status| status.success()))
+            },
+            std::process::Child::kill,
+        )
     }
 
     fn wait_for_watchdog_job() {
@@ -1019,7 +1050,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             .map_err(std::io::Error::other)
             .and_then(|()| std::fs::write(gate, b"ready"));
         if let Err(error) = setup {
-            let cleanup = child.kill().and_then(|()| child.wait().map(|_| ()));
+            let cleanup = wait_bounded(child, Duration::ZERO).map(|_| ());
             return Err(std::io::Error::other(format!(
                 "watchdog job setup failed: {error}; worker cleanup: {cleanup:?}"
             )));
@@ -1034,6 +1065,21 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         use windows::Win32::System::Threading::{
             OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
         };
+
+        let mut kills = 0;
+        let error = wait_bounded_with(
+            &mut kills,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| Ok(None),
+            |kills| {
+                *kills += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(kills, 1);
 
         const CHILD: &str = "MXC_NVX_WATCHDOG_TEST_CHILD";
         const READY: &str = "MXC_NVX_WATCHDOG_READY";
@@ -1086,8 +1132,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                 panic!("watchdog test child exited before publishing readiness");
             }
             if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
+                wait_bounded(&mut child, Duration::ZERO).unwrap();
                 panic!("watchdog test child did not publish readiness");
             }
             std::thread::sleep(Duration::from_millis(25));
