@@ -42,6 +42,12 @@ var result = await MxcContainer.RunJsonAsync(
 Console.WriteLine(result.Stdout);
 ```
 
+For captured execution in an existing MicroVM container,
+`V1.Dev.MxcLifecycle.RunInContainerJson` and `RunInContainerJsonAsync` limit
+combined stdout and stderr to 64 MiB. Live streams are not subject to this
+capture limit. See the [NVX backend guide](../../docs/backends/nvx/nvx.md#output-timeout-and-cleanup)
+for overflow and cleanup behavior.
+
 ## Run to completion
 
 ```csharp
