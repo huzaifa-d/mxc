@@ -206,13 +206,16 @@ fn unsupported_platform_or_feature_is_fail_closed() {
 #[cfg(all(windows, target_arch = "x86_64", feature = "microvm"))]
 mod windows_x64 {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::process::{Command, Output, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use mxc_sdk::mxc_common::logger::{Logger, Mode};
+    use mxc_sdk::process_container_common::job_object::UiJobObject;
     use mxc_sdk::v1::{ExecutionResult, WaitResult};
     use serde_json::{json, Value};
+    use windows::Win32::Foundation::HANDLE;
 
     use super::*;
 
@@ -848,6 +851,14 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         std::fs::remove_file(path).map_err(|error| format!("retire cleanup identity: {error}"))
     }
 
+    fn cleanup_stop_result(result: Result<String, mxc_sdk::v1::Error>) -> Result<(), String> {
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == ErrorCode::AlreadyStopped => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn cleanup_failure_diagnostics(
         identity_path: &Path,
         stderr_path: &Path,
@@ -921,6 +932,28 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         assert!(!path.exists());
 
         publish_cleanup_identity(&path, id, true).unwrap();
+        cleanup_published_lifecycle(
+            &path,
+            |_| {
+                cleanup_stop_result(Err(mxc_sdk::v1::Error::new(
+                    ErrorCode::AlreadyStopped,
+                    "already stopped",
+                )))
+            },
+            |actual| {
+                assert_eq!(actual, id);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert!(cleanup_stop_result(Err(mxc_sdk::v1::Error::new(
+            ErrorCode::BackendError,
+            "stop failed"
+        )))
+        .is_err());
+
+        publish_cleanup_identity(&path, id, true).unwrap();
         let failure = cleanup_published_lifecycle(
             &path,
             |_| Err("stop failed".to_owned()),
@@ -967,27 +1000,86 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         }
     }
 
+    fn wait_for_watchdog_job() {
+        let gate = std::env::var_os("MXC_NVX_WATCHDOG_JOB_GATE").expect("watchdog job gate");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !Path::new(&gate).exists() {
+            assert!(Instant::now() < deadline, "watchdog job gate timed out");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn assign_watchdog_job(
+        job: &UiJobObject,
+        child: &mut std::process::Child,
+        gate: &Path,
+    ) -> std::io::Result<()> {
+        let setup = job
+            .assign_process(HANDLE(child.as_raw_handle()))
+            .map_err(std::io::Error::other)
+            .and_then(|()| std::fs::write(gate, b"ready"));
+        if let Err(error) = setup {
+            let cleanup = child.kill().and_then(|()| child.wait().map(|_| ()));
+            return Err(std::io::Error::other(format!(
+                "watchdog job setup failed: {error}; worker cleanup: {cleanup:?}"
+            )));
+        }
+        Ok(())
+    }
+
     #[test]
     fn stream_watchdog_terminates_stuck_worker() {
+        use mxc_sdk::mxc_common::process_util::OwnedHandle;
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
         const CHILD: &str = "MXC_NVX_WATCHDOG_TEST_CHILD";
         const READY: &str = "MXC_NVX_WATCHDOG_READY";
         const TEST: &str = "windows_x64::stream_watchdog_terminates_stuck_worker";
-        if std::env::var_os(CHILD).is_some() {
-            std::fs::write(std::env::var_os(READY).unwrap(), b"ready").unwrap();
-            std::thread::sleep(Duration::from_secs(30));
-            return;
+        match std::env::var(CHILD).ok().as_deref() {
+            Some("descendant") => {
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            Some("worker") => {
+                wait_for_watchdog_job();
+                let mut descendant = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST])
+                    .env(CHILD, "descendant")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                std::fs::write(
+                    std::env::var_os(READY).unwrap(),
+                    descendant.id().to_string(),
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+                descendant.wait().unwrap();
+                return;
+            }
+            Some(mode) => panic!("unknown watchdog test mode: {mode}"),
+            None => {}
         }
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
+        let gate = directory.path().join("gate");
+        let job = UiJobObject::new().expect("create watchdog job");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST])
-            .env(CHILD, "1")
+            .env(CHILD, "worker")
             .env(READY, &ready)
+            .env("MXC_NVX_WATCHDOG_JOB_GATE", &gate)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        assign_watchdog_job(&job, &mut child, &gate).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() {
             if child.try_wait().unwrap().is_some() {
@@ -1000,10 +1092,20 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+        let pid: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+        // SAFETY: the worker created this live child and the handle is owned below.
+        let descendant =
+            OwnedHandle::new(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.unwrap());
         let started = Instant::now();
         assert!(!wait_bounded(&mut child, Duration::from_secs(1)).unwrap());
+        job.terminate_and_wait(1).unwrap();
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(child.try_wait().unwrap().is_some());
+        // SAFETY: descendant remains a valid process handle until it is dropped.
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.get(), 5000) },
+            WAIT_OBJECT_0
+        );
     }
 
     #[test]
@@ -1020,12 +1122,14 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
 
         match std::env::var(CHILD).ok().as_deref() {
             Some("cleanup") => {
+                wait_for_watchdog_job();
                 cleanup_published_lifecycle(
                     &id_file,
                     |id| {
-                        dev::stop_container_json(&lifecycle_phase(id, "stop").to_string(), options)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
+                        cleanup_stop_result(dev::stop_container_json(
+                            &lifecycle_phase(id, "stop").to_string(),
+                            options,
+                        ))
                     },
                     |id| {
                         dev::deprovision_container_json(
@@ -1040,6 +1144,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                 return;
             }
             Some("scenario") => {
+                wait_for_watchdog_job();
                 let provisioned = record_provision_result(
                     dev::provision_container_json(&lifecycle_provision().to_string(), options),
                     &id_file,
@@ -1118,6 +1223,8 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                     options,
                 )
                 .unwrap();
+                let root = local_app_data.join(r"Microsoft\MXC\nvx");
+                assert!(!lifecycle_sandbox_directory(&root, &id).exists());
                 container.cleaned = true;
                 std::fs::remove_file(&id_file).unwrap();
                 println!("{MARKER}");
@@ -1130,25 +1237,31 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         let directory = tempfile::tempdir().expect("isolated cancellation LOCALAPPDATA");
         let stdout_path = directory.path().join("scenario.stdout");
         let stderr_path = directory.path().join("scenario.stderr");
+        let job = UiJobObject::new().expect("create lifecycle watchdog job");
         let spawn =
             |mode: &str, stdout: &Path, stderr: &Path| -> std::io::Result<std::process::Child> {
-                Command::new(std::env::current_exe()?)
+                let gate = directory.path().join(format!("{mode}.gate"));
+                let mut child = Command::new(std::env::current_exe()?)
                     .args(["--exact", TEST, "--ignored", "--nocapture"])
                     .env(CHILD, mode)
+                    .env("MXC_NVX_WATCHDOG_JOB_GATE", &gate)
                     .env("LOCALAPPDATA", directory.path())
                     .stdin(Stdio::null())
                     .stdout(std::fs::File::create(stdout)?)
                     .stderr(std::fs::File::create(stderr)?)
-                    .spawn()
+                    .spawn()?;
+                assign_watchdog_job(&job, &mut child, &gate)?;
+                Ok(child)
             };
         let mut child = spawn("scenario", &stdout_path, &stderr_path).unwrap();
         let success = match wait_bounded(&mut child, Duration::from_secs(240)) {
             Ok(success) => success,
             Err(error) => {
+                let fallback = job.terminate_and_wait(1);
                 let recovery = directory.keep();
                 panic!(
                     "cancellation watchdog could not confirm worker termination: {error}; \
-                     recovery state={}",
+                     job fallback={fallback:?}; recovery state={}",
                     recovery.display()
                 );
             }
@@ -1182,14 +1295,17 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
             } else {
                 "no published sandbox ID".to_owned()
             };
+            let fallback = job.terminate_and_wait(1);
             let recovery = directory.keep();
             panic!(
-                "cancellation scenario failed or timed out; cleanup={cleanup}; \
+                "cancellation scenario failed or timed out; cleanup={cleanup}; job fallback={fallback:?}; \
                  recovery state={}; stdout={stdout}; stderr={stderr}",
                 recovery.display()
             );
         }
         assert!(!directory.path().join("nvx-undrained-sandbox-id").exists());
+        job.wait_for_empty()
+            .expect("lifecycle watchdog job retained processes");
         println!("{MARKER}");
     }
 

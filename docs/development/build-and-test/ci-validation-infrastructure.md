@@ -375,7 +375,8 @@ template without exiting the owning SDK process.
 Another isolated helper kills and drops live lifecycle executions while holding
 their stdout undrained, then checks that the container remains usable. A parent
 watchdog bounds the helper and attempts cleanup using its published sandbox ID;
-if recovery fails, the isolated state and logs are retained for diagnosis.
+if recovery fails, a scoped Windows job terminates the helper's processes and
+the isolated state and redacted diagnostics are retained for diagnosis.
 
 An intentionally blocked template store must cold boot successfully and return
 warnings to captured and streaming SDK callers. Lifecycle `start` must record a

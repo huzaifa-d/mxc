@@ -96,10 +96,20 @@ fn microvm_creation_requires_opt_in_and_rejects_lifecycle_envelopes() {
         assert!(result.stdout_utf8.is_null());
         assert!(result.stderr_utf8.is_null());
         assert!(!result.error.message_utf8.is_null());
+        if expected == MXC_STATUS_BACKEND_UNAVAILABLE {
+            // SAFETY: the entry point returned a non-null owned error message.
+            let message = unsafe { CStr::from_ptr(result.error.message_utf8) }
+                .to_str()
+                .unwrap();
+            assert!(message.contains("experimental"), "{message}");
+        }
         // SAFETY: result owns the strings returned by the call.
         unsafe { mxc_run_result_free(&mut result) };
         assert!(result.error.message_utf8.is_null());
     }
+    let (status, message) = spawn_failure(mxc_spawn_json, CREATE, 0);
+    assert_eq!(status, MXC_STATUS_BACKEND_UNAVAILABLE, "{message}");
+    assert!(message.contains("experimental"), "{message}");
 
     #[cfg(all(windows, target_arch = "aarch64"))]
     {
@@ -161,6 +171,11 @@ fn microvm_lifecycle_exec_exports_require_opt_in() {
         assert_eq!(result.status, status);
         assert!(result.response_json_utf8.is_null());
         assert!(!result.error.message_utf8.is_null());
+        // SAFETY: the entry point returned a non-null owned error message.
+        let message = unsafe { CStr::from_ptr(result.error.message_utf8) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("experimental"), "{message}");
         // SAFETY: result owns the strings returned by the call.
         unsafe { mxc_state_aware_result_free(&mut result) };
     }
