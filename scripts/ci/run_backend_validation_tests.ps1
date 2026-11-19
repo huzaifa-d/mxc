@@ -517,7 +517,10 @@ function Invoke-MicroVmTests {
     } finally {
         [Environment]::SetEnvironmentVariable('ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR', $previousAgent)
     }
-    $failure = Get-LibtestFailure -Run $run -RequiredTests 'windows_x64::stream_watchdog_terminates_stuck_worker'
+    $failure = Get-LibtestFailure -Run $run -RequiredTests @(
+        'windows_x64::provision_close_failure_publishes_identity_for_parent_cleanup',
+        'windows_x64::stream_watchdog_terminates_stuck_worker'
+    )
     if ($failure) {
         throw "MicroVM SDK tests $failure."
     }

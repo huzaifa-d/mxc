@@ -269,6 +269,9 @@ fn main() {
         if mode != "missing-stream-watchdog-discovery" {
             println!("windows_x64::stream_watchdog_terminates_stuck_worker: test");
         }
+        if mode != "missing-provision-recovery-discovery" {
+            println!("windows_x64::provision_close_failure_publishes_identity_for_parent_cleanup: test");
+        }
         if mode != "missing-undrained-discovery" {
             println!("windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation: test");
         }
@@ -309,6 +312,9 @@ fn main() {
     }
     if mode != "missing-stream-watchdog-result" {
         println!("test windows_x64::stream_watchdog_terminates_stuck_worker ... ok");
+    }
+    if mode != "missing-provision-recovery-result" {
+        println!("test windows_x64::provision_close_failure_publishes_identity_for_parent_cleanup ... ok");
     }
     if mode != "missing-undrained-marker" {
         println!("VM_EXECUTED SDK lifecycle undrained stream kill drop and reuse");
@@ -816,6 +822,7 @@ for (const [mode, message] of [
   ["missing-sdk-json", /did not execute the SDK JSON capture VM scenario/],
   ["missing-sdk-lifecycle", /did not execute the SDK JSON lifecycle VM scenario/],
   ["missing-stream-watchdog-result", /stream_watchdog_terminates_stuck_worker.*did not pass/],
+  ["missing-provision-recovery-result", /provision_close_failure_publishes_identity_for_parent_cleanup.*did not pass/],
   ["missing-undrained-marker", /did not execute the SDK lifecycle undrained cancellation VM scenario/],
   ["missing-sdk-clone-cleanup", /did not execute the SDK clone cleanup VM scenario/],
   ["missing-snapshot-memory", /did not execute the snapshot memory VM scenario/],
@@ -996,6 +1003,7 @@ for (const [mode, message] of [
   ["missing-sdk-json-discovery", /did not discover windows_x64::signed_bundle_sdk_json_capture/],
   ["missing-sdk-lifecycle-discovery", /did not discover windows_x64::signed_bundle_sdk_json_lifecycle/],
   ["missing-stream-watchdog-discovery", /did not discover windows_x64::stream_watchdog_terminates_stuck_worker/],
+  ["missing-provision-recovery-discovery", /did not discover[\s\S]*windows_x64::provision_close_failure_publishes_identity_for_parent_cleanup/],
   ["missing-undrained-discovery", /did not discover windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation/],
   ["missing-interruption-discovery", /did not discover windows_x64::signed_bundle_executor_console_interrupt/],
   ["missing-image-reuse-discovery", /did not discover windows_x64::signed_bundle_executor_reuses_registered_images/],
@@ -1021,6 +1029,7 @@ for (const [mode, message] of [
       "missing-sdk-json-discovery",
       "missing-sdk-lifecycle-discovery",
       "missing-stream-watchdog-discovery",
+      "missing-provision-recovery-discovery",
       "missing-undrained-discovery",
       "missing-interruption-discovery",
       "missing-image-reuse-discovery",

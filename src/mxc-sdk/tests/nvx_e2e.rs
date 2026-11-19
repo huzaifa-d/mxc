@@ -763,6 +763,145 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         provision
     }
 
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct CleanupIdentity {
+        sandbox_id: String,
+        stop_first: bool,
+    }
+
+    fn publish_cleanup_identity(path: &Path, id: &str, stop_first: bool) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let parent = path.parent().expect("cleanup identity directory");
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(
+            &mut file,
+            &CleanupIdentity {
+                sandbox_id: id.to_owned(),
+                stop_first,
+            },
+        )?;
+        file.flush()?;
+        file.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    fn publish_provision_recovery(
+        error: &mxc_sdk::v1::Error,
+        path: &Path,
+    ) -> std::io::Result<bool> {
+        let Some(id) = error
+            .details
+            .as_deref()
+            .and_then(|details| details.pointer("/nvxRecovery/sandboxId"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(false);
+        };
+        let mut guard = LifecycleContainer {
+            id: id.to_owned(),
+            local_app_data: None,
+            cleaned: false,
+        };
+        publish_cleanup_identity(path, id, false)?;
+        guard.cleaned = true;
+        Ok(true)
+    }
+
+    fn record_provision_result(
+        result: Result<String, mxc_sdk::v1::Error>,
+        path: &Path,
+    ) -> Result<String, String> {
+        match result {
+            Ok(provisioned) => Ok(provisioned),
+            Err(error) => {
+                if let Err(publish_error) = publish_provision_recovery(&error, path) {
+                    return Err(format!(
+                        "provision failed: {error}; recovery publication failed: {publish_error}"
+                    ));
+                }
+                Err(format!("provision failed: {error}"))
+            }
+        }
+    }
+
+    fn cleanup_published_lifecycle(
+        path: &Path,
+        mut stop: impl FnMut(&str) -> Result<(), String>,
+        mut deprovision: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let identity: CleanupIdentity = serde_json::from_slice(
+            &std::fs::read(path).map_err(|error| format!("read cleanup identity: {error}"))?,
+        )
+        .map_err(|error| format!("parse cleanup identity: {error}"))?;
+        let stop_error = if identity.stop_first {
+            stop(&identity.sandbox_id).err()
+        } else {
+            None
+        };
+        let deprovision_error = deprovision(&identity.sandbox_id).err();
+        if stop_error.is_some() || deprovision_error.is_some() {
+            return Err(format!(
+                "stop cleanup: {stop_error:?}; deprovision cleanup: {deprovision_error:?}"
+            ));
+        }
+        std::fs::remove_file(path).map_err(|error| format!("retire cleanup identity: {error}"))
+    }
+
+    #[test]
+    fn provision_close_failure_publishes_identity_for_parent_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sandbox-id");
+        let id = "microvm:0123456789abcdef0123456789abcdef";
+        let mut error = mxc_sdk::v1::Error::new(ErrorCode::BackendError, "close failed");
+        error.details = Some(Box::new(json!({
+            "nvxRecovery": {"sandboxId": id, "state": "provisioned"}
+        })));
+        assert!(!format!("{error:?}").contains(id));
+        let failure = record_provision_result(Err(error), &path).unwrap_err();
+        assert!(failure.contains("close failed"));
+        assert!(!failure.contains(id));
+        let mut stops = 0;
+        let mut deprovisions = 0;
+        cleanup_published_lifecycle(
+            &path,
+            |_| {
+                stops += 1;
+                Ok(())
+            },
+            |actual| {
+                assert_eq!(actual, id);
+                deprovisions += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((stops, deprovisions), (0, 1));
+        assert!(!path.exists());
+
+        let failure = record_provision_result(
+            Err(mxc_sdk::v1::Error::new(
+                ErrorCode::BackendError,
+                "no recovery",
+            )),
+            &path,
+        )
+        .unwrap_err();
+        assert!(failure.contains("no recovery"));
+        assert!(!path.exists());
+
+        publish_cleanup_identity(&path, id, true).unwrap();
+        let failure = cleanup_published_lifecycle(
+            &path,
+            |_| Err("stop failed".to_owned()),
+            |_| Err("deprovision failed".to_owned()),
+        )
+        .unwrap_err();
+        assert!(failure.contains("stop failed"), "{failure}");
+        assert!(failure.contains("deprovision failed"), "{failure}");
+        assert!(path.exists(), "failed cleanup must retain its identity");
+    }
+
     fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -835,26 +974,32 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
 
         match std::env::var(CHILD).ok().as_deref() {
             Some("cleanup") => {
-                let id = std::fs::read_to_string(&id_file).unwrap();
-                let stop =
-                    dev::stop_container_json(&lifecycle_phase(&id, "stop").to_string(), options);
-                let deprovision = dev::deprovision_container_json(
-                    &lifecycle_phase(&id, "deprovision").to_string(),
-                    options,
-                );
-                assert!(
-                    stop.is_ok() && deprovision.is_ok(),
-                    "stop={stop:?}, deprovision={deprovision:?}"
-                );
-                std::fs::remove_file(&id_file).unwrap();
+                cleanup_published_lifecycle(
+                    &id_file,
+                    |id| {
+                        dev::stop_container_json(&lifecycle_phase(id, "stop").to_string(), options)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                    |id| {
+                        dev::deprovision_container_json(
+                            &lifecycle_phase(id, "deprovision").to_string(),
+                            options,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .expect("recover lifecycle container");
                 return;
             }
             Some("scenario") => {
-                let provisioned: Value = serde_json::from_str(
-                    &dev::provision_container_json(&lifecycle_provision().to_string(), options)
-                        .unwrap(),
+                let provisioned = record_provision_result(
+                    dev::provision_container_json(&lifecycle_provision().to_string(), options),
+                    &id_file,
                 )
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{error}"));
+                let provisioned: Value = serde_json::from_str(&provisioned).unwrap();
                 let id = provisioned["result"]["sandboxId"]
                     .as_str()
                     .unwrap()
@@ -864,7 +1009,7 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
                     local_app_data: None,
                     cleaned: false,
                 };
-                std::fs::write(&id_file, &id).unwrap();
+                publish_cleanup_identity(&id_file, &id, true).unwrap();
                 dev::start_container_json(&lifecycle_phase(&id, "start").to_string(), options)
                     .unwrap();
                 for dispose in [false, true] {

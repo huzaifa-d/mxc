@@ -63,6 +63,7 @@ foreach ($name in @(
     'windows_x64::signed_bundle_facade_create_and_run',
     'windows_x64::signed_bundle_sdk_json_capture',
     'windows_x64::signed_bundle_sdk_json_lifecycle',
+    'windows_x64::provision_close_failure_publishes_identity_for_parent_cleanup',
     'windows_x64::stream_watchdog_terminates_stuck_worker',
     'windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation',
     'windows_x64::signed_bundle_json_image_and_filesystem_policy',
