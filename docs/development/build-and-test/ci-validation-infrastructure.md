@@ -372,6 +372,11 @@ An isolated SDK helper also stops and deprovisions a clone, checks release of it
 lease and sandbox state, then starts and cleans up another clone from the same
 template without exiting the owning SDK process.
 
+Another isolated helper kills and drops live lifecycle executions while holding
+their stdout undrained, then checks that the container remains usable. A parent
+watchdog bounds the helper and attempts cleanup using its published sandbox ID;
+if recovery fails, the isolated state and logs are retained for diagnosis.
+
 An intentionally blocked template store must cold boot successfully and return
 warnings to captured and streaming SDK callers. Lifecycle `start` must record a
 redacted fallback diagnostic through the caller's configured logging without
@@ -407,6 +412,14 @@ warnings and lifecycle diagnostics, concurrent image reuse, and all three
 interruption phases, as well as the existing execution and policy scenarios.
 Missing markers, empty suites, skips, ignored tests, and filtered tests fail
 the job.
+
+Windows PR builds also require discovery and passing results for direct-C
+MicroVM JSON boundary tests covering experimental authorization, lifecycle
+entry points, PTY rejection, and ambiguous selectors. GitHub Actions runs
+these host-only checks on native x64 and ARM64; Azure runs them on Windows x64.
+The x64 test build enables the MicroVM backend through `mxc_ffi`'s Windows x64
+test dependency; ARM64 exercises an unsupported execution host. Neither run
+starts a VM.
 
 `node --test scripts/tests/microvm-validation.test.js` runs host fixtures for
 these gates, including negative cases that omit required discovered tests or

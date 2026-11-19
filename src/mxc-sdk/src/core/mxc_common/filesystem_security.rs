@@ -790,9 +790,183 @@ mod tests {
     use super::*;
     use std::ptr::NonNull;
     use windows::Win32::Security::{
-        AclSizeInformation, GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACE_HEADER,
-        ACL_SIZE_INFORMATION, INHERITED_ACE,
+        AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION,
+        INHERITED_ACE,
     };
+
+    fn test_descriptor(sddl: &str) -> OwnedSecurityDescriptor {
+        let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+            .expect("construct native security descriptor");
+        }
+        OwnedSecurityDescriptor(descriptor)
+    }
+
+    fn descriptor_dacl(descriptor: &OwnedSecurityDescriptor) -> *mut ACL {
+        let mut present = windows::core::BOOL::default();
+        let mut defaulted = windows::core::BOOL::default();
+        let mut dacl = ptr::null_mut();
+        unsafe {
+            GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
+                .expect("inspect native DACL");
+        }
+        dacl
+    }
+
+    fn admits_descriptor(sddl: &str, user: &OwnedSid, token_owner: Option<PSID>) -> bool {
+        let descriptor = test_descriptor(sddl);
+        let mut owner = PSID::default();
+        let mut defaulted = windows::core::BOOL::default();
+        unsafe {
+            GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted)
+                .expect("inspect native owner");
+        }
+        validate_owner_only_acl_for_user(
+            owner,
+            descriptor_dacl(&descriptor),
+            descriptor.0,
+            Path::new("<ACL fixture>"),
+            user.as_psid(),
+            token_owner,
+        )
+        .expect("validate native security descriptor")
+    }
+
+    #[test]
+    fn owner_only_creation_and_validation_use_unique_user_and_system_sids() {
+        for identity in ["S-1-5-21-1-2-3-1001", "S-1-5-18"] {
+            let user = OwnedSid::parse(identity).unwrap();
+            let descriptor =
+                owner_only_security_descriptor_for_user(user.as_psid(), Path::new("<fixture>"))
+                    .unwrap();
+            let dacl = descriptor_dacl(&descriptor);
+            let mut size = ACL_SIZE_INFORMATION::default();
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+                .unwrap();
+            }
+            assert_eq!(size.AceCount, if identity == "S-1-5-18" { 1 } else { 2 });
+            assert!(validate_owner_only_acl_for_user(
+                user.as_psid(),
+                dacl,
+                descriptor.0,
+                Path::new("<fixture>"),
+                user.as_psid(),
+                None,
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn owner_only_acl_rejects_adversarial_grants_for_user_and_system() {
+        for identity in ["S-1-5-21-1-2-3-1001", "S-1-5-18"] {
+            let user = OwnedSid::parse(identity).unwrap();
+            let user_ace = format!("(A;OICI;FA;;;{identity})");
+            let system_ace = if identity == "S-1-5-18" {
+                ""
+            } else {
+                "(A;OICI;FA;;;SY)"
+            };
+            let grants = format!("{user_ace}{system_ace}");
+            assert!(admits_descriptor(
+                &format!("O:{identity}D:P{grants}"),
+                &user,
+                None
+            ));
+            for bad in [
+                format!("O:{identity}D:{grants}"),
+                format!("O:WDD:P{grants}"),
+                format!("O:{identity}"),
+                format!("O:{identity}D:P(A;OICIID;FA;;;{identity}){system_ace}"),
+                format!("O:{identity}D:P(A;;FA;;;{identity}){system_ace}"),
+                format!("O:{identity}D:P(A;OICI;GR;;;{identity}){system_ace}"),
+                format!("O:{identity}D:P(D;OICI;FA;;;{identity}){system_ace}"),
+                format!("O:{identity}D:P(A;OICI;FA;;;WD){system_ace}"),
+                format!("O:{identity}D:P{grants}(A;OICI;FA;;;WD)"),
+                format!("O:{identity}D:P{user_ace}{user_ace}"),
+                format!("O:{identity}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;SY)"),
+            ] {
+                assert!(!admits_descriptor(&bad, &user, None), "accepted {bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn owner_only_acl_accepts_only_the_existing_token_owner_alternative() {
+        let user = OwnedSid::parse("S-1-5-21-1-2-3-1001").unwrap();
+        let token_owner = OwnedSid::parse("S-1-5-32-544").unwrap();
+        let sddl = "O:BAD:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FA;;;SY)";
+        assert!(!admits_descriptor(sddl, &user, None));
+        assert!(admits_descriptor(sddl, &user, Some(token_owner.as_psid())));
+    }
+
+    #[test]
+    fn locked_private_nvx_root_rejects_replacement_and_unsafe_existing_root() {
+        let base = tempfile::tempdir().unwrap();
+        let mxc = base.path().join("Microsoft").join("MXC");
+        std::fs::create_dir_all(&mxc).unwrap();
+        let components = ["Microsoft", "MXC", "nvx"].map(std::ffi::OsStr::new);
+        let guard = lock_owner_only_directory_path(base.path(), &components, 2).unwrap();
+        assert_eq!(guard.path(), mxc.join("nvx"));
+        assert!(owner_only_directory_handle(guard._handles.last().unwrap(), guard.path()).unwrap());
+        assert!(std::fs::rename(guard.path(), mxc.join("replacement")).is_err());
+        assert!(guard.path().is_dir());
+        drop(guard);
+
+        let unsafe_root = mxc.join("unsafe");
+        std::fs::create_dir(&unsafe_root).unwrap();
+        let components = ["Microsoft", "MXC", "unsafe"].map(std::ffi::OsStr::new);
+        let error = lock_owner_only_directory_path(base.path(), &components, 2)
+            .expect_err("an inherited ACL must not be accepted as private");
+        assert!(error.to_string().contains("owner or ACL"), "{error}");
+    }
+
+    #[test]
+    fn locked_private_path_rejects_ambiguous_names_and_junctions() {
+        let base = tempfile::tempdir().unwrap();
+        for name in ["state.", "state "] {
+            let error = lock_owner_only_directory_path(
+                base.path(),
+                &[std::ffi::OsStr::new(name), std::ffi::OsStr::new("private")],
+                1,
+            )
+            .expect_err("ambiguous component must be rejected before creation");
+            assert!(
+                error.to_string().contains("ambiguous non-verbatim"),
+                "{error}"
+            );
+            assert!(!base.path().join("state").exists());
+        }
+
+        let target = base.path().join("target");
+        let link = base.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction creation failed");
+        let error = lock_owner_only_directory_path(base.path(), &[std::ffi::OsStr::new("link")], 0)
+            .expect_err("junction must not be accepted");
+        assert!(error.to_string().contains("reparse point"), "{error}");
+        std::fs::remove_dir(&link).unwrap();
+    }
 
     #[test]
     fn owner_is_self_true_for_dir_we_create() {

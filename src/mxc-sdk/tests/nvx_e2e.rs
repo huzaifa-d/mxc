@@ -763,6 +763,234 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         provision
     }
 
+    fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status.success());
+            }
+            if Instant::now() >= deadline {
+                if let Err(error) = child.kill() {
+                    if child.try_wait()?.is_none() {
+                        return Err(error);
+                    }
+                }
+                child.wait()?;
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn stream_watchdog_terminates_stuck_worker() {
+        const CHILD: &str = "MXC_NVX_WATCHDOG_TEST_CHILD";
+        const READY: &str = "MXC_NVX_WATCHDOG_READY";
+        const TEST: &str = "windows_x64::stream_watchdog_terminates_stuck_worker";
+        if std::env::var_os(CHILD).is_some() {
+            std::fs::write(std::env::var_os(READY).unwrap(), b"ready").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST])
+            .env(CHILD, "1")
+            .env(READY, &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            if child.try_wait().unwrap().is_some() {
+                panic!("watchdog test child exited before publishing readiness");
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("watchdog test child did not publish readiness");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let started = Instant::now();
+        assert!(!wait_bounded(&mut child, Duration::from_secs(1)).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "VM: requires Windows x64, WHP and the exact signed official bundle"]
+    fn signed_bundle_sdk_lifecycle_undrained_cancellation() {
+        use std::io::Read;
+
+        const CHILD: &str = "MXC_NVX_UNDRAINED_STREAM_CHILD";
+        const TEST: &str = "windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation";
+        const MARKER: &str = "VM_EXECUTED SDK lifecycle undrained stream kill drop and reuse";
+        let options = dev::JsonOptions { experimental: true };
+        let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        let id_file = local_app_data.join("nvx-undrained-sandbox-id");
+
+        match std::env::var(CHILD).ok().as_deref() {
+            Some("cleanup") => {
+                let id = std::fs::read_to_string(&id_file).unwrap();
+                let stop =
+                    dev::stop_container_json(&lifecycle_phase(&id, "stop").to_string(), options);
+                let deprovision = dev::deprovision_container_json(
+                    &lifecycle_phase(&id, "deprovision").to_string(),
+                    options,
+                );
+                assert!(
+                    stop.is_ok() && deprovision.is_ok(),
+                    "stop={stop:?}, deprovision={deprovision:?}"
+                );
+                std::fs::remove_file(&id_file).unwrap();
+                return;
+            }
+            Some("scenario") => {
+                let provisioned: Value = serde_json::from_str(
+                    &dev::provision_container_json(&lifecycle_provision().to_string(), options)
+                        .unwrap(),
+                )
+                .unwrap();
+                let id = provisioned["result"]["sandboxId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let mut container = LifecycleContainer {
+                    id: id.clone(),
+                    local_app_data: None,
+                    cleaned: false,
+                };
+                std::fs::write(&id_file, &id).unwrap();
+                dev::start_container_json(&lifecycle_phase(&id, "start").to_string(), options)
+                    .unwrap();
+                for dispose in [false, true] {
+                    let completed = format!("/tmp/{}-output-complete", nonce());
+                    let mut exec = lifecycle_phase(&id, "exec");
+                    exec["process"] = json!({
+                        "commandLine": format!(
+                            "printf CANCEL_READY; head -c 4194304 /dev/zero; printf done > {completed}; sleep 120"
+                        ),
+                        "timeout": 0
+                    });
+                    let mut process =
+                        dev::spawn_in_container_json(&exec.to_string(), options).unwrap();
+                    let mut stdout = process.take_stdout().expect("caller-owned stdout");
+                    let mut ready = [0; 12];
+                    stdout.read_exact(&mut ready).unwrap();
+                    assert_eq!(&ready, b"CANCEL_READY");
+                    assert!(process.try_wait().unwrap().is_none());
+                    std::thread::sleep(Duration::from_secs(2));
+                    let mut probe = lifecycle_phase(&id, "exec");
+                    probe["process"] = json!({
+                        "commandLine": format!("if test -e {completed}; then exit 1; fi"),
+                        "timeout": 30000
+                    });
+                    let result = dev::run_in_container_json(&probe.to_string(), options).unwrap();
+                    assert_eq!(
+                        result.outcome,
+                        WaitResult::Exited(0),
+                        "the producer finished writing despite the undrained stream"
+                    );
+                    let started = Instant::now();
+                    if dispose {
+                        drop(process);
+                    } else {
+                        process.kill().unwrap();
+                        assert!(matches!(process.wait().unwrap(), WaitResult::Exited(_)));
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "cancellation waited for an undrained stream"
+                    );
+                    let mut exec = lifecycle_phase(&id, "exec");
+                    exec["process"] = json!({"commandLine": "printf reused", "timeout": 30000});
+                    let result = dev::run_in_container_json(&exec.to_string(), options).unwrap();
+                    assert_eq!(
+                        result.outcome,
+                        WaitResult::Exited(0),
+                        "dispose={dispose}, stdout={}, stderr={}",
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    assert_eq!(result.stdout, b"reused");
+                    assert!(result.stderr.is_empty());
+                    drop(stdout);
+                }
+                dev::stop_container_json(&lifecycle_phase(&id, "stop").to_string(), options)
+                    .unwrap();
+                dev::deprovision_container_json(
+                    &lifecycle_phase(&id, "deprovision").to_string(),
+                    options,
+                )
+                .unwrap();
+                container.cleaned = true;
+                std::fs::remove_file(&id_file).unwrap();
+                println!("{MARKER}");
+                return;
+            }
+            Some(mode) => panic!("unknown cancellation helper mode: {mode}"),
+            None => {}
+        }
+
+        let directory = tempfile::tempdir().expect("isolated cancellation LOCALAPPDATA");
+        let stdout_path = directory.path().join("scenario.stdout");
+        let stderr_path = directory.path().join("scenario.stderr");
+        let spawn =
+            |mode: &str, stdout: &Path, stderr: &Path| -> std::io::Result<std::process::Child> {
+                Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST, "--ignored", "--nocapture"])
+                    .env(CHILD, mode)
+                    .env("LOCALAPPDATA", directory.path())
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::File::create(stdout)?)
+                    .stderr(std::fs::File::create(stderr)?)
+                    .spawn()
+            };
+        let mut child = spawn("scenario", &stdout_path, &stderr_path).unwrap();
+        let success = match wait_bounded(&mut child, Duration::from_secs(240)) {
+            Ok(success) => success,
+            Err(error) => {
+                let recovery = directory.keep();
+                panic!(
+                    "cancellation watchdog could not confirm worker termination: {error}; \
+                     recovery state={}",
+                    recovery.display()
+                );
+            }
+        };
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        if !success || !stdout.contains(MARKER) {
+            let id_file = directory.path().join("nvx-undrained-sandbox-id");
+            let cleanup = if id_file.exists() {
+                match spawn(
+                    "cleanup",
+                    &directory.path().join("cleanup.stdout"),
+                    &directory.path().join("cleanup.stderr"),
+                ) {
+                    Ok(mut cleanup) => {
+                        format!("{:?}", wait_bounded(&mut cleanup, Duration::from_secs(90)))
+                    }
+                    Err(error) => format!("could not start cleanup worker: {error}"),
+                }
+            } else {
+                "no published sandbox ID".to_owned()
+            };
+            let recovery = directory.keep();
+            panic!(
+                "cancellation scenario failed or timed out; cleanup={cleanup}; \
+                 recovery state={}; stdout={stdout}; stderr={stderr}",
+                recovery.display()
+            );
+        }
+        assert!(!directory.path().join("nvx-undrained-sandbox-id").exists());
+        println!("{MARKER}");
+    }
+
     struct LifecycleContainer {
         id: String,
         local_app_data: Option<PathBuf>,

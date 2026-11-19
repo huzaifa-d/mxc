@@ -241,6 +241,12 @@ jobs:
         workingDirectory: $(Build.SourcesDirectory)/src
         condition: and(succeeded(), eq('${{ item.os }}', 'windows'), eq('${{ item.arch }}', 'x64'))
 
+      - pwsh: |
+          & "$(Build.SourcesDirectory)\scripts\ci\test-microvm-json-boundary.ps1" `
+            -Target "$(triplet)" -LogDirectory "$(Agent.TempDirectory)\microvm-boundary"
+        displayName: Require MicroVM direct-C boundary tests
+        condition: and(succeeded(), eq('${{ item.os }}', 'windows'), eq('${{ item.arch }}', 'x64'))
+
       - task: EsrpCodeSigning@6
         displayName: Code Sign
         condition: and(succeeded(), eq(${{ parameters.isOfficialBuild }}, true), eq('${{ item.os }}', 'windows'))

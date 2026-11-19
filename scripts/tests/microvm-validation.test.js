@@ -25,6 +25,13 @@ const root = resolve(__dirname, "..", "..");
 const dispatcher = join(root, "scripts", "ci", "run_backend_validation_tests.ps1");
 const staging = join(root, "scripts", "ci", "stage-nvx-validation-tests.ps1");
 const packaging = join(root, "scripts", "ci", "Invoke-CratePackage.ps1");
+const boundary = join(root, "scripts", "ci", "test-microvm-json-boundary.ps1");
+const boundaryTests = [
+  "microvm_creation_requires_opt_in_and_rejects_lifecycle_envelopes",
+  "microvm_lifecycle_exec_exports_require_opt_in",
+  "microvm_pty_exports_reject_unsupported_modes",
+  "microvm_ambiguous_selectors_are_rejected_at_c_boundary",
+];
 const microvmFixtures = [
   "microvm_hello.json",
   "microvm_exit_code.json",
@@ -81,6 +88,21 @@ fn main() {
     let mode = env::var("MXC_CI_FIXTURE_MODE").unwrap_or_default();
     let exe = env::current_exe().unwrap();
     if exe.file_stem().unwrap() == "cargo" {
+        if args.windows(2).any(|pair| pair == ["--test", "microvm_json_boundary"]) {
+            assert!(args.contains(&"--locked".to_owned()));
+            assert!(args.contains(&"--no-run".to_owned()));
+            assert!(args.contains(&"--no-default-features".to_owned()));
+            let target = env::var("MXC_CI_BOUNDARY_TARGET").unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--target", target.as_str()]));
+            if mode == "boundary-build-failure" {
+                process::exit(17);
+            }
+            if mode != "boundary-no-artifact" {
+                let executable = env::var("MXC_CI_FIXTURE_EXECUTABLE").unwrap();
+                println!("{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"microvm_json_boundary\"}},\"profile\":{{\"test\":true}},\"executable\":{executable:?}}}");
+            }
+            return;
+        }
         if args.first().map(String::as_str) == Some("metadata") {
             let target = env::var("MXC_CI_PACKAGE_TARGET").unwrap();
             let manifest = env::var("MXC_CI_PACKAGE_MANIFEST").unwrap();
@@ -153,6 +175,32 @@ fn main() {
         }
         return;
     }
+    if env::var_os("MXC_CI_BOUNDARY_FIXTURE").is_some() {
+        let names = [
+            "microvm_creation_requires_opt_in_and_rejects_lifecycle_envelopes",
+            "microvm_lifecycle_exec_exports_require_opt_in",
+            "microvm_pty_exports_reject_unsupported_modes",
+            "microvm_ambiguous_selectors_are_rejected_at_c_boundary",
+        ];
+        if args == ["--list"] {
+            if mode == "boundary-list-failure" { process::exit(18); }
+            for name in names {
+                if mode != format!("boundary-missing-discovery:{name}") {
+                    println!("{name}: test");
+                }
+            }
+        } else {
+            assert_eq!(args, ["--test-threads=1"]);
+            if mode == "boundary-run-failure" { process::exit(19); }
+            for name in names {
+                if mode != format!("boundary-missing-result:{name}") {
+                    println!("test {name} ... ok");
+                }
+            }
+            println!("test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
+        }
+        return;
+    }
     if exe.file_name().unwrap() == "Microsoft.Mxc.Sdk.Tests.exe" {
         assert_eq!(env::var("MXC_ENABLE_NVX_TESTS").unwrap(), "1");
         assert!(env::var("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR").unwrap_or_default().is_empty());
@@ -218,6 +266,12 @@ fn main() {
         if mode != "missing-sdk-lifecycle-discovery" {
             println!("windows_x64::signed_bundle_sdk_json_lifecycle: test");
         }
+        if mode != "missing-stream-watchdog-discovery" {
+            println!("windows_x64::stream_watchdog_terminates_stuck_worker: test");
+        }
+        if mode != "missing-undrained-discovery" {
+            println!("windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation: test");
+        }
         if mode != "missing-network-discovery" {
             println!("windows_network::signed_bundle_network_rules_enforce_allow_deny_and_port_selectors: test");
         }
@@ -252,6 +306,12 @@ fn main() {
     }
     if mode != "missing-sdk-lifecycle" {
         println!("VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption");
+    }
+    if mode != "missing-stream-watchdog-result" {
+        println!("test windows_x64::stream_watchdog_terminates_stuck_worker ... ok");
+    }
+    if mode != "missing-undrained-marker" {
+        println!("VM_EXECUTED SDK lifecycle undrained stream kill drop and reuse");
     }
     if mode != "missing-sdk-clone-cleanup" {
         println!("VM_EXECUTED SDK JSON lifecycle same-process clone cleanup lease release and reuse");
@@ -383,8 +443,54 @@ test("Windows builds stage and upload the SDK tests and the complete runtime bun
   assert.ok(workflow.includes("src/target/${{ matrix.target }}/release/aci-edge-sandboxes/"));
   assert.match(workflow, /Invoke-CratePackage\.ps1[\s\S]*-VerifyMicrovmTests/);
   assert.match(workflow, /ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR:/);
+  const boundaryStep = workflow.match(/      - name: Require MicroVM direct-C boundary tests\n[\s\S]*?(?=\n      - name:)/);
+  assert.ok(boundaryStep, "Windows must require the direct-C boundary tests");
+  assert.doesNotMatch(boundaryStep[0], /^\s+if:/m);
+  assert.match(boundaryStep[0], /test-microvm-json-boundary\.ps1/);
+  assert.match(boundaryStep[0], /-Target '\$\{\{ matrix\.target \}\}'/);
+  const azure = readFileSync(join(root, ".azure-pipelines", "templates", "Rust.Build.Job.yml"), "utf8");
+  const azureBoundary = azure.match(/      - pwsh: \|\n(?:(?:          .*)\n)+        displayName: Require MicroVM direct-C boundary tests\n        condition: (.*)/);
+  assert.ok(azureBoundary, "Azure must require the direct-C boundary tests");
+  assert.match(azureBoundary[0], /test-microvm-json-boundary\.ps1/);
+  assert.match(azureBoundary[0], /-Target "\$\(triplet\)"/);
+  assert.equal(azureBoundary[1].trim(), "and(succeeded(), eq('${{ item.os }}', 'windows'), eq('${{ item.arch }}', 'x64'))");
   assert.equal(existsSync(join(root, ".github", "workflows", "microvm-e2e.yml")), false);
 });
+
+function runBoundary(mode = "", target = "x86_64-pc-windows-msvc") {
+  const logs = mkdtempSync(join(scratch, "boundary-"));
+  return runScript(boundary, ["-Target", target, "-LogDirectory", logs], {
+    PATH: tools + delimiter + process.env.PATH,
+    MXC_CI_BOUNDARY_FIXTURE: "1",
+    MXC_CI_BOUNDARY_TARGET: target,
+    MXC_CI_FIXTURE_MODE: mode,
+    MXC_CI_FIXTURE_EXECUTABLE: fixture,
+  });
+}
+
+for (const target of ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]) {
+  test(`direct-C boundary gate executes every required case on ${target}`, () => {
+    const result = runBoundary("", target);
+    assert.equal(result.status, 0, result.output);
+  });
+  for (const name of boundaryTests) {
+    for (const kind of ["missing-discovery", "missing-result"]) {
+      test(`direct-C boundary gate rejects ${kind} for ${name} on ${target}`, () => {
+        const result = runBoundary(`boundary-${kind}:${name}`, target);
+        assert.notEqual(result.status, 0, result.output);
+        assert.ok(result.output.includes(name), result.output);
+      });
+    }
+  }
+}
+
+for (const mode of ["boundary-build-failure", "boundary-no-artifact", "boundary-list-failure", "boundary-run-failure"]) {
+  test(`direct-C boundary gate rejects ${mode}`, () => {
+    const result = runBoundary(mode);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, /MicroVM C boundary/i);
+  });
+}
 
 function azureBundleStep() {
   const pipeline = readFileSync(
@@ -686,6 +792,7 @@ test("artifact dispatcher executes prebuilt SDK tests and preserves the log", ()
   assert.match(log, /VM_EXECUTED facade /);
   assert.match(log, /VM_EXECUTED SDK JSON binary capture /);
   assert.match(log, /VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption/);
+  assert.match(log, /VM_EXECUTED SDK lifecycle undrained stream kill drop and reuse/);
   assert.match(log, /VM_EXECUTED SDK JSON lifecycle same-process clone cleanup lease release and reuse/);
   assert.match(log, /VM_EXECUTED snapshot memory explicit 256 clone and 512 resource cold boot guest sizing both modes/);
   assert.match(log, /VM_EXECUTED executor lifecycle provision\/dry-run clone start cross-process exec and cleanup/);
@@ -708,6 +815,8 @@ for (const [mode, message] of [
   ["missing-facade", /did not execute the facade VM scenario/],
   ["missing-sdk-json", /did not execute the SDK JSON capture VM scenario/],
   ["missing-sdk-lifecycle", /did not execute the SDK JSON lifecycle VM scenario/],
+  ["missing-stream-watchdog-result", /stream_watchdog_terminates_stuck_worker.*did not pass/],
+  ["missing-undrained-marker", /did not execute the SDK lifecycle undrained cancellation VM scenario/],
   ["missing-sdk-clone-cleanup", /did not execute the SDK clone cleanup VM scenario/],
   ["missing-snapshot-memory", /did not execute the snapshot memory VM scenario/],
   ["missing-executor-lifecycle", /did not execute the executor lifecycle VM scenario/],
@@ -886,6 +995,8 @@ for (const [mode, message] of [
   ["missing-discovery", /did not discover windows_x64::signed_bundle_facade_create_and_run/],
   ["missing-sdk-json-discovery", /did not discover windows_x64::signed_bundle_sdk_json_capture/],
   ["missing-sdk-lifecycle-discovery", /did not discover windows_x64::signed_bundle_sdk_json_lifecycle/],
+  ["missing-stream-watchdog-discovery", /did not discover windows_x64::stream_watchdog_terminates_stuck_worker/],
+  ["missing-undrained-discovery", /did not discover windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation/],
   ["missing-interruption-discovery", /did not discover windows_x64::signed_bundle_executor_console_interrupt/],
   ["missing-image-reuse-discovery", /did not discover windows_x64::signed_bundle_executor_reuses_registered_images/],
   ["missing-platform-snapshots-discovery", /did not discover[\s\S]*windows_x64::signed_bundle_executor_starts_sandboxes_from_platform_snapshots/],
@@ -909,6 +1020,8 @@ for (const [mode, message] of [
       "missing-discovery",
       "missing-sdk-json-discovery",
       "missing-sdk-lifecycle-discovery",
+      "missing-stream-watchdog-discovery",
+      "missing-undrained-discovery",
       "missing-interruption-discovery",
       "missing-image-reuse-discovery",
       "missing-platform-snapshots-discovery",

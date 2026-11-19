@@ -105,6 +105,12 @@ jobs:
              --no-default-features
              --features "${{ matrix.features }}"
 
+      - name: Require MicroVM direct-C boundary tests
+        shell: pwsh
+        run: |
+          & ..\scripts\ci\test-microvm-json-boundary.ps1 `
+            -Target '${{ matrix.target }}' -LogDirectory '${{ runner.temp }}\microvm-boundary'
+
       - name: Require NVX module lifetime regression
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
