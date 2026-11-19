@@ -59,7 +59,7 @@ public static class MxcLifecycle
                 NativeSandbox* handle = null;
                 MxcErrorDetail error = default;
                 var status = capture
-                    ? NativeMethods.mxc_exec_state_aware_for_run_json(
+                    ? NativeMethods.mxc_exec_state_aware_capture_json(
                         requestPtr, experimental, &handle, &error)
                     : NativeMethods.mxc_exec_state_aware_json(
                         requestPtr, experimental, &handle, &error);

@@ -12,6 +12,8 @@ namespace Microsoft.Mxc.Sdk.Tests.V1;
 [Collection("MxcLiveHost")]
 public class MxcLifecycleNvxE2ETests
 {
+    private const int CaptureHalfLimit = 32 * 1024 * 1024;
+
     [Fact]
     public async Task DevJson_NvxLifecycleCaptureAndLiveStreams()
     {
@@ -28,7 +30,22 @@ public class MxcLifecycleNvxE2ETests
         var id = response.RootElement.GetProperty("result").GetProperty("sandboxId").GetString();
         Assert.False(string.IsNullOrEmpty(id));
         string Phase(string phase) => JsonSerializer.Serialize(new { version = "1.0.0", phase, sandboxId = id });
-        string Exec(string command) => JsonSerializer.Serialize(new { version = "1.1.0-alpha", phase = "exec", sandboxId = id, process = new { commandLine = command, timeout = 30000 } });
+        string Exec(string command, int timeout = 30000) => JsonSerializer.Serialize(new { version = "1.1.0-alpha", phase = "exec", sandboxId = id, process = new { commandLine = command, timeout } });
+        string CaptureBoundary(int stderrBytes) => Exec(
+            $"head -c {CaptureHalfLimit} /dev/zero && head -c {stderrBytes} /dev/zero >&2", 0);
+        async Task AssertCaptureBoundary(int stderrBytes, bool synchronous)
+        {
+            var request = CaptureBoundary(stderrBytes);
+            var result = synchronous
+                ? Dev.MxcLifecycle.RunInContainerJson(request, options)
+                : await Dev.MxcLifecycle.RunInContainerJsonAsync(request, options, TestContext.Current.CancellationToken);
+            Assert.False(result.TimedOut);
+            Assert.Equal(0, result.ExitCode);
+            Assert.Equal(CaptureHalfLimit, result.Stdout.Length);
+            Assert.Equal(stderrBytes, result.Stderr.Length);
+            Assert.Equal(-1, result.Stdout.AsSpan().IndexOfAnyExcept('\0'));
+            Assert.Equal(-1, result.Stderr.AsSpan().IndexOfAnyExcept('\0'));
+        }
         var started = false;
         try
         {
@@ -38,6 +55,31 @@ public class MxcLifecycleNvxE2ETests
             Assert.Equal(0, captured.ExitCode);
             Assert.Contains("NVX_CAPTURE", captured.Stdout);
             Assert.Contains("NVX_ERROR", captured.Stderr);
+            await AssertCaptureBoundary(CaptureHalfLimit - 1, synchronous: false);
+            await AssertCaptureBoundary(CaptureHalfLimit, synchronous: true);
+            var overflow = await Assert.ThrowsAsync<MxcException>(() =>
+                Dev.MxcLifecycle.RunInContainerJsonAsync(
+                    CaptureBoundary(CaptureHalfLimit + 1), options, TestContext.Current.CancellationToken));
+            Assert.Equal(ErrorCode.BackendError, overflow.Code);
+            var afterOverflow = await Dev.MxcLifecycle.RunInContainerJsonAsync(
+                Exec("printf 'NVX_REUSED\\n'"), options, TestContext.Current.CancellationToken);
+            Assert.Equal(0, afterOverflow.ExitCode);
+            Assert.Contains("NVX_REUSED", afterOverflow.Stdout);
+            using (var largeStream = await Dev.MxcLifecycle.SpawnInContainerJsonAsync(
+                Exec($"head -c {2 * CaptureHalfLimit + 1} /dev/zero", 0), options, TestContext.Current.CancellationToken))
+            using (var largeOutput = Assert.IsAssignableFrom<Stream>(largeStream.StandardOutput))
+            {
+                var wait = largeStream.WaitAsync(TestContext.Current.CancellationToken);
+                var buffer = new byte[64 * 1024];
+                long total = 0;
+                int count;
+                while ((count = await largeOutput.ReadAsync(buffer, TestContext.Current.CancellationToken)) != 0)
+                {
+                    total += count;
+                }
+                Assert.Equal(2L * CaptureHalfLimit + 1, total);
+                Assert.Equal(0, (await wait).ExitCode);
+            }
             using var process = await Dev.MxcLifecycle.SpawnInContainerJsonAsync(Exec("printf 'NVX_LIVE_OUT\\n'; printf 'NVX_LIVE_ERR\\n' >&2; sleep 3"), options, TestContext.Current.CancellationToken);
             using var stdout = new StreamReader(Assert.IsAssignableFrom<Stream>(process.StandardOutput));
             using var stderr = new StreamReader(Assert.IsAssignableFrom<Stream>(process.StandardError));

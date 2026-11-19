@@ -74,6 +74,9 @@ With live execution, close any stdin stream you take when the workload needs EOF
 A descendant holding an output pipe open can delay captured execution
 completion after a workload timeout.
 
+For MicroVM, captured existing-container execution accepts at most 64 MiB
+combined stdout and stderr; live streams do not have this capture limit.
+
 On WSLC, `SpawnJson`, `SpawnWithExtendedOptionsJson` with `SpawnStdio.Pipes`,
 and `SpawnInContainerJson` return a process whose `StandardInput` is writable.
 Disposing it, or waiting before taking it, gives the command end-of-file;
