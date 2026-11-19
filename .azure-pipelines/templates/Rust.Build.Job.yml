@@ -243,7 +243,8 @@ jobs:
 
       - pwsh: |
           & "$(Build.SourcesDirectory)\scripts\ci\test-microvm-json-boundary.ps1" `
-            -Target "$(triplet)" -LogDirectory "$(Agent.TempDirectory)\microvm-boundary"
+            -Target "$(triplet)" -LogDirectory "$(Agent.TempDirectory)\microvm-boundary" `
+            -TargetDirectory "$(Agent.TempDirectory)\microvm-boundary-target"
         displayName: Require MicroVM direct-C boundary tests
         condition: and(succeeded(), eq('${{ item.os }}', 'windows'), eq('${{ item.arch }}', 'x64'))
 

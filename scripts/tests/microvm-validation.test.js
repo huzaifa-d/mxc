@@ -94,6 +94,8 @@ fn main() {
             assert!(args.contains(&"--no-default-features".to_owned()));
             let target = env::var("MXC_CI_BOUNDARY_TARGET").unwrap();
             assert!(args.windows(2).any(|pair| pair == ["--target", target.as_str()]));
+            let target_dir = env::var("MXC_CI_BOUNDARY_TARGET_DIR").unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--target-dir", target_dir.as_str()]));
             if mode == "boundary-build-failure" {
                 process::exit(17);
             }
@@ -454,21 +456,25 @@ test("Windows builds stage and upload the SDK tests and the complete runtime bun
   assert.doesNotMatch(boundaryStep[0], /^\s+if:/m);
   assert.match(boundaryStep[0], /test-microvm-json-boundary\.ps1/);
   assert.match(boundaryStep[0], /-Target '\$\{\{ matrix\.target \}\}'/);
+  assert.match(boundaryStep[0], /-TargetDirectory '\$\{\{ runner\.temp \}\}\\microvm-boundary-target'/);
   const azure = readFileSync(join(root, ".azure-pipelines", "templates", "Rust.Build.Job.yml"), "utf8");
   const azureBoundary = azure.match(/      - pwsh: \|\n(?:(?:          .*)\n)+        displayName: Require MicroVM direct-C boundary tests\n        condition: (.*)/);
   assert.ok(azureBoundary, "Azure must require the direct-C boundary tests");
   assert.match(azureBoundary[0], /test-microvm-json-boundary\.ps1/);
   assert.match(azureBoundary[0], /-Target "\$\(triplet\)"/);
+  assert.match(azureBoundary[0], /-TargetDirectory "\$\(Agent\.TempDirectory\)\\microvm-boundary-target"/);
   assert.equal(azureBoundary[1].trim(), "and(succeeded(), eq('${{ item.os }}', 'windows'), eq('${{ item.arch }}', 'x64'))");
   assert.equal(existsSync(join(root, ".github", "workflows", "microvm-e2e.yml")), false);
 });
 
 function runBoundary(mode = "", target = "x86_64-pc-windows-msvc") {
   const logs = mkdtempSync(join(scratch, "boundary-"));
-  return runScript(boundary, ["-Target", target, "-LogDirectory", logs], {
+  const targetDir = join(scratch, "boundary-target");
+  return runScript(boundary, ["-Target", target, "-LogDirectory", logs, "-TargetDirectory", targetDir], {
     PATH: tools + delimiter + process.env.PATH,
     MXC_CI_BOUNDARY_FIXTURE: "1",
     MXC_CI_BOUNDARY_TARGET: target,
+    MXC_CI_BOUNDARY_TARGET_DIR: targetDir,
     MXC_CI_FIXTURE_MODE: mode,
     MXC_CI_FIXTURE_EXECUTABLE: fixture,
   });

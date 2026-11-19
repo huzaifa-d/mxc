@@ -12,7 +12,10 @@ param(
     [string]$Target,
 
     [Parameter(Mandatory)]
-    [string]$LogDirectory
+    [string]$LogDirectory,
+
+    [Parameter(Mandatory)]
+    [string]$TargetDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +32,8 @@ $log = Join-Path (Resolve-Path -LiteralPath $LogDirectory).Path 'microvm-json-bo
 Push-Location (Join-Path $PSScriptRoot '..\..\src')
 try {
     $messages = @(cargo test --locked --release --target $Target -p mxc_ffi `
-        --no-default-features --test microvm_json_boundary --no-run --message-format=json)
+        --no-default-features --test microvm_json_boundary --no-run --message-format=json `
+        --target-dir $TargetDirectory)
     if ($LASTEXITCODE -ne 0) {
         $messages | ForEach-Object { Write-Host $_ }
         throw "MicroVM C boundary compilation failed with exit code $LASTEXITCODE."

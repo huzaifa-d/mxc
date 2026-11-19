@@ -418,6 +418,8 @@ Windows PR builds also require discovery and passing results for direct-C
 MicroVM JSON boundary tests covering experimental authorization, lifecycle
 entry points, PTY rejection, and ambiguous selectors. GitHub Actions runs
 these host-only checks on native x64 and ARM64; Azure runs them on Windows x64.
+The tests build in a separate Cargo target directory so their test-only features
+cannot replace the native library that is signed and packaged.
 The x64 test build enables the MicroVM backend through `mxc_ffi`'s Windows x64
 test dependency; ARM64 exercises an unsupported execution host. Neither run
 starts a VM.

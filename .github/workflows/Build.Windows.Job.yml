@@ -109,7 +109,8 @@ jobs:
         shell: pwsh
         run: |
           & ..\scripts\ci\test-microvm-json-boundary.ps1 `
-            -Target '${{ matrix.target }}' -LogDirectory '${{ runner.temp }}\microvm-boundary'
+            -Target '${{ matrix.target }}' -LogDirectory '${{ runner.temp }}\microvm-boundary' `
+            -TargetDirectory '${{ runner.temp }}\microvm-boundary-target'
 
       - name: Require NVX module lifetime regression
         if: matrix.target == 'x86_64-pc-windows-msvc'
