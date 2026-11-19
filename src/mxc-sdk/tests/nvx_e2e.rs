@@ -206,13 +206,16 @@ fn unsupported_platform_or_feature_is_fail_closed() {
 #[cfg(all(windows, target_arch = "x86_64", feature = "microvm"))]
 mod windows_x64 {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::process::{Command, Output, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use mxc_sdk::mxc_common::logger::{Logger, Mode};
+    use mxc_sdk::process_container_common::job_object::UiJobObject;
     use mxc_sdk::v1::{ExecutionResult, WaitResult};
     use serde_json::{json, Value};
+    use windows::Win32::Foundation::HANDLE;
 
     use super::*;
 
@@ -761,6 +764,594 @@ print("NVX_JSON_IMAGE_AND_POLICY_OK", end="")
         provision.as_object_mut().unwrap().remove("process");
         provision["phase"] = json!("provision");
         provision
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct CleanupIdentity {
+        sandbox_id: String,
+        stop_first: bool,
+    }
+
+    fn publish_cleanup_identity(path: &Path, id: &str, stop_first: bool) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let parent = path.parent().expect("cleanup identity directory");
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(
+            &mut file,
+            &CleanupIdentity {
+                sandbox_id: id.to_owned(),
+                stop_first,
+            },
+        )?;
+        file.flush()?;
+        file.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    fn publish_provision_recovery(
+        error: &mxc_sdk::v1::Error,
+        path: &Path,
+    ) -> std::io::Result<bool> {
+        let Some(id) = error
+            .details
+            .as_deref()
+            .and_then(|details| details.pointer("/nvxRecovery/sandboxId"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(false);
+        };
+        let mut guard = LifecycleContainer {
+            id: id.to_owned(),
+            local_app_data: None,
+            cleaned: false,
+        };
+        publish_cleanup_identity(path, id, false)?;
+        guard.cleaned = true;
+        Ok(true)
+    }
+
+    fn record_provision_result(
+        result: Result<String, mxc_sdk::v1::Error>,
+        path: &Path,
+    ) -> Result<String, String> {
+        match result {
+            Ok(provisioned) => Ok(provisioned),
+            Err(error) => {
+                if let Err(publish_error) = publish_provision_recovery(&error, path) {
+                    return Err(format!(
+                        "provision failed: {error}; recovery publication failed: {publish_error}"
+                    ));
+                }
+                Err(format!("provision failed: {error}"))
+            }
+        }
+    }
+
+    fn cleanup_published_lifecycle(
+        path: &Path,
+        mut stop: impl FnMut(&str) -> Result<(), String>,
+        mut deprovision: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let identity: CleanupIdentity = serde_json::from_slice(
+            &std::fs::read(path).map_err(|error| format!("read cleanup identity: {error}"))?,
+        )
+        .map_err(|error| format!("parse cleanup identity: {error}"))?;
+        let stop_error = if identity.stop_first {
+            stop(&identity.sandbox_id).err()
+        } else {
+            None
+        };
+        let deprovision_error = deprovision(&identity.sandbox_id).err();
+        if stop_error.is_some() || deprovision_error.is_some() {
+            return Err(format!(
+                "stop cleanup: {stop_error:?}; deprovision cleanup: {deprovision_error:?}"
+            ));
+        }
+        std::fs::remove_file(path).map_err(|error| format!("retire cleanup identity: {error}"))
+    }
+
+    fn cleanup_stop_result(result: Result<String, mxc_sdk::v1::Error>) -> Result<(), String> {
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == ErrorCode::AlreadyStopped => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn cleanup_failure_diagnostics(
+        identity_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<String, String> {
+        let identity: CleanupIdentity = serde_json::from_slice(
+            &std::fs::read(identity_path)
+                .map_err(|error| format!("read cleanup identity: {error}"))?,
+        )
+        .map_err(|error| format!("parse cleanup identity: {error}"))?;
+        if identity.sandbox_id.is_empty() {
+            return Err("cleanup identity is empty".to_owned());
+        }
+        let stderr = std::fs::read_to_string(stderr_path)
+            .map_err(|error| format!("read cleanup diagnostics: {error}"))?;
+        let message = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("recover lifecycle container: "))
+            .ok_or_else(|| "cleanup worker did not report a recovery error".to_owned())?;
+        let native_id = identity
+            .sandbox_id
+            .strip_prefix("microvm:")
+            .unwrap_or(&identity.sandbox_id);
+        if native_id.is_empty() {
+            return Err("cleanup identity has no native ID".to_owned());
+        }
+        Ok(message
+            .replace(&identity.sandbox_id, "<redacted>")
+            .replace(native_id, "<redacted>"))
+    }
+
+    #[test]
+    fn provision_close_failure_publishes_identity_for_parent_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sandbox-id");
+        let id = "microvm:0123456789abcdef0123456789abcdef";
+        let mut error = mxc_sdk::v1::Error::new(ErrorCode::BackendError, "close failed");
+        error.details = Some(Box::new(json!({
+            "nvxRecovery": {"sandboxId": id, "state": "provisioned"}
+        })));
+        assert!(!format!("{error:?}").contains(id));
+        let failure = record_provision_result(Err(error), &path).unwrap_err();
+        assert!(failure.contains("close failed"));
+        assert!(!failure.contains(id));
+        let mut stops = 0;
+        let mut deprovisions = 0;
+        cleanup_published_lifecycle(
+            &path,
+            |_| {
+                stops += 1;
+                Ok(())
+            },
+            |actual| {
+                assert_eq!(actual, id);
+                deprovisions += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((stops, deprovisions), (0, 1));
+        assert!(!path.exists());
+
+        let failure = record_provision_result(
+            Err(mxc_sdk::v1::Error::new(
+                ErrorCode::BackendError,
+                "no recovery",
+            )),
+            &path,
+        )
+        .unwrap_err();
+        assert!(failure.contains("no recovery"));
+        assert!(!path.exists());
+
+        publish_cleanup_identity(&path, id, true).unwrap();
+        cleanup_published_lifecycle(
+            &path,
+            |_| {
+                cleanup_stop_result(Err(mxc_sdk::v1::Error::new(
+                    ErrorCode::AlreadyStopped,
+                    "already stopped",
+                )))
+            },
+            |actual| {
+                assert_eq!(actual, id);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert!(cleanup_stop_result(Err(mxc_sdk::v1::Error::new(
+            ErrorCode::BackendError,
+            "stop failed"
+        )))
+        .is_err());
+
+        publish_cleanup_identity(&path, id, true).unwrap();
+        let failure = cleanup_published_lifecycle(
+            &path,
+            |_| Err("stop failed".to_owned()),
+            |_| Err("deprovision failed".to_owned()),
+        )
+        .unwrap_err();
+        assert!(failure.contains("stop failed"), "{failure}");
+        assert!(failure.contains("deprovision failed"), "{failure}");
+        assert!(path.exists(), "failed cleanup must retain its identity");
+
+        let stderr = directory.path().join("cleanup.stderr");
+        std::fs::write(
+            &stderr,
+            format!(
+                "ignored native diagnostics\nrecover lifecycle container: StaleId for {id}, native {}",
+                id.strip_prefix("microvm:").unwrap()
+            ),
+        )
+        .unwrap();
+        let diagnostics = cleanup_failure_diagnostics(&path, &stderr).unwrap();
+        assert_eq!(diagnostics, "StaleId for <redacted>, native <redacted>");
+        std::fs::write(&stderr, "unrelated native diagnostics").unwrap();
+        assert!(cleanup_failure_diagnostics(&path, &stderr).is_err());
+        std::fs::write(&path, b"invalid identity").unwrap();
+        assert!(cleanup_failure_diagnostics(&path, &stderr).is_err());
+    }
+
+    fn wait_bounded_with<C>(
+        child: &mut C,
+        timeout: Duration,
+        reap_timeout: Duration,
+        mut try_wait: impl FnMut(&mut C) -> std::io::Result<Option<bool>>,
+        mut kill: impl FnMut(&mut C) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(success) = try_wait(child)? {
+                return Ok(success);
+            }
+            if Instant::now() >= deadline {
+                if let Err(error) = kill(child) {
+                    if try_wait(child)?.is_none() {
+                        return Err(error);
+                    }
+                }
+                let reap_deadline = Instant::now() + reap_timeout;
+                loop {
+                    if try_wait(child)?.is_some() {
+                        return Ok(false);
+                    }
+                    if Instant::now() >= reap_deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "watchdog could not confirm worker termination",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
+        wait_bounded_with(
+            child,
+            timeout,
+            Duration::from_secs(5),
+            |child| {
+                child
+                    .try_wait()
+                    .map(|status| status.map(|status| status.success()))
+            },
+            std::process::Child::kill,
+        )
+    }
+
+    fn wait_for_watchdog_job() {
+        let gate = std::env::var_os("MXC_NVX_WATCHDOG_JOB_GATE").expect("watchdog job gate");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !Path::new(&gate).exists() {
+            assert!(Instant::now() < deadline, "watchdog job gate timed out");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn assign_watchdog_job(
+        job: &UiJobObject,
+        child: &mut std::process::Child,
+        gate: &Path,
+    ) -> std::io::Result<()> {
+        let setup = job
+            .assign_process(HANDLE(child.as_raw_handle()))
+            .map_err(std::io::Error::other)
+            .and_then(|()| std::fs::write(gate, b"ready"));
+        if let Err(error) = setup {
+            let cleanup = wait_bounded(child, Duration::ZERO).map(|_| ());
+            return Err(std::io::Error::other(format!(
+                "watchdog job setup failed: {error}; worker cleanup: {cleanup:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_watchdog_terminates_stuck_worker() {
+        use mxc_sdk::mxc_common::process_util::OwnedHandle;
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
+        let mut kills = 0;
+        let error = wait_bounded_with(
+            &mut kills,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| Ok(None),
+            |kills| {
+                *kills += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(kills, 1);
+
+        const CHILD: &str = "MXC_NVX_WATCHDOG_TEST_CHILD";
+        const READY: &str = "MXC_NVX_WATCHDOG_READY";
+        const TEST: &str = "windows_x64::stream_watchdog_terminates_stuck_worker";
+        match std::env::var(CHILD).ok().as_deref() {
+            Some("descendant") => {
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            Some("worker") => {
+                wait_for_watchdog_job();
+                let mut descendant = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST])
+                    .env(CHILD, "descendant")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                std::fs::write(
+                    std::env::var_os(READY).unwrap(),
+                    descendant.id().to_string(),
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+                descendant.wait().unwrap();
+                return;
+            }
+            Some(mode) => panic!("unknown watchdog test mode: {mode}"),
+            None => {}
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let gate = directory.path().join("gate");
+        let job = UiJobObject::new().expect("create watchdog job");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST])
+            .env(CHILD, "worker")
+            .env(READY, &ready)
+            .env("MXC_NVX_WATCHDOG_JOB_GATE", &gate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assign_watchdog_job(&job, &mut child, &gate).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            if child.try_wait().unwrap().is_some() {
+                panic!("watchdog test child exited before publishing readiness");
+            }
+            if Instant::now() >= deadline {
+                wait_bounded(&mut child, Duration::ZERO).unwrap();
+                panic!("watchdog test child did not publish readiness");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let pid: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+        // SAFETY: the worker created this live child and the handle is owned below.
+        let descendant =
+            OwnedHandle::new(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.unwrap());
+        let started = Instant::now();
+        assert!(!wait_bounded(&mut child, Duration::from_secs(1)).unwrap());
+        job.terminate_and_wait(1).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_some());
+        // SAFETY: descendant remains a valid process handle until it is dropped.
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.get(), 5000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    #[ignore = "VM: requires Windows x64, WHP and the exact signed official bundle"]
+    fn signed_bundle_sdk_lifecycle_undrained_cancellation() {
+        use std::io::Read;
+
+        const CHILD: &str = "MXC_NVX_UNDRAINED_STREAM_CHILD";
+        const TEST: &str = "windows_x64::signed_bundle_sdk_lifecycle_undrained_cancellation";
+        const MARKER: &str = "VM_EXECUTED SDK lifecycle undrained stream kill drop and reuse";
+        let options = dev::JsonOptions { experimental: true };
+        let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        let id_file = local_app_data.join("nvx-undrained-sandbox-id");
+
+        match std::env::var(CHILD).ok().as_deref() {
+            Some("cleanup") => {
+                wait_for_watchdog_job();
+                cleanup_published_lifecycle(
+                    &id_file,
+                    |id| {
+                        cleanup_stop_result(dev::stop_container_json(
+                            &lifecycle_phase(id, "stop").to_string(),
+                            options,
+                        ))
+                    },
+                    |id| {
+                        dev::deprovision_container_json(
+                            &lifecycle_phase(id, "deprovision").to_string(),
+                            options,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .expect("recover lifecycle container");
+                return;
+            }
+            Some("scenario") => {
+                wait_for_watchdog_job();
+                let provisioned = record_provision_result(
+                    dev::provision_container_json(&lifecycle_provision().to_string(), options),
+                    &id_file,
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+                let provisioned: Value = serde_json::from_str(&provisioned).unwrap();
+                let id = provisioned["result"]["sandboxId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let mut container = LifecycleContainer {
+                    id: id.clone(),
+                    local_app_data: None,
+                    cleaned: false,
+                };
+                publish_cleanup_identity(&id_file, &id, true).unwrap();
+                dev::start_container_json(&lifecycle_phase(&id, "start").to_string(), options)
+                    .unwrap();
+                for dispose in [false, true] {
+                    let completed = format!("/tmp/{}-output-complete", nonce());
+                    let mut exec = lifecycle_phase(&id, "exec");
+                    exec["process"] = json!({
+                        "commandLine": format!(
+                            "printf CANCEL_READY; head -c 4194304 /dev/zero; printf done > {completed}; sleep 120"
+                        ),
+                        "timeout": 0
+                    });
+                    let mut process =
+                        dev::spawn_in_container_json(&exec.to_string(), options).unwrap();
+                    let mut stdout = process.take_stdout().expect("caller-owned stdout");
+                    let mut ready = [0; 12];
+                    stdout.read_exact(&mut ready).unwrap();
+                    assert_eq!(&ready, b"CANCEL_READY");
+                    assert!(process.try_wait().unwrap().is_none());
+                    std::thread::sleep(Duration::from_secs(2));
+                    let mut probe = lifecycle_phase(&id, "exec");
+                    probe["process"] = json!({
+                        "commandLine": format!("if test -e {completed}; then exit 1; fi"),
+                        "timeout": 30000
+                    });
+                    let result = dev::run_in_container_json(&probe.to_string(), options).unwrap();
+                    assert_eq!(
+                        result.outcome,
+                        WaitResult::Exited(0),
+                        "the producer finished writing despite the undrained stream"
+                    );
+                    let started = Instant::now();
+                    if dispose {
+                        drop(process);
+                    } else {
+                        process.kill().unwrap();
+                        assert!(matches!(process.wait().unwrap(), WaitResult::Exited(_)));
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "cancellation waited for an undrained stream"
+                    );
+                    let mut exec = lifecycle_phase(&id, "exec");
+                    exec["process"] = json!({"commandLine": "printf reused", "timeout": 30000});
+                    let result = dev::run_in_container_json(&exec.to_string(), options).unwrap();
+                    assert_eq!(
+                        result.outcome,
+                        WaitResult::Exited(0),
+                        "dispose={dispose}, stdout={}, stderr={}",
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    assert_eq!(result.stdout, b"reused");
+                    assert!(result.stderr.is_empty());
+                    drop(stdout);
+                }
+                dev::stop_container_json(&lifecycle_phase(&id, "stop").to_string(), options)
+                    .unwrap();
+                dev::deprovision_container_json(
+                    &lifecycle_phase(&id, "deprovision").to_string(),
+                    options,
+                )
+                .unwrap();
+                let root = local_app_data.join(r"Microsoft\MXC\nvx");
+                assert!(!lifecycle_sandbox_directory(&root, &id).exists());
+                container.cleaned = true;
+                std::fs::remove_file(&id_file).unwrap();
+                println!("{MARKER}");
+                return;
+            }
+            Some(mode) => panic!("unknown cancellation helper mode: {mode}"),
+            None => {}
+        }
+
+        let directory = tempfile::tempdir().expect("isolated cancellation LOCALAPPDATA");
+        let stdout_path = directory.path().join("scenario.stdout");
+        let stderr_path = directory.path().join("scenario.stderr");
+        let job = UiJobObject::new().expect("create lifecycle watchdog job");
+        let spawn =
+            |mode: &str, stdout: &Path, stderr: &Path| -> std::io::Result<std::process::Child> {
+                let gate = directory.path().join(format!("{mode}.gate"));
+                let mut child = Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST, "--ignored", "--nocapture"])
+                    .env(CHILD, mode)
+                    .env("MXC_NVX_WATCHDOG_JOB_GATE", &gate)
+                    .env("LOCALAPPDATA", directory.path())
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::File::create(stdout)?)
+                    .stderr(std::fs::File::create(stderr)?)
+                    .spawn()?;
+                assign_watchdog_job(&job, &mut child, &gate)?;
+                Ok(child)
+            };
+        let mut child = spawn("scenario", &stdout_path, &stderr_path).unwrap();
+        let success = match wait_bounded(&mut child, Duration::from_secs(240)) {
+            Ok(success) => success,
+            Err(error) => {
+                let fallback = job.terminate_and_wait(1);
+                let recovery = directory.keep();
+                panic!(
+                    "cancellation watchdog could not confirm worker termination: {error}; \
+                     job fallback={fallback:?}; recovery state={}",
+                    recovery.display()
+                );
+            }
+        };
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        if !success || !stdout.contains(MARKER) {
+            let id_file = directory.path().join("nvx-undrained-sandbox-id");
+            let cleanup = if id_file.exists() {
+                let cleanup_stderr = directory.path().join("cleanup.stderr");
+                match spawn(
+                    "cleanup",
+                    &directory.path().join("cleanup.stdout"),
+                    &cleanup_stderr,
+                ) {
+                    Ok(mut cleanup) => {
+                        let result = wait_bounded(&mut cleanup, Duration::from_secs(90));
+                        if matches!(result, Ok(true)) {
+                            format!("{result:?}")
+                        } else {
+                            let diagnostics =
+                                cleanup_failure_diagnostics(&id_file, &cleanup_stderr)
+                                    .unwrap_or_else(|error| {
+                                        format!("diagnostics unavailable: {error}")
+                                    });
+                            format!("{result:?}; cleanup stderr: {diagnostics}")
+                        }
+                    }
+                    Err(error) => format!("could not start cleanup worker: {error}"),
+                }
+            } else {
+                "no published sandbox ID".to_owned()
+            };
+            let fallback = job.terminate_and_wait(1);
+            let recovery = directory.keep();
+            panic!(
+                "cancellation scenario failed or timed out; cleanup={cleanup}; job fallback={fallback:?}; \
+                 recovery state={}; stdout={stdout}; stderr={stderr}",
+                recovery.display()
+            );
+        }
+        assert!(!directory.path().join("nvx-undrained-sandbox-id").exists());
+        job.wait_for_empty()
+            .expect("lifecycle watchdog job retained processes");
+        println!("{MARKER}");
     }
 
     struct LifecycleContainer {

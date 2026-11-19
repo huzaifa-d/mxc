@@ -517,7 +517,10 @@ function Invoke-MicroVmTests {
     } finally {
         [Environment]::SetEnvironmentVariable('ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR', $previousAgent)
     }
-    $failure = Get-LibtestFailure -Run $run
+    $failure = Get-LibtestFailure -Run $run -RequiredTests @(
+        'windows_x64::provision_close_failure_publishes_identity_for_parent_cleanup',
+        'windows_x64::stream_watchdog_terminates_stuck_worker'
+    )
     if ($failure) {
         throw "MicroVM SDK tests $failure."
     }
@@ -530,6 +533,7 @@ function Invoke-MicroVmTests {
         'facade' = 'VM_EXECUTED facade sequential '
         'SDK JSON capture' = 'VM_EXECUTED SDK JSON binary capture timeout limit and cleanup'
         'SDK JSON lifecycle' = 'VM_EXECUTED SDK JSON lifecycle clone start state reuse live-owner rejection and adoption'
+        'SDK lifecycle undrained cancellation' = 'VM_EXECUTED SDK lifecycle undrained stream kill drop and reuse'
         'SDK clone cleanup' = 'VM_EXECUTED SDK JSON lifecycle same-process clone cleanup lease release and reuse'
         'snapshot memory' = 'VM_EXECUTED snapshot memory explicit 256 clone and 512 resource cold boot guest sizing both modes'
         'executor lifecycle' = 'VM_EXECUTED executor lifecycle provision/dry-run clone start cross-process exec and cleanup'
